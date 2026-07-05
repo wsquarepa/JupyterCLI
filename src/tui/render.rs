@@ -382,6 +382,43 @@ fn trim_spans(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'static>> {
     out
 }
 
+/// Fixed-size dialog rect centered in `area`, clamped to fit.
+pub fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+pub fn dialog_block(title: &str) -> Block<'static> {
+    Block::new()
+        .borders(Borders::ALL)
+        .title(title.to_string())
+        .border_style(Style::default().fg(theme::DIALOG))
+}
+
+/// Centered hint strip in the row directly below a dialog, skipped when the
+/// dialog touches the bottom edge.
+pub fn render_hints_below_dialog(frame: &mut Frame, dialog: Rect, area: Rect, hints: &str) {
+    if area.bottom() <= dialog.bottom() {
+        return;
+    }
+    let hint_area = Rect::new(dialog.x, dialog.bottom(), dialog.width, 1);
+    frame.render_widget(Clear, hint_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(hints.to_string()).centered()).style(
+            Style::default()
+                .fg(theme::STATUS_BAR_FG)
+                .bg(theme::STATUS_BAR_BG),
+        ),
+        hint_area,
+    );
+}
+
 #[cfg(test)]
 pub(crate) fn buffer_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
     let buffer = terminal.backend().buffer();

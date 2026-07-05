@@ -2,10 +2,9 @@ use std::collections::BTreeMap;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::Stylize as _;
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
 
 use crate::config::JsonMap;
 
@@ -85,58 +84,75 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent) -> Outcome {
 }
 
 pub fn render_dialog(frame: &mut Frame, dialog: &Dialog) {
-    let area = centered(frame.area(), 50, 40);
-    frame.render_widget(Clear, area);
+    let area = frame.area();
     match dialog {
         Dialog::Start(start) => {
+            let height = (start.entries.len() as u16).saturating_add(4);
+            let rect = super::render::centered_rect(60, height, area);
+            frame.render_widget(Clear, rect);
             let title = match &start.server {
-                Some(server) => format!("Start {server}"),
-                None => "Start the default server".to_string(),
+                Some(server) => format!(" Start {server} "),
+                None => " Start the default server ".to_string(),
             };
-            let items: Vec<ListItem> = start
-                .entries
-                .iter()
-                .enumerate()
-                .map(|(index, (name, options))| {
-                    let detail = if options.is_empty() {
-                        String::new()
-                    } else {
-                        let rendered: Vec<String> =
-                            options.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                        format!("  {}", rendered.join(" "))
-                    };
-                    let line = Line::from(format!("{name}{detail}"));
-                    if index == start.selected {
-                        ListItem::new(line.reversed())
-                    } else {
-                        ListItem::new(line)
-                    }
-                })
-                .collect();
-            let block = Block::new()
-                .borders(Borders::ALL)
-                .title(title)
-                .title_bottom("Enter start  Esc cancel");
-            frame.render_widget(List::new(items).block(block), area);
+            let width = usize::from(rect.width.saturating_sub(2));
+            let mut lines: Vec<Line> = vec![Line::from("")];
+            lines.extend(
+                start
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (name, options))| {
+                        let detail = if options.is_empty() {
+                            String::new()
+                        } else {
+                            let rendered: Vec<String> =
+                                options.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                            format!("  {}", rendered.join(" "))
+                        };
+                        let text = format!(" {name}{detail}");
+                        if index == start.selected {
+                            Line::from(Span::styled(
+                                format!("{text:<width$}"),
+                                Style::default()
+                                    .fg(crate::tui::theme::SELECTION_FG)
+                                    .bg(crate::tui::theme::SELECTION_BG),
+                            ))
+                        } else {
+                            Line::from(text)
+                        }
+                    }),
+            );
+            let block = super::render::dialog_block(&title);
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            frame.render_widget(Paragraph::new(lines), inner);
+            super::render::render_hints_below_dialog(
+                frame,
+                rect,
+                area,
+                " Up/Down: navigate  Enter: start  Esc: cancel ",
+            );
         }
         Dialog::Confirm(confirm) => {
-            let block = Block::new()
-                .borders(Borders::ALL)
-                .title("Confirm")
-                .title_bottom("Enter/y confirm  Esc/n cancel");
-            frame.render_widget(Paragraph::new(confirm.message.clone()).block(block), area);
+            let rect = super::render::centered_rect(60, 5, area);
+            frame.render_widget(Clear, rect);
+            let block = super::render::dialog_block(" Confirm ");
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(""),
+                    Line::from(confirm.message.clone()).centered(),
+                ]),
+                inner,
+            );
+            super::render::render_hints_below_dialog(
+                frame,
+                rect,
+                area,
+                " Enter/y: confirm  Esc/n: cancel ",
+            );
         }
-    }
-}
-
-fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let width = area.width * percent_x / 100;
-    let height = (area.height * percent_y / 100).max(4);
-    Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
     }
 }
 
@@ -230,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_footer_documents_the_y_and_n_synonyms() {
+    fn confirm_hints_render_below_the_dialog() {
         let dialog = Dialog::Confirm(ConfirmDialog {
             message: "Stop default?".to_string(),
             effect: Effect::Stop {
@@ -244,7 +260,23 @@ mod tests {
             .draw(|frame| render_dialog(frame, &dialog))
             .unwrap();
         let text = crate::tui::render::buffer_text(&terminal);
-        assert!(text.contains("Enter/y confirm"), "buffer was:\n{text}");
-        assert!(text.contains("Esc/n cancel"), "buffer was:\n{text}");
+        assert!(text.contains("Enter/y: confirm"), "buffer was:\n{text}");
+        assert!(text.contains("Esc/n: cancel"), "buffer was:\n{text}");
+        assert!(text.contains(" Confirm "));
+    }
+
+    #[test]
+    fn start_dialog_lists_presets_with_hints() {
+        let dialog = Dialog::Start(StartDialog::new(None, &presets()));
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dialog(frame, &dialog))
+            .unwrap();
+        let text = crate::tui::render::buffer_text(&terminal);
+        assert!(text.contains("Start the default server"));
+        assert!(text.contains("hub defaults"));
+        assert!(text.contains("a100"));
+        assert!(text.contains("Enter: start"));
     }
 }
