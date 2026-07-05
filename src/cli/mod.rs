@@ -280,7 +280,13 @@ pub fn main() -> std::process::ExitCode {
         }
     };
     let is_exec = matches!(cli.command, Some(Command::Exec { .. }));
-    match runtime.block_on(dispatch(cli)) {
+    let dispatched = runtime.block_on(dispatch(cli));
+    // A piped-stdin exec (or a remote-closed attach) leaves a blocking read parked on fd 0
+    // via `tokio::io::stdin()`. `Runtime::drop` waits for in-flight blocking tasks, so it
+    // would hang until one more byte arrives. `shutdown_background` reclaims the runtime
+    // without that wait; the result-handling writes below are synchronous std::io.
+    runtime.shutdown_background();
+    match dispatched {
         Ok(code) => code,
         Err(CliError::Config(ConfigError::NotFound(_))) => {
             eprintln!("{}", init::NO_CONFIG_GUIDANCE);
