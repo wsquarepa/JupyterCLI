@@ -3,6 +3,7 @@ pub mod dialogs;
 pub mod input;
 pub mod net;
 pub mod render;
+pub mod suspend;
 
 use std::time::{Duration, Instant};
 
@@ -71,13 +72,18 @@ async fn dashboard_loop(
             match effect {
                 app::Effect::Quit => return Ok(()),
                 app::Effect::Attach { target } => {
-                    // Task 8 replaces this arm with the suspend/subprocess flow.
-                    let _ = target;
-                    app.set_status(
-                        "attach lands in the next milestone step".to_string(),
-                        true,
-                        Instant::now(),
-                    );
+                    let message = suspend::attach_in_subprocess(&app.hub_name, &target).await?;
+                    terminal.clear().map_err(CliError::Io)?;
+                    app.set_status(message, false, Instant::now());
+                    if let Some(server) = app.selected_server()
+                        && let Some(url) = server.url.clone()
+                    {
+                        let effect = app::Effect::FetchShells {
+                            server: server.display.clone(),
+                            url,
+                        };
+                        net::dispatch(effect, client.clone(), tx.clone());
+                    }
                 }
                 other => net::dispatch(other, client.clone(), tx.clone()),
             }
