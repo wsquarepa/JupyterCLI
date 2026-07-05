@@ -49,6 +49,17 @@ pub async fn attach_in_subprocess(hub: &str, target: &str) -> Result<String, Cli
         .status()
         .await;
 
+    // The attach session painted the primary screen. Clearing here, still
+    // outside the alternate screen, means quitting the TUI later reveals a clean
+    // screen instead of remote-shell residue; a session that never attaches
+    // leaves the user's screen untouched. Scrollback is kept (no ClearType::Purge).
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    )
+    .map_err(CliError::Io)?;
+
     enable_raw_mode().map_err(CliError::Io)?;
     crossterm::execute!(std::io::stdout(), EnterAlternateScreen).map_err(CliError::Io)?;
 
