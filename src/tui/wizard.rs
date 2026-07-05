@@ -123,6 +123,77 @@ impl WizardState {
     }
 }
 
+/// Text columns available for wizard dialog content: the dialog is 64 wide,
+/// less the two block borders and the two columns of interior padding.
+const CONTENT_WIDTH: usize = 60;
+
+/// Greedy word wrap to `width` columns; a single word longer than the width
+/// breaks mid-word (URLs and error payloads have no convenient spaces).
+///
+/// Width 0 disables wrapping and returns the text as one line. Non-empty input
+/// never yields an empty vec; empty input yields a single empty line so blank
+/// spacer rows survive wrapping.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current: Vec<char> = Vec::new();
+    for word in text.split(' ') {
+        let word_len = word.chars().count();
+        if word_len > width {
+            if !current.is_empty() {
+                lines.push(current.iter().collect());
+                current.clear();
+            }
+            let mut chunk: Vec<char> = Vec::new();
+            for ch in word.chars() {
+                chunk.push(ch);
+                if chunk.len() == width {
+                    lines.push(chunk.iter().collect());
+                    chunk.clear();
+                }
+            }
+            current = chunk;
+            continue;
+        }
+        let separator = usize::from(!current.is_empty());
+        if current.len() + separator + word_len > width {
+            lines.push(current.iter().collect());
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.extend(word.chars());
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current.iter().collect());
+    }
+    lines
+}
+
+/// Visible window of a (possibly masked) input value: at most `avail` cells
+/// with the cursor cell always inside. Returns (before, at, after) where
+/// `at` is the single cursor cell (a space when the cursor sits past the end).
+fn input_window(display: &str, cursor: usize, avail: usize) -> (String, String, String) {
+    let chars: Vec<char> = display.chars().collect();
+    let cursor = cursor.min(chars.len());
+    if avail == 0 {
+        return (String::new(), String::new(), String::new());
+    }
+    let scroll = cursor.saturating_sub(avail.saturating_sub(1));
+    let window_end = (scroll + avail).min(chars.len());
+    let before: String = chars[scroll..cursor].iter().collect();
+    let at: String = chars
+        .get(cursor)
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| " ".to_string());
+    let after_start = (cursor + 1).min(window_end);
+    let after: String = chars[after_start..window_end].iter().collect();
+    (before, at, after)
+}
+
 fn input_line(label: &str, input: &LineInput, active: bool) -> ratatui::text::Line<'static> {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::Span;
@@ -134,29 +205,29 @@ fn input_line(label: &str, input: &LineInput, active: bool) -> ratatui::text::Li
         Style::default()
     };
     let display = input.display();
-    let chars: Vec<char> = display.chars().collect();
-    let cursor = input.cursor().min(chars.len());
     if !active {
         return ratatui::text::Line::from(vec![
             Span::styled(format!("  {label}: "), style),
             Span::styled(display, style),
         ]);
     }
-    let before: String = chars[..cursor].iter().collect();
-    let at: String = chars
-        .get(cursor)
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| " ".to_string());
-    let after: String = chars
-        .get(cursor + 1..)
-        .map(|s| s.iter().collect())
-        .unwrap_or_default();
+    let prefix = format!("> {label}: ");
+    let avail = CONTENT_WIDTH.saturating_sub(prefix.chars().count());
+    let cursor = input.cursor().min(display.chars().count());
+    let (before, at, after) = input_window(&display, cursor, avail);
     ratatui::text::Line::from(vec![
-        Span::styled(format!("> {label}: "), style),
+        Span::styled(prefix, style),
         Span::styled(before, style),
         Span::styled(at, style.add_modifier(Modifier::REVERSED)),
         Span::styled(after, style),
     ])
+}
+
+/// A wizard content row: `Text` is plain prose to word-wrap; `Row` is an input
+/// or spinner row rendered verbatim (its cursor windowing is already sized).
+enum Body {
+    Text(String),
+    Row(Line<'static>),
 }
 
 pub fn render(
@@ -173,29 +244,29 @@ pub fn render(
     super::render::draw(frame, backdrop);
 
     let url = state.url.value().trim_end_matches('/').to_string();
-    let (lines, hints): (Vec<Line>, &str) = match &state.step {
+    let (body, hints): (Vec<Body>, &str) = match &state.step {
         Step::Welcome => (
             vec![
-                Line::from("Welcome to JupyterCLI."),
-                Line::from("This wizard connects you to a JupyterHub in three steps."),
+                Body::Text("Welcome to JupyterCLI.".to_string()),
+                Body::Text("This wizard connects you to a JupyterHub in three steps.".to_string()),
             ],
             " Enter: continue  Esc: quit ",
         ),
         Step::Url => (
             vec![
-                Line::from("Step 1 of 3: hub base URL"),
-                Line::from("Example: https://jupyter.example.edu"),
-                Line::from(""),
-                input_line("URL", &state.url, true),
+                Body::Text("Step 1 of 3: hub base URL".to_string()),
+                Body::Text("Example: https://jupyter.example.edu".to_string()),
+                Body::Text(String::new()),
+                Body::Row(input_line("URL", &state.url, true)),
             ],
             " Enter: continue  Esc: quit ",
         ),
         Step::Token => (
             vec![
-                Line::from("Step 2 of 3: API token"),
-                Line::from(format!("Create one in the browser at {url}/hub/token")),
-                Line::from(""),
-                input_line("Token", &state.token, true),
+                Body::Text("Step 2 of 3: API token".to_string()),
+                Body::Text(format!("Create one in the browser at {url}/hub/token")),
+                Body::Text(String::new()),
+                Body::Row(input_line("Token", &state.token, true)),
             ],
             " Enter: test the connection  Esc: quit ",
         ),
@@ -203,17 +274,17 @@ pub fn render(
             let glyph = crate::tui::app::SPINNER_FRAMES
                 [spinner_frame % crate::tui::app::SPINNER_FRAMES.len()];
             (
-                vec![Line::from(Span::styled(
+                vec![Body::Row(Line::from(Span::styled(
                     format!("Step 3 of 3: {glyph} testing the connection..."),
                     Style::default().fg(crate::tui::theme::SPINNER),
-                ))],
+                )))],
                 "",
             )
         }
         Step::Failed => (
             vec![
-                Line::from("The connection test failed:"),
-                Line::from(state.error.clone().unwrap_or_default()),
+                Body::Text("The connection test failed:".to_string()),
+                Body::Text(state.error.clone().unwrap_or_default()),
             ],
             " any key: re-enter the token  Esc: quit ",
         ),
@@ -225,31 +296,54 @@ pub fn render(
                         options.iter().map(|(k, v)| format!("{k}={v}")).collect();
                     (
                         vec![
-                            Line::from(format!("Connected as {username}. Configuration saved.")),
-                            Line::from(""),
-                            Line::from("A running server was found with these options:"),
-                            Line::from(format!("  {}", rendered.join(" "))),
-                            Line::from("Save them as preset 'imported' for one-key starts?"),
+                            Body::Text(format!("Connected as {username}. Configuration saved.")),
+                            Body::Text(String::new()),
+                            Body::Text(
+                                "A running server was found with these options:".to_string(),
+                            ),
+                            Body::Text(format!("  {}", rendered.join(" "))),
+                            Body::Text(
+                                "Save them as preset 'imported' for one-key starts?".to_string(),
+                            ),
                         ],
                         " y: save  n: skip  Esc: quit ",
                     )
                 }
                 None => (
                     vec![
-                        Line::from(format!("Connected as {username}. Configuration saved.")),
-                        Line::from(""),
-                        Line::from("JupyterCLI cannot list your hub's environment and resource"),
-                        Line::from("options because JupyterHub does not expose them over its API."),
-                        Line::from(format!(
+                        Body::Text(format!("Connected as {username}. Configuration saved.")),
+                        Body::Text(String::new()),
+                        Body::Text(
+                            "JupyterCLI cannot list your hub's environment and resource"
+                                .to_string(),
+                        ),
+                        Body::Text(
+                            "options because JupyterHub does not expose them over its API."
+                                .to_string(),
+                        ),
+                        Body::Text(format!(
                             "Start a server once in the browser at {url}/hub/spawn,"
                         )),
-                        Line::from("then run: jhc preset import"),
+                        Body::Text("then run: jhc preset import".to_string()),
                     ],
                     " Enter: open the dashboard ",
                 ),
             }
         }
     };
+
+    // Wrap plain text to the content width before deriving the dialog height so
+    // multi-row output grows the dialog instead of clipping at the border.
+    let lines: Vec<Line> = body
+        .into_iter()
+        .flat_map(|item| match item {
+            Body::Text(text) => wrap_text(&text, CONTENT_WIDTH)
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<Line>>(),
+            Body::Row(line) => vec![line],
+        })
+        .collect();
 
     let area = frame.area();
     let height = lines.len() as u16 + 4;
@@ -537,6 +631,113 @@ mod tests {
         assert!(
             bottom_row > content_row + 1,
             "a blank row must sit above the bottom border:\n{text}"
+        );
+    }
+
+    #[test]
+    fn wrap_text_greedy_wraps_and_breaks_long_words() {
+        assert_eq!(wrap_text("hello world foo", 11), vec!["hello world", "foo"]);
+        assert_eq!(wrap_text("abcdefgh", 3), vec!["abc", "def", "gh"]);
+        assert_eq!(wrap_text("abcdef", 3), vec!["abc", "def"]);
+        assert_eq!(wrap_text("anything", 0), vec!["anything"]);
+        assert_eq!(wrap_text("", 60), vec![String::new()]);
+    }
+
+    #[test]
+    fn input_window_keeps_the_cursor_cell_visible() {
+        let long = "0123456789";
+        let (before, at, after) = input_window(long, long.chars().count(), 5);
+        assert_eq!(before, "6789", "cursor at end shows the tail");
+        assert_eq!(at, " ", "cursor past the end is a space cell");
+        assert_eq!(after, "");
+
+        let (before, at, after) = input_window(long, 0, 5);
+        assert_eq!(before, "", "cursor at 0 shows the head");
+        assert_eq!(at, "0");
+        assert_eq!(after, "1234");
+
+        let (before, at, after) = input_window("ab", 1, 10);
+        assert_eq!(
+            (before.as_str(), at.as_str(), after.as_str()),
+            ("a", "b", "")
+        );
+
+        let (before, at, after) = input_window("áéíóú", 5, 3);
+        assert_eq!(before, "óú", "multibyte window stays on char boundaries");
+        assert_eq!(at, " ");
+        assert_eq!(after, "");
+    }
+
+    fn token_step_with_url(url: &str) -> WizardState {
+        let mut state = WizardState::new();
+        state.on_key(&press(KeyCode::Enter));
+        type_text(&mut state, url);
+        state.on_key(&press(KeyCode::Enter));
+        state
+    }
+
+    #[test]
+    fn token_step_wraps_a_long_browser_url_without_clipping() {
+        let state = token_step_with_url("https://jupyterhub.university.example.edu");
+        let mut backdrop = crate::tui::app::App::new(
+            "not configured".to_string(),
+            Default::default(),
+            999,
+            (90, 24),
+        );
+        let _ = backdrop.take_effects();
+        backdrop.ops.clear();
+        let backend = ratatui::backend::TestBackend::new(90, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &backdrop, 0))
+            .unwrap();
+        let text = crate::tui::render::buffer_text(&terminal);
+        let lines: Vec<&str> = text.lines().collect();
+        let intro_row = lines
+            .iter()
+            .position(|l| l.contains("Create one in the browser at"))
+            .expect("browser instruction row");
+        let url_row = lines
+            .iter()
+            .position(|l| l.contains("https://jupyterhub.university.example.edu/hub/token"))
+            .expect("wrapped url tail row must not be clipped");
+        assert_ne!(
+            intro_row, url_row,
+            "the browser line must wrap across two rows"
+        );
+    }
+
+    #[test]
+    fn token_step_windows_a_long_masked_token_inside_the_dialog() {
+        let mut state = token_step_with_url("https://x");
+        type_text(&mut state, &"a".repeat(120));
+        let mut backdrop = crate::tui::app::App::new(
+            "not configured".to_string(),
+            Default::default(),
+            999,
+            (90, 24),
+        );
+        let _ = backdrop.take_effects();
+        backdrop.ops.clear();
+        let backend = ratatui::backend::TestBackend::new(90, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &backdrop, 0))
+            .unwrap();
+        let text = crate::tui::render::buffer_text(&terminal);
+        let token_row = text
+            .lines()
+            .find(|l| l.contains('*'))
+            .expect("masked token row");
+        assert!(
+            token_row.matches('*').count() >= 40,
+            "windowed masked value must render:\n{token_row}"
+        );
+        let last_star = token_row.rfind('*').unwrap();
+        assert!(
+            token_row[last_star..].contains('│'),
+            "the token row must end inside the dialog:\n{token_row}"
         );
     }
 
