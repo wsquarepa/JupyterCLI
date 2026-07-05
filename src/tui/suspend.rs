@@ -30,7 +30,17 @@ pub async fn attach_in_subprocess(hub: &str, target: &str) -> Result<String, Cli
     let exe = std::env::current_exe().map_err(CliError::Io)?;
 
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, LeaveAlternateScreen).map_err(CliError::Io)?;
+    // Clear the visible primary screen so the remote shell starts on a blank
+    // page instead of over the user's local shell history. Scrollback is
+    // deliberately kept (no ClearType::Purge): only the visible bleed-through
+    // is the problem.
+    crossterm::execute!(
+        stdout,
+        LeaveAlternateScreen,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0)
+    )
+    .map_err(CliError::Io)?;
     disable_raw_mode().map_err(CliError::Io)?;
     stdout.flush().map_err(CliError::Io)?;
 
