@@ -17,7 +17,7 @@ use crate::cli::CliError;
 use crate::config::{self, Config, ConfigError};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(15);
-const TICK_EVERY: Duration = Duration::from_millis(500);
+const TICK_EVERY: Duration = Duration::from_millis(100);
 
 pub async fn run(hub_flag: Option<&str>) -> Result<(), CliError> {
     let cfg = match config::load() {

@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Style, Stylize as _};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -284,37 +284,102 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+const GLOBAL_HINTS: &str = "Tab: switch focus | r: refresh | q: quit ";
+
 fn draw_statusbar(frame: &mut Frame, app: &App, area: Rect) {
-    // Transitional: Task 6 replaces this with the colored bar, spinner slot,
-    // and notification shifting.
-    let version = concat!("JupyterCLI v", env!("CARGO_PKG_VERSION"));
-    let line = match &app.status {
-        Some(status) if status.error => {
-            frame.render_widget(
-                Paragraph::new(Line::from(status.text.clone()).bold().reversed()),
-                area,
-            );
-            return;
-        }
-        Some(status) => right_aligned(version, &status.text, area.width),
-        None => right_aligned(
-            version,
-            "Tab: switch focus | r: refresh | q: quit",
-            area.width,
-        ),
-    };
-    frame.render_widget(Paragraph::new(line), area);
+    if let Some(status) = &app.status
+        && status.error
+    {
+        let bar = Paragraph::new(Line::from(format!(" {} ", status.text)).centered()).style(
+            Style::default()
+                .fg(theme::STATUS_ERROR_FG)
+                .bg(theme::STATUS_ERROR_BG),
+        );
+        frame.render_widget(bar, area);
+        return;
+    }
+    let bar_style = Style::default()
+        .fg(theme::STATUS_BAR_FG)
+        .bg(theme::STATUS_BAR_BG);
+    frame.render_widget(Paragraph::new("").style(bar_style), area);
+
+    let width = usize::from(area.width);
+    let notification: Option<Span<'static>> = app.status.as_ref().map(|status| {
+        let text: String = format!(" {} ", status.text).chars().take(width).collect();
+        Span::styled(
+            text,
+            Style::default()
+                .fg(theme::STATUS_INFO_FG)
+                .bg(theme::STATUS_INFO_BG),
+        )
+    });
+    let notif_width = notification
+        .as_ref()
+        .map(|s| s.content.chars().count())
+        .unwrap_or(0);
+
+    let mut core: Vec<Span<'static>> = Vec::new();
+    if let Some((glyph, label)) = app.spinner() {
+        core.push(Span::styled(
+            format!("{glyph} {label}  "),
+            Style::default().fg(theme::SPINNER).bg(theme::STATUS_BAR_BG),
+        ));
+    }
+    core.push(Span::styled(GLOBAL_HINTS, bar_style));
+    let mut right = trim_spans(core, width.saturating_sub(notif_width));
+    if let Some(notification) = notification {
+        right.push(notification);
+    }
+    let right_width: usize = right.iter().map(|s| s.content.chars().count()).sum();
+
+    let left_max = width.saturating_sub(right_width).saturating_sub(1);
+    let left: String = format!(
+        " JupyterCLI v{}  {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        app.hub_name,
+        app.username.as_deref().unwrap_or("...")
+    )
+    .chars()
+    .take(left_max)
+    .collect();
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(left, bar_style))),
+        Rect::new(area.x, area.y, left_max as u16, 1),
+    );
+    if right_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(right)),
+            Rect::new(
+                area.x + (width - right_width) as u16,
+                area.y,
+                right_width as u16,
+                1,
+            ),
+        );
+    }
 }
 
-fn right_aligned(left: &str, right: &str, width: u16) -> Line<'static> {
-    let pad = (width as usize)
-        .saturating_sub(left.chars().count())
-        .saturating_sub(right.chars().count());
-    Line::from(vec![
-        Span::raw(left.to_string()),
-        Span::raw(" ".repeat(pad)),
-        Span::raw(right.to_string()),
-    ])
+/// Truncate a span list to `budget` columns keeping the prefix, LibLLM style:
+/// the global hints lose their tail as a notification claims the right edge.
+fn trim_spans(spans: Vec<Span<'static>>, budget: usize) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let len = span.content.chars().count();
+        if used + len <= budget {
+            used += len;
+            out.push(span);
+        } else {
+            let keep = budget - used;
+            if keep > 0 {
+                let text: String = span.content.chars().take(keep).collect();
+                out.push(Span::styled(text, span.style));
+            }
+            break;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -529,5 +594,62 @@ mod tests {
             now,
         );
         assert!(!rendered(&app).contains(" Peek"));
+    }
+
+    #[test]
+    fn statusbar_left_names_product_hub_and_user() {
+        let (app, _) = app_with_servers();
+        let text = rendered(&app);
+        assert!(text.contains("JupyterCLI v"));
+        assert!(text.contains("icrn (ww41)"));
+        assert!(text.contains("Tab: switch focus | r: refresh | q: quit"));
+    }
+
+    #[test]
+    fn notification_shifts_the_global_hints() {
+        let (mut app, now) = app_with_servers();
+        app.set_status("server ready".to_string(), false, now);
+        let wide = rendered_sized(&app, 120, 30);
+        assert!(wide.contains("server ready"));
+        assert!(wide.contains("q: quit"), "wide bars fit both");
+        let narrow = rendered_sized(&app, 50, 30);
+        assert!(narrow.contains("server ready"), "buffer:\n{narrow}");
+        assert!(
+            !narrow.contains("q: quit"),
+            "hints must truncate before the notification does:\n{narrow}"
+        );
+    }
+
+    #[test]
+    fn error_takes_over_the_whole_bar() {
+        let (mut app, now) = app_with_servers();
+        app.set_status("token lacks the required scope".to_string(), true, now);
+        let text = rendered(&app);
+        assert!(text.contains("token lacks the required scope"));
+        assert!(!text.contains("JupyterCLI v"));
+        assert!(!text.contains("q: quit"));
+    }
+
+    #[test]
+    fn spinner_shows_while_an_op_is_in_flight() {
+        let now = Instant::now();
+        // A fresh App holds the initial "refreshing" op until its event lands.
+        let app = App::new("icrn".to_string(), Default::default(), 999, (100, 30));
+        let text = rendered(&app);
+        assert!(text.contains("refreshing"), "buffer:\n{text}");
+        assert!(text.contains("⠋"));
+
+        let mut app = app;
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::Refreshed {
+                op: 1,
+                username: "ww41".to_string(),
+                servers: vec![],
+            },
+            now,
+        );
+        let text = rendered(&app);
+        assert!(!text.contains("refreshing"));
     }
 }
