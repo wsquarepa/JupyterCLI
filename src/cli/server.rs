@@ -33,19 +33,62 @@ pub async fn status(ctx: &Ctx) -> Result<(), CliError> {
 }
 
 pub async fn start(
-    _ctx: &Ctx,
-    _server: Option<&str>,
-    _preset: Option<&str>,
-    _options: &[String],
-    _no_wait: bool,
+    ctx: &Ctx,
+    server: Option<&str>,
+    preset: Option<&str>,
+    options: &[String],
+    no_wait: bool,
 ) -> Result<(), CliError> {
-    Err(CliError::Usage(
-        "implemented in a later task of this plan".to_string(),
-    ))
+    use crate::config::JsonMap;
+
+    let spawn_options: JsonMap = match (preset, options.is_empty()) {
+        (Some(_), false) => {
+            return Err(CliError::Usage(
+                "pass either --preset or -o options, not both".to_string(),
+            ));
+        }
+        (Some(name), true) => match ctx.hub.presets.get(name) {
+            Some(preset) => preset.clone(),
+            None => {
+                return Err(CliError::Usage(format!(
+                    "unknown preset '{name}': configured presets are {}",
+                    ctx.hub
+                        .presets
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        },
+        (None, false) => super::options_from_flags(options)?,
+        (None, true) => JsonMap::new(),
+    };
+
+    let user = ctx.client.whoami().await?;
+    ctx.client.spawn(&user.name, server, &spawn_options).await?;
+    println!("spawn requested for {}", server.unwrap_or("default server"));
+    if no_wait {
+        return Ok(());
+    }
+    ctx.client
+        .wait_ready(&user.name, server, |event| {
+            if let Some(message) = &event.message {
+                let pct = event
+                    .progress
+                    .map(|p| format!("[{p:>3}%] "))
+                    .unwrap_or_default();
+                println!("{pct}{message}");
+            }
+        })
+        .await?;
+    println!("server ready");
+    Ok(())
 }
 
-pub async fn stop(_ctx: &Ctx, _server: Option<&str>) -> Result<(), CliError> {
-    Err(CliError::Usage(
-        "implemented in a later task of this plan".to_string(),
-    ))
+pub async fn stop(ctx: &Ctx, server: Option<&str>) -> Result<(), CliError> {
+    let user = ctx.client.whoami().await?;
+    ctx.client.stop(&user.name, server).await?;
+    println!("stop requested for {}", server.unwrap_or("default server"));
+    Ok(())
 }
