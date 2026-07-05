@@ -134,6 +134,10 @@ pub enum Effect {
     Attach {
         target: String,
     },
+    SavePreset {
+        name: String,
+        options: JsonMap,
+    },
     Quit,
 }
 
@@ -148,7 +152,9 @@ impl Effect {
             Effect::NewTerminal { .. } => Some("creating"),
             Effect::KillTerminal { .. } => Some("killing"),
             Effect::PeekStart { .. } => Some("connecting"),
-            Effect::PeekStop | Effect::Attach { .. } | Effect::Quit => None,
+            Effect::PeekStop | Effect::Attach { .. } | Effect::Quit | Effect::SavePreset { .. } => {
+                None
+            }
         }
     }
 
@@ -161,7 +167,8 @@ impl Effect {
             | Effect::NewTerminal { op, .. }
             | Effect::KillTerminal { op, .. }
             | Effect::PeekStart { op, .. } => *op = id,
-            Effect::PeekStop | Effect::Attach { .. } | Effect::Quit => {}
+            Effect::PeekStop | Effect::Attach { .. } | Effect::Quit | Effect::SavePreset { .. } => {
+            }
         }
     }
 }
@@ -605,6 +612,19 @@ impl App {
         if let Some((server, Some(url))) = target {
             self.push_effect(Effect::FetchTerminals { op: 0, server, url });
         }
+    }
+
+    pub fn on_preset_saved(&mut self, name: String, options: JsonMap, now: Instant) {
+        self.presets.insert(name.clone(), options);
+        let presets = self.presets.clone();
+        match &mut self.dialog {
+            Some(super::dialogs::Dialog::Start(start)) => start.reload_presets(&presets, &name),
+            Some(super::dialogs::Dialog::CreateNamed(create)) => {
+                create.picker.reload_presets(&presets, &name)
+            }
+            _ => {}
+        }
+        self.set_status(format!("saved preset '{name}'"), false, now);
     }
 
     pub fn on_key(&mut self, key: &KeyEvent, now: Instant) {
@@ -1417,6 +1437,42 @@ mod tests {
             app.take_effects().as_slice(),
             [Effect::FetchTerminals { .. }]
         ));
+    }
+
+    #[test]
+    fn on_preset_saved_updates_presets_and_selects_in_start_dialog() {
+        let (mut app, now) = fresh_app();
+        app.dialog = Some(crate::tui::dialogs::Dialog::Start(
+            crate::tui::dialogs::StartDialog::new(None, &app.presets),
+        ));
+        let options: JsonMap = serde_json::from_str(r#"{"resource":"3_h200"}"#).unwrap();
+        app.on_preset_saved("h200".to_string(), options, now);
+
+        assert!(app.presets.contains_key("h200"));
+        match &app.dialog {
+            Some(crate::tui::dialogs::Dialog::Start(start)) => {
+                assert_eq!(start.entries[start.selected].0, "h200");
+            }
+            other => panic!("expected a Start dialog, got {other:?}"),
+        }
+        assert_eq!(app.status.as_ref().unwrap().text, "saved preset 'h200'");
+        assert!(!app.status.as_ref().unwrap().error);
+    }
+
+    #[test]
+    fn on_preset_saved_reloads_the_create_named_picker() {
+        let (mut app, now) = fresh_app();
+        app.dialog = Some(crate::tui::dialogs::Dialog::CreateNamed(
+            crate::tui::dialogs::CreateNamedDialog::new(&app.presets),
+        ));
+        let options: JsonMap = serde_json::from_str(r#"{"resource":"3_h200"}"#).unwrap();
+        app.on_preset_saved("h200".to_string(), options, now);
+        match &app.dialog {
+            Some(crate::tui::dialogs::Dialog::CreateNamed(create)) => {
+                assert_eq!(create.picker.entries[create.picker.selected].0, "h200");
+            }
+            other => panic!("expected a CreateNamed dialog, got {other:?}"),
+        }
     }
 
     #[test]

@@ -135,6 +135,12 @@ async fn dashboard_loop(
                     terminal.clear().map_err(CliError::Io)?;
                     app.after_attach(message, Instant::now());
                 }
+                app::Effect::SavePreset { name, options } => {
+                    match config::add_preset(&app.hub_name, &name, options.clone()) {
+                        Ok(()) => app.on_preset_saved(name, options, Instant::now()),
+                        Err(e) => app.set_status(e.to_string(), true, Instant::now()),
+                    }
+                }
                 other => net::dispatch(other, client.clone(), tx.clone()),
             }
         }

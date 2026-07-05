@@ -57,8 +57,12 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
             | Effect::Stop { op, .. }
             | Effect::NewTerminal { op, .. }
             | Effect::KillTerminal { op, .. } => *op,
-            Effect::PeekStart { .. } | Effect::PeekStop | Effect::Attach { .. } | Effect::Quit => {
-                unreachable!("peek effects are handled by the event loop, not net::dispatch")
+            Effect::PeekStart { .. }
+            | Effect::PeekStop
+            | Effect::Attach { .. }
+            | Effect::Quit
+            | Effect::SavePreset { .. } => {
+                unreachable!("local effects are handled by the event loop, not net::dispatch")
             }
         };
         let event = match effect {
@@ -81,8 +85,12 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
                 url,
                 terminal,
             } => kill_terminal(&client, op, &server, &url, &terminal).await,
-            Effect::PeekStart { .. } | Effect::PeekStop | Effect::Attach { .. } | Effect::Quit => {
-                unreachable!("peek effects are handled by the event loop, not net::dispatch")
+            Effect::PeekStart { .. }
+            | Effect::PeekStop
+            | Effect::Attach { .. }
+            | Effect::Quit
+            | Effect::SavePreset { .. } => {
+                unreachable!("local effects are handled by the event loop, not net::dispatch")
             }
         };
         let event = event.unwrap_or_else(|e| AppEvent::OpFailed {

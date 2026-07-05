@@ -55,15 +55,28 @@ pub struct StartDialog {
     pub selected: usize,
 }
 
+fn preset_entries(presets: &BTreeMap<String, JsonMap>) -> Vec<(String, JsonMap)> {
+    let mut entries = vec![("hub defaults".to_string(), JsonMap::new())];
+    entries.extend(presets.iter().map(|(k, v)| (k.clone(), v.clone())));
+    entries
+}
+
 impl StartDialog {
     pub fn new(server: Option<String>, presets: &BTreeMap<String, JsonMap>) -> Self {
-        let mut entries = vec![("hub defaults".to_string(), JsonMap::new())];
-        entries.extend(presets.iter().map(|(k, v)| (k.clone(), v.clone())));
         Self {
             server,
-            entries,
+            entries: preset_entries(presets),
             selected: 0,
         }
+    }
+
+    pub fn reload_presets(&mut self, presets: &BTreeMap<String, JsonMap>, select: &str) {
+        self.entries = preset_entries(presets);
+        self.selected = self
+            .entries
+            .iter()
+            .position(|(name, _)| name == select)
+            .unwrap_or(0);
     }
 }
 
