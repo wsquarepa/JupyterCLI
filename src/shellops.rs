@@ -60,13 +60,16 @@ impl AnsiStripper {
                     // escape like `ESC(B` (charset designation); consume the whole
                     // sequence through its final byte instead of leaking that byte.
                     '\u{20}'..='\u{2f}' => self.state = StripState::EscapeIntermediate,
+                    // ESC aborts the current sequence and starts a new one (ECMA-48),
+                    // so a truncated escape never leaks the next sequence as text.
+                    '\x1b' => {}
                     _ => self.state = StripState::Ground,
                 },
-                StripState::EscapeIntermediate => {
-                    if !('\u{20}'..='\u{2f}').contains(&ch) {
-                        self.state = StripState::Ground;
-                    }
-                }
+                StripState::EscapeIntermediate => match ch {
+                    '\u{20}'..='\u{2f}' => {}
+                    '\x1b' => self.state = StripState::Escape,
+                    _ => self.state = StripState::Ground,
+                },
                 StripState::Csi => {
                     if ('\u{40}'..='\u{7e}').contains(&ch) {
                         self.state = StripState::Ground;
@@ -365,6 +368,16 @@ mod tests {
         assert_eq!(s.push("\x1b)0"), "");
         let mut s = AnsiStripper::new();
         assert_eq!(s.push("\x1b(Bhello"), "hello");
+    }
+
+    #[test]
+    fn esc_aborts_a_truncated_sequence_without_leaking_the_next() {
+        // A stray ESC mid-sequence starts a new escape (ECMA-48 abort), so the
+        // following CSI must strip cleanly instead of leaking "[31m" as text.
+        let mut s = AnsiStripper::new();
+        assert_eq!(s.push("\x1b(\x1b[31mred"), "red");
+        let mut s = AnsiStripper::new();
+        assert_eq!(s.push("\x1b\x1b[31mred"), "red");
     }
 
     #[test]
