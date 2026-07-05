@@ -175,7 +175,9 @@ impl App {
             }
             AppEvent::Shells { server, shells } => {
                 let current = self.selected_server().map(|s| s.display.clone());
-                if current.as_deref() == Some(server.as_str()) {
+                if current.as_deref() == Some(server.as_str())
+                    && self.selected_server().is_some_and(|s| s.ready)
+                {
                     self.shells = shells;
                     self.selected_shell =
                         self.selected_shell.min(self.shells.len().saturating_sub(1));
@@ -429,6 +431,32 @@ mod tests {
         assert!(
             app.shells.is_empty(),
             "shells for an unselected server must be dropped"
+        );
+    }
+
+    #[test]
+    fn stale_shells_event_for_stopped_server_is_ignored() {
+        let (mut app, now) = refreshed_app();
+        app.apply(
+            AppEvent::Refreshed {
+                username: "ww41".to_string(),
+                servers: vec![row("", false), row("backup", true)],
+            },
+            now,
+        );
+        app.apply(
+            AppEvent::Shells {
+                server: "default".to_string(),
+                shells: vec![ShellRow {
+                    name: "1".to_string(),
+                    last_activity: None,
+                }],
+            },
+            now,
+        );
+        assert!(
+            app.shells.is_empty(),
+            "shells for a stopped server must be dropped"
         );
     }
 

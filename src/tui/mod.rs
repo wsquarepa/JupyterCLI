@@ -53,8 +53,8 @@ async fn dashboard_loop(
     hub_flag: Option<&str>,
 ) -> Result<(), CliError> {
     let (hub_name, hub) = cfg.resolve_hub(hub_flag)?;
-    // Verbose logging stays off in the TUI: stderr writes would corrupt the alternate screen.
-    let client = HubClient::new(&hub.url, &hub.effective_token())?;
+    // Verbose logging and retry warnings stay off in the TUI: stderr writes would corrupt the alternate screen.
+    let client = HubClient::new(&hub.url, &hub.effective_token())?.with_retry_warnings(false);
     let mut app = app::App::new(hub_name.to_string(), hub.presets.clone());
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
