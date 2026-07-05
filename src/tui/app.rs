@@ -435,6 +435,8 @@ impl App {
                 servers,
             } => {
                 self.finish_op(op);
+                let was_synthetic =
+                    !self.servers.is_empty() && self.server_cursor == self.servers.len();
                 let cursor_name = self
                     .servers
                     .get(self.server_cursor)
@@ -444,6 +446,9 @@ impl App {
                 self.server_cursor = cursor_name
                     .and_then(|d| self.servers.iter().position(|s| s.display == d))
                     .unwrap_or(0);
+                if was_synthetic {
+                    self.server_cursor = self.servers.len();
+                }
                 self.revalidate_commitment();
                 if let Some(name) = self.pending_server_select.take()
                     && let Some(index) = self.servers.iter().position(|s| s.display == name)
@@ -1676,7 +1681,7 @@ mod tests {
         assert!(app.take_effects().is_empty());
     }
 
-    fn open_create_at_starting(app: &mut App, now: Instant, name: &str, op: u64) {
+    fn open_create_at_starting(app: &mut App, name: &str, op: u64) {
         app.dialog = Some(crate::tui::dialogs::Dialog::CreateNamed(
             crate::tui::dialogs::CreateNamedDialog::new(&app.presets),
         ));
@@ -1687,13 +1692,12 @@ mod tests {
             d.op = Some(op);
             d.step = crate::tui::dialogs::CreateStep::Starting;
         }
-        let _ = now;
     }
 
     #[test]
     fn spawn_failure_reverts_to_name_and_preserves_input() {
         let (mut app, now) = fresh_app();
-        open_create_at_starting(&mut app, now, "gpu", 42);
+        open_create_at_starting(&mut app, "gpu", 42);
         app.apply(
             AppEvent::OpFailed {
                 op: 42,
@@ -1715,7 +1719,7 @@ mod tests {
     #[test]
     fn spawn_success_closes_dialog_and_selects_new_row() {
         let (mut app, now) = fresh_app();
-        open_create_at_starting(&mut app, now, "gpu", 43);
+        open_create_at_starting(&mut app, "gpu", 43);
         app.apply(
             AppEvent::OpDone {
                 op: 43,
@@ -1736,5 +1740,52 @@ mod tests {
         assert_eq!(app.servers[app.server_cursor].display, "gpu");
         assert!(app.committed_server.is_none());
         assert_eq!(app.focus, Focus::Servers);
+    }
+
+    #[test]
+    fn refresh_keeps_the_cursor_on_the_synthetic_row() {
+        let (mut app, now) = fresh_app();
+        // servers = [default, backup, lab]; park on the synthetic row (index 3).
+        for _ in 0..5 {
+            app.on_key(&press(KeyCode::Down), now);
+        }
+        assert_eq!(app.server_cursor, app.servers.len());
+        app.apply(
+            AppEvent::Refreshed {
+                op: 7,
+                username: "ww41".to_string(),
+                servers: vec![row("", true), row("backup", true), row("lab", false)],
+            },
+            now,
+        );
+        assert_eq!(app.server_cursor, app.servers.len());
+    }
+
+    #[test]
+    fn pending_server_select_is_discarded_when_absent() {
+        let (mut app, now) = fresh_app();
+        app.pending_server_select = Some("ghost".to_string());
+        // Refresh WITHOUT "ghost": the request is taken and discarded, so the
+        // cursor stays where it was rather than snapping to a wrong row.
+        app.apply(
+            AppEvent::Refreshed {
+                op: 7,
+                username: "ww41".to_string(),
+                servers: vec![row("", true), row("backup", true)],
+            },
+            now,
+        );
+        assert_eq!(app.servers[app.server_cursor].display, "default");
+        assert!(app.pending_server_select.is_none());
+        // A later refresh that DOES contain "ghost" must not hijack the cursor.
+        app.apply(
+            AppEvent::Refreshed {
+                op: 8,
+                username: "ww41".to_string(),
+                servers: vec![row("", true), row("ghost", true)],
+            },
+            now,
+        );
+        assert_eq!(app.servers[app.server_cursor].display, "default");
     }
 }
