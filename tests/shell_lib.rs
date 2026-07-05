@@ -82,9 +82,41 @@ async fn exec_runs_command_and_propagates_exit_code() {
     .await;
     let sock = TermSocket::connect(&mock.url(), "tok").await.unwrap();
     let mut out: Vec<u8> = Vec::new();
-    let outcome = shellops::exec(sock, "nvidia-smi", None, &mut out)
+    let outcome = shellops::exec(sock, "nvidia-smi", None, true, &mut out)
         .await
         .unwrap();
     assert_eq!(outcome.exit_code, 3);
     assert_eq!(String::from_utf8(out).unwrap(), "GPU 0: H200\n");
+}
+
+#[tokio::test]
+async fn exec_reuse_path_keeps_shell_alive_and_propagates_exit_code() {
+    let mock = MockTerminado::spawn("", |input| {
+        let nonce_start = input.find("printf '\\036").map(|p| p + 12).unwrap();
+        let nonce = &input[nonce_start..nonce_start + 16];
+        vec![
+            format!("{input}\r\n"),
+            format!("\x1e{nonce}:S\x1e"),
+            "done\r\n".to_string(),
+            format!("\x1e{nonce}:7\x1e"),
+        ]
+    })
+    .await;
+    let sock = TermSocket::connect(&mock.url(), "tok").await.unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    let outcome = shellops::exec(sock, "make", None, false, &mut out)
+        .await
+        .unwrap();
+    assert_eq!(outcome.exit_code, 7);
+    assert_eq!(String::from_utf8(out).unwrap(), "done\n");
+    let sent = mock.received();
+    let exec_line = sent
+        .iter()
+        .find(|line| line.contains("printf"))
+        .expect("exec line was sent");
+    assert!(
+        exec_line.ends_with("; stty echo\n"),
+        "reuse path must restore echo instead of exiting: {exec_line:?}"
+    );
+    assert!(!exec_line.contains("; exit\n"));
 }

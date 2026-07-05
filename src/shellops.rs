@@ -126,9 +126,13 @@ pub async fn peek(
 
 pub const JHC_FAILURE_EXIT: i32 = 125;
 
-pub fn build_exec_line(command: &str, nonce: &str) -> String {
+pub fn build_exec_line(command: &str, nonce: &str, ephemeral: bool) -> String {
+    // Ephemeral shells are single-use, so `exit` reaps the remote bash. A reused
+    // persistent shell must survive; `stty echo` only undoes the `stty -echo` above,
+    // leaving background jobs and the bash process intact.
+    let tail = if ephemeral { "exit" } else { "stty echo" };
     format!(
-        "stty -echo; printf '\\036{nonce}:S\\036'; {{ {command}; }}; printf '\\036{nonce}:%d\\036' $?; exit\n"
+        "stty -echo; printf '\\036{nonce}:S\\036'; {{ {command}; }}; printf '\\036{nonce}:%d\\036' $?; {tail}\n"
     )
 }
 
@@ -248,6 +252,7 @@ pub async fn exec(
     mut sock: TermSocket,
     command: &str,
     stdin_pipe: Option<tokio::io::Stdin>,
+    ephemeral: bool,
     out: &mut impl std::io::Write,
 ) -> Result<ExecOutcome, ApiError> {
     use rand::RngExt as _;
@@ -260,7 +265,8 @@ pub async fn exec(
             .collect()
     };
     let mut parser = ExecParser::new(&nonce);
-    sock.send_stdin(&build_exec_line(command, &nonce)).await?;
+    sock.send_stdin(&build_exec_line(command, &nonce, ephemeral))
+        .await?;
 
     let mut stdin = stdin_pipe;
     let mut stdin_buf = [0u8; 8192];
@@ -405,9 +411,18 @@ mod tests {
 
     #[test]
     fn exec_line_shape() {
-        let line = build_exec_line("nvidia-smi", "abcd1234");
+        let line = build_exec_line("nvidia-smi", "abcd1234", true);
         assert!(line.starts_with("stty -echo; printf"));
         assert!(line.contains("{ nvidia-smi; }"));
         assert!(line.ends_with("; exit\n"));
+    }
+
+    #[test]
+    fn exec_line_reuse_restores_echo_without_exit() {
+        let line = build_exec_line("nvidia-smi", "abcd1234", false);
+        assert!(line.starts_with("stty -echo; printf"));
+        assert!(line.contains("{ nvidia-smi; }"));
+        assert!(line.ends_with("; stty echo\n"));
+        assert!(!line.contains("; exit\n"));
     }
 }

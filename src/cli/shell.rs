@@ -154,7 +154,7 @@ pub async fn exec_cmd(
     let url = client.ws_terminal_url(&shell_name)?;
     let sock = TermSocket::connect(&url, &ctx.hub.effective_token()).await?;
     let mut stdout = std::io::stdout();
-    let result = shellops::exec(sock, command, stdin_pipe, &mut stdout).await;
+    let result = shellops::exec(sock, command, stdin_pipe, ephemeral, &mut stdout).await;
 
     if ephemeral {
         // The remote `exit` self-destructs the terminal; DELETE is the belt for
