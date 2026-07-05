@@ -199,7 +199,7 @@ fn help_copy_says_jupytercli_and_never_uses_em_dashes() {
         .unwrap();
     let peek_text = String::from_utf8(peek.stdout).unwrap();
     assert!(
-        peek_text.contains("tee"),
+        peek_text.contains("tee") && peek_text.contains(":job.log"),
         "peek help must document the tee-to-file long-job pattern:\n{peek_text}"
     );
 }

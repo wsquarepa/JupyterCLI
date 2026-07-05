@@ -157,7 +157,7 @@ pub enum ShellCmd {
     #[command(
         after_help = "peek shows only the terminal's bounded scrollback, so output from a \
 long-running job can scroll past the ceiling and be lost. For long jobs, capture to a file and \
-fetch it instead:\n  jhc shell send SHELL -- 'cmd |& tee job.log'\n  jhc cp SHELL:job.log ./job.log"
+fetch it instead:\n  jhc shell send SHELL -- 'cmd |& tee job.log'\n  jhc cp :job.log ./job.log"
     )]
     Peek {
         /// Shell as [SERVER:]SHELL
