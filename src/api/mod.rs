@@ -2,6 +2,7 @@ pub mod error;
 pub mod server;
 pub mod sse;
 pub mod types;
+pub mod ws;
 
 use error::{ApiError, check};
 use types::{JsonMap, NewToken, ProgressEvent, TokenInfo, User};
