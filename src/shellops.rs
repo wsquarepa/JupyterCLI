@@ -12,6 +12,7 @@ pub const TERMINAL_LIMIT: usize = 999;
 enum StripState {
     Ground,
     Escape,
+    EscapeIntermediate,
     Csi,
     Osc,
     OscEsc,
@@ -55,8 +56,17 @@ impl AnsiStripper {
                 StripState::Escape => match ch {
                     '[' => self.state = StripState::Csi,
                     ']' => self.state = StripState::Osc,
+                    // An intermediate byte (ECMA-48 0x20..=0x2F) begins a multi-byte
+                    // escape like `ESC(B` (charset designation); consume the whole
+                    // sequence through its final byte instead of leaking that byte.
+                    '\u{20}'..='\u{2f}' => self.state = StripState::EscapeIntermediate,
                     _ => self.state = StripState::Ground,
                 },
+                StripState::EscapeIntermediate => {
+                    if !('\u{20}'..='\u{2f}').contains(&ch) {
+                        self.state = StripState::Ground;
+                    }
+                }
                 StripState::Csi => {
                     if ('\u{40}'..='\u{7e}').contains(&ch) {
                         self.state = StripState::Ground;
@@ -345,6 +355,16 @@ mod tests {
         let mut out = s.push("before\x1b[3");
         out.push_str(&s.push("2mafter"));
         assert_eq!(out, "beforeafter");
+    }
+
+    #[test]
+    fn consumes_intermediate_escape_sequences() {
+        let mut s = AnsiStripper::new();
+        assert_eq!(s.push("\x1b(B"), "");
+        let mut s = AnsiStripper::new();
+        assert_eq!(s.push("\x1b)0"), "");
+        let mut s = AnsiStripper::new();
+        assert_eq!(s.push("\x1b(Bhello"), "hello");
     }
 
     #[test]
