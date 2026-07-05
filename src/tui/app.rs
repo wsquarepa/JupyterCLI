@@ -452,7 +452,8 @@ impl App {
                     self.ensure_grid_cursor_visible();
                     // A pending create points the cursor at its new terminal
                     // once the list refresh shows it; a missing name clears the
-                    // request so a failed create cannot hijack a later refresh.
+                    // request so it cannot hijack a later refresh of the same
+                    // server (switching servers clears it in commit_cursor_server).
                     if let Some(name) = self.pending_select.take()
                         && let Some(index) = self
                             .displayed_terminals()
@@ -728,6 +729,9 @@ impl App {
             self.terminals.clear();
             self.grid_cursor = 0;
             self.grid_scroll = 0;
+            // A create pending on the previous server must not select a
+            // same-named terminal on this one.
+            self.pending_select = None;
         }
         self.committed_server = Some(display.clone());
         if let Some(url) = url {
