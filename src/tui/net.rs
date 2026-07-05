@@ -166,11 +166,12 @@ pub fn spawn_peek(
 }
 
 async fn refresh(client: &HubClient, op: u64) -> Result<AppEvent, ApiError> {
-    let user = client.whoami().await?;
+    let me = client.whoami().await?;
+    let full = client.user_including_stopped(&me.name).await?;
     Ok(AppEvent::Refreshed {
         op,
-        username: user.name.clone(),
-        servers: rows_from_user(&user),
+        username: me.name,
+        servers: rows_from_user(&full),
     })
 }
 
@@ -305,6 +306,18 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(user_json(true)))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/hub/api/users/ww41"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "ww41",
+                "servers": {
+                    "": {"name": "", "ready": true, "url": "/user/ww41/", "user_options": {}},
+                    "backup": {"name": "backup", "ready": true, "url": "/user/ww41/backup/", "user_options": {}},
+                    "old": {"name": "old", "ready": false, "pending": null, "url": null, "user_options": {}}
+                }
+            })))
+            .mount(&server)
+            .await;
         let client = HubClient::new(&server.uri(), "tok").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         dispatch(Effect::Refresh { op: 0 }, client, tx);
@@ -313,7 +326,7 @@ mod tests {
                 username, servers, ..
             } => {
                 assert_eq!(username, "ww41");
-                assert_eq!(servers.len(), 2);
+                assert!(servers.iter().any(|s| s.display == "old" && !s.ready));
             }
             other => panic!("unexpected event: {other:?}"),
         }

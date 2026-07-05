@@ -141,6 +141,17 @@ impl HubClient {
         })
     }
 
+    pub async fn user_including_stopped(&self, name: &str) -> Result<User, ApiError> {
+        let path = format!("hub/api/users/{name}?include_stopped_servers=true");
+        let url = self.url(&path)?;
+        let resp = self.get(&path).await?;
+        resp.json().await.map_err(|e| ApiError::Transport {
+            method: "GET",
+            url: url.to_string(),
+            source: e,
+        })
+    }
+
     fn server_path(user: &str, server: Option<&str>) -> String {
         match server {
             Some(name) => format!("hub/api/users/{user}/servers/{name}"),
@@ -306,7 +317,7 @@ impl HubClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn client(server: &MockServer) -> HubClient {
@@ -389,6 +400,33 @@ mod tests {
             .with_retry_warnings(false);
         let err = client.whoami().await.unwrap_err();
         assert!(err.to_string().contains("502"));
+    }
+
+    #[tokio::test]
+    async fn user_including_stopped_sends_the_flag_and_parses_a_stopped_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/hub/api/users/ww41"))
+            .and(query_param("include_stopped_servers", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "ww41",
+                "servers": {
+                    "backup": {
+                        "name": "backup", "ready": false, "pending": null,
+                        "stopped": true, "url": null, "user_options": {}
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let user = client(&server)
+            .await
+            .user_including_stopped("ww41")
+            .await
+            .unwrap();
+        let backup = &user.servers["backup"];
+        assert!(!backup.ready);
+        assert_eq!(backup.name, "backup");
     }
 
     #[tokio::test]
