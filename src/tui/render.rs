@@ -66,7 +66,7 @@ fn draw_servers(frame: &mut Frame, app: &App, area: Rect) {
         .title(" Servers ")
         .border_style(border_style(focused));
     if focused {
-        block = block.title_bottom(Line::from(" Enter: open  n: new  x: stop ").centered());
+        block = block.title_bottom(Line::from(" n: new  x: stop ").centered());
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -458,17 +458,14 @@ mod tests {
     fn hints_follow_focus() {
         let (app, _) = app_with_servers();
         let text = rendered(&app);
-        // The Servers pane is only 20 cols wide at this frame size (18 usable
-        // inside the border), so the 30-char hint cannot render in full;
-        // ratatui's centered title clips to its trailing slice. Assert the
-        // visible tail instead of the full string.
-        assert!(text.contains("x: stop"), "buffer:\n{text}");
+        assert!(text.contains("n: new  x: stop"), "buffer:\n{text}");
         assert!(!text.contains("Enter: attach"));
 
         let (app, _) = committed(&["1"]);
         let text = rendered(&app);
         assert!(text.contains("Enter: attach  n: new  x: kill  Esc: back"));
         assert!(!text.contains("Enter: open"));
+        assert!(!text.contains("n: new  x: stop"));
     }
 
     #[test]
