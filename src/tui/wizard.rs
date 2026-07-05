@@ -125,7 +125,7 @@ impl WizardState {
 
 /// Text columns available for wizard dialog content: the dialog is 64 wide,
 /// less the two block borders and the two columns of interior padding.
-const CONTENT_WIDTH: usize = 60;
+pub(crate) const CONTENT_WIDTH: usize = 60;
 
 /// Greedy word wrap to `width` columns; a single word longer than the width
 /// breaks mid-word (URLs and error payloads have no convenient spaces).
@@ -133,7 +133,7 @@ const CONTENT_WIDTH: usize = 60;
 /// Width 0 disables wrapping and returns the text as one line. Non-empty input
 /// never yields an empty vec; empty input yields a single empty line so blank
 /// spacer rows survive wrapping.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
@@ -176,7 +176,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 /// Visible window of a (possibly masked) input value: at most `avail` cells
 /// with the cursor cell always inside. Returns (before, at, after) where
 /// `at` is the single cursor cell (a space when the cursor sits past the end).
-fn input_window(display: &str, cursor: usize, avail: usize) -> (String, String, String) {
+pub(crate) fn input_window(display: &str, cursor: usize, avail: usize) -> (String, String, String) {
     let chars: Vec<char> = display.chars().collect();
     let cursor = cursor.min(chars.len());
     if avail == 0 {
@@ -194,7 +194,11 @@ fn input_window(display: &str, cursor: usize, avail: usize) -> (String, String, 
     (before, at, after)
 }
 
-fn input_line(label: &str, input: &LineInput, active: bool) -> ratatui::text::Line<'static> {
+pub(crate) fn input_line(
+    label: &str,
+    input: &LineInput,
+    active: bool,
+) -> ratatui::text::Line<'static> {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::Span;
     let style = if active {

@@ -161,7 +161,16 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome 
     }
 }
 
-pub fn render_dialog(frame: &mut Frame, dialog: &Dialog) {
+fn preset_entry_text(name: &str, options: &JsonMap) -> String {
+    if options.is_empty() {
+        format!(" {name}")
+    } else {
+        let rendered: Vec<String> = options.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        format!(" {name}  {}", rendered.join(" "))
+    }
+}
+
+pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
     let area = frame.area();
     match dialog {
         Dialog::Start(start) => {
@@ -180,14 +189,7 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog) {
                     .iter()
                     .enumerate()
                     .map(|(index, (name, options))| {
-                        let detail = if options.is_empty() {
-                            String::new()
-                        } else {
-                            let rendered: Vec<String> =
-                                options.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                            format!("  {}", rendered.join(" "))
-                        };
-                        let text = format!(" {name}{detail}");
+                        let text = preset_entry_text(name, options);
                         if index == start.selected {
                             Line::from(Span::styled(
                                 format!("{text:<width$}"),
@@ -231,9 +233,74 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog) {
                 " Enter/y: confirm  Esc/n: cancel ",
             );
         }
-        // Rendering for CreateNamed is a later task; it draws nothing until
-        // that task adds its layout here.
-        Dialog::CreateNamed(_) => {}
+        Dialog::CreateNamed(create) => {
+            let mut lines: Vec<Line> = Vec::new();
+            match create.step {
+                CreateStep::Name => {
+                    lines.push(Line::from(" Step 1 of 2: name the server"));
+                    lines.push(Line::from(""));
+                    let mut name_row = super::wizard::input_line("Name", &create.input, true);
+                    if create.flash.is_some() {
+                        for span in &mut name_row.spans {
+                            span.style = span.style.fg(crate::tui::theme::STATUS_ERROR_BG);
+                        }
+                    }
+                    lines.push(name_row);
+                    if let Some(error) = &create.error {
+                        lines.push(Line::from(""));
+                        for wrapped in super::wizard::wrap_text(error, super::wizard::CONTENT_WIDTH)
+                        {
+                            lines.push(Line::from(format!(" {wrapped}")));
+                        }
+                    }
+                }
+                CreateStep::Preset => {
+                    lines.push(Line::from(" Step 2 of 2: choose a preset"));
+                    lines.push(Line::from(""));
+                    for (index, (name, options)) in create.picker.entries.iter().enumerate() {
+                        let text = preset_entry_text(name, options);
+                        if index == create.picker.selected {
+                            lines.push(Line::from(Span::styled(
+                                text,
+                                Style::default()
+                                    .fg(crate::tui::theme::SELECTION_FG)
+                                    .bg(crate::tui::theme::SELECTION_BG),
+                            )));
+                        } else {
+                            lines.push(Line::from(text));
+                        }
+                    }
+                }
+                CreateStep::Starting => {
+                    let name = create.input.value();
+                    let glyph = crate::tui::app::SPINNER_FRAMES
+                        [spinner_frame % crate::tui::app::SPINNER_FRAMES.len()];
+                    lines.push(Line::from(format!(" starting '{name}'  {glyph}")));
+                }
+            }
+            let hints = match create.step {
+                CreateStep::Name => " Enter: continue  Esc: cancel ",
+                CreateStep::Preset => " Up/Down: navigate  Enter: start  Esc: cancel ",
+                CreateStep::Starting => "",
+            };
+            let height = lines.len() as u16 + 4;
+            let rect = super::render::centered_rect(64, height, area);
+            frame.render_widget(Clear, rect);
+            let block = super::render::dialog_block(" Create named server ");
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            let mut content = vec![Line::from("")];
+            content.extend(lines);
+            let padded = ratatui::layout::Rect {
+                x: inner.x + 1,
+                width: inner.width.saturating_sub(2),
+                ..inner
+            };
+            frame.render_widget(Paragraph::new(content), padded);
+            if !hints.is_empty() {
+                super::render::render_hints_below_dialog(frame, rect, area, hints);
+            }
+        }
     }
 }
 
@@ -416,7 +483,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_dialog(frame, &dialog))
+            .draw(|frame| render_dialog(frame, &dialog, 0))
             .unwrap();
         let text = crate::tui::render::buffer_text(&terminal);
         assert!(text.contains("Enter/y: confirm"), "buffer was:\n{text}");
@@ -430,12 +497,66 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_dialog(frame, &dialog))
+            .draw(|frame| render_dialog(frame, &dialog, 0))
             .unwrap();
         let text = crate::tui::render::buffer_text(&terminal);
         assert!(text.contains("Start the default server"));
         assert!(text.contains("hub defaults"));
         assert!(text.contains("a100"));
         assert!(text.contains("Enter: start"));
+    }
+
+    fn render_to_text(dialog: &Dialog) -> String {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dialog(frame, dialog, 0))
+            .unwrap();
+        crate::tui::render::buffer_text(&terminal)
+    }
+
+    #[test]
+    fn create_named_name_step_shows_title_step_and_input() {
+        let dialog = create_dialog();
+        let text = render_to_text(&dialog);
+        assert!(text.contains("Create named server"), "buffer was:\n{text}");
+        assert!(
+            text.contains("Step 1 of 2: name the server"),
+            "buffer was:\n{text}"
+        );
+        assert!(text.contains("Name:"), "buffer was:\n{text}");
+        assert!(text.contains("Enter: continue"), "buffer was:\n{text}");
+    }
+
+    #[test]
+    fn create_named_preset_step_lists_presets() {
+        let now = std::time::Instant::now();
+        let mut dialog = create_dialog();
+        for c in ['g', 'p', 'u'] {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now);
+        let text = render_to_text(&dialog);
+        assert!(
+            text.contains("Step 2 of 2: choose a preset"),
+            "buffer was:\n{text}"
+        );
+        assert!(text.contains("hub defaults"), "buffer was:\n{text}");
+        assert!(text.contains("a100"), "buffer was:\n{text}");
+    }
+
+    #[test]
+    fn create_named_starting_step_shows_the_name_and_spinner() {
+        let now = std::time::Instant::now();
+        let mut dialog = create_dialog();
+        for c in ['g', 'p', 'u'] {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now); // -> Preset
+        if let Dialog::CreateNamed(d) = &mut dialog {
+            d.step = CreateStep::Starting;
+        }
+        let text = render_to_text(&dialog);
+        assert!(text.contains("starting 'gpu'"), "buffer was:\n{text}");
     }
 }

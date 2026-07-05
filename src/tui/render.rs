@@ -37,7 +37,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     draw_statusbar(frame, app, rows[1]);
     if let Some(dialog) = &app.dialog {
-        super::dialogs::render_dialog(frame, dialog);
+        super::dialogs::render_dialog(frame, dialog, app.spinner_frame);
     }
 }
 
