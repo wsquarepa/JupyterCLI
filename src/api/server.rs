@@ -11,13 +11,12 @@ pub struct ServerClient {
 
 impl ServerClient {
     pub fn from_hub(hub: &HubClient, server_url_path: &str) -> Result<Self, ApiError> {
-        let rel = format!(
-            "{}/",
-            server_url_path
-                .trim_start_matches('/')
-                .trim_end_matches('/')
-        );
-        let base = hub.base().join(&rel).map_err(|e| ApiError::BadUrl {
+        // JupyterHub's `server.url` is host-absolute and already carries the hub's
+        // base_url prefix, so it must replace the hub base's path wholesale rather than
+        // extend it. A leading-slash join does exactly that; the trailing slash keeps
+        // later relative joins (`api/terminals`, ...) inside the server path.
+        let abs = format!("/{}/", server_url_path.trim_matches('/'));
+        let base = hub.base().join(&abs).map_err(|e| ApiError::BadUrl {
             url: format!("{}{server_url_path}", hub.base()),
             reason: e.to_string(),
         })?;
@@ -355,6 +354,16 @@ mod tests {
         assert_eq!(
             client.ws_terminal_url("2").unwrap(),
             "wss://jupyter.example.edu/user/ww41/terminals/websocket/2"
+        );
+    }
+
+    #[test]
+    fn base_url_hub_does_not_double_prefix() {
+        let hub = HubClient::new("https://host/jupyter", "tok").unwrap();
+        let client = ServerClient::from_hub(&hub, "/jupyter/user/ww41/").unwrap();
+        assert_eq!(
+            client.ws_terminal_url("1").unwrap(),
+            "wss://host/jupyter/user/ww41/terminals/websocket/1"
         );
     }
 }
