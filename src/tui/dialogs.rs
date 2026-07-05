@@ -117,7 +117,7 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome 
             CreateStep::Name => match key.code {
                 KeyCode::Enter => {
                     let name = create.input.value().to_string();
-                    if name.trim().is_empty() || name.contains('/') {
+                    if name.trim().is_empty() || name.contains('/') || name == "default" {
                         create.flash = Some(now);
                         Outcome::Stay
                     } else {
@@ -156,7 +156,10 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome 
                 KeyCode::Esc => Outcome::Close,
                 _ => Outcome::Stay,
             },
-            CreateStep::Starting => Outcome::Stay,
+            CreateStep::Starting => match key.code {
+                KeyCode::Esc => Outcome::Close,
+                _ => Outcome::Stay,
+            },
         },
     }
 }
@@ -237,7 +240,7 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
             let mut lines: Vec<Line> = Vec::new();
             match create.step {
                 CreateStep::Name => {
-                    lines.push(Line::from(" Step 1 of 2: name the server"));
+                    lines.push(Line::from("Step 1 of 2: name the server"));
                     lines.push(Line::from(""));
                     let mut name_row = super::wizard::input_line("Name", &create.input, true);
                     if create.flash.is_some() {
@@ -250,18 +253,18 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
                         lines.push(Line::from(""));
                         for wrapped in super::wizard::wrap_text(error, super::wizard::CONTENT_WIDTH)
                         {
-                            lines.push(Line::from(format!(" {wrapped}")));
+                            lines.push(Line::from(wrapped));
                         }
                     }
                 }
                 CreateStep::Preset => {
-                    lines.push(Line::from(" Step 2 of 2: choose a preset"));
+                    lines.push(Line::from("Step 2 of 2: choose a preset"));
                     lines.push(Line::from(""));
                     for (index, (name, options)) in create.picker.entries.iter().enumerate() {
                         let text = preset_entry_text(name, options);
                         if index == create.picker.selected {
                             lines.push(Line::from(Span::styled(
-                                text,
+                                format!("{text:<width$}", width = super::wizard::CONTENT_WIDTH),
                                 Style::default()
                                     .fg(crate::tui::theme::SELECTION_FG)
                                     .bg(crate::tui::theme::SELECTION_BG),
@@ -275,7 +278,7 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
                     let name = create.input.value();
                     let glyph = crate::tui::app::SPINNER_FRAMES
                         [spinner_frame % crate::tui::app::SPINNER_FRAMES.len()];
-                    lines.push(Line::from(format!(" starting '{name}'  {glyph}")));
+                    lines.push(Line::from(format!("starting '{name}'  {glyph}")));
                 }
             }
             let hints = match create.step {
@@ -558,5 +561,62 @@ mod tests {
         }
         let text = render_to_text(&dialog);
         assert!(text.contains("starting 'gpu'"), "buffer was:\n{text}");
+    }
+
+    #[test]
+    fn starting_step_esc_closes_other_keys_stay() {
+        let now = Instant::now();
+        let mut dialog = create_dialog();
+        if let Dialog::CreateNamed(d) = &mut dialog {
+            d.step = CreateStep::Starting;
+        }
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Char('x')), now),
+            Outcome::Stay
+        ));
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Esc), now),
+            Outcome::Close
+        ));
+    }
+
+    #[test]
+    fn default_name_is_rejected() {
+        let now = Instant::now();
+        let mut dialog = create_dialog();
+        for c in "default".chars() {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        if let Dialog::CreateNamed(d) = &dialog {
+            assert!(matches!(d.step, CreateStep::Name));
+            assert!(d.flash.is_some());
+        }
+    }
+
+    #[test]
+    fn create_named_error_wraps_with_spacer_and_full_width_last_column() {
+        // Two full-width (60-col) words; the second ends in a unique marker so a
+        // clipped last column would drop it (guards the double-pad fix).
+        let error = format!("{} {}Z", "A".repeat(60), "B".repeat(59));
+        let mut dialog = create_dialog();
+        if let Dialog::CreateNamed(d) = &mut dialog {
+            d.error = Some(error);
+        }
+        let text = render_to_text(&dialog);
+        let marker = format!("{}Z", "B".repeat(59));
+        assert!(text.contains(&marker), "buffer was:\n{text}");
+        let rows: Vec<&str> = text.lines().collect();
+        let first_error = rows
+            .iter()
+            .position(|r| r.contains(&"A".repeat(60)))
+            .expect("wrapped error line present");
+        assert!(
+            !rows[first_error - 1].chars().any(|c| c.is_alphanumeric()),
+            "expected a blank spacer above the error, buffer was:\n{text}"
+        );
     }
 }
