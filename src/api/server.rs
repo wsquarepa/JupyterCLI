@@ -7,6 +7,7 @@ pub struct ServerClient {
     http: reqwest::Client,
     base: reqwest::Url,
     token: String,
+    verbose: bool,
 }
 
 impl ServerClient {
@@ -24,6 +25,7 @@ impl ServerClient {
             http: reqwest::Client::new(),
             base,
             token: hub.token().to_string(),
+            verbose: hub.verbose(),
         })
     }
 
@@ -38,17 +40,29 @@ impl ServerClient {
         rb.header("Authorization", format!("token {}", self.token))
     }
 
+    fn log(&self, method: &str, url: &str, outcome: &str) {
+        if self.verbose {
+            eprintln!("jhc: {method} {url} -> {outcome}");
+        }
+    }
+
     pub async fn terminals(&self) -> Result<Vec<Terminal>, ApiError> {
         let url = self.url("api/terminals")?;
-        let resp = self
-            .auth(self.http.get(url.clone()))
-            .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "GET",
-                url: url.to_string(),
-                source: e,
-            })?;
+        let result = self.auth(self.http.get(url.clone())).send().await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("GET", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("GET", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "GET",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         if resp.status().as_u16() == 404 {
             return Err(ApiError::TerminalsUnsupported {
                 url: url.to_string(),
@@ -64,15 +78,21 @@ impl ServerClient {
 
     pub async fn create_terminal(&self) -> Result<Terminal, ApiError> {
         let url = self.url("api/terminals")?;
-        let resp = self
-            .auth(self.http.post(url.clone()))
-            .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "POST",
-                url: url.to_string(),
-                source: e,
-            })?;
+        let result = self.auth(self.http.post(url.clone())).send().await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("POST", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("POST", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "POST",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         if resp.status().as_u16() == 404 {
             return Err(ApiError::TerminalsUnsupported {
                 url: url.to_string(),
@@ -88,15 +108,21 @@ impl ServerClient {
 
     pub async fn delete_terminal(&self, name: &str) -> Result<(), ApiError> {
         let url = self.url(&format!("api/terminals/{name}"))?;
-        let resp = self
-            .auth(self.http.delete(url.clone()))
-            .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "DELETE",
-                url: url.to_string(),
-                source: e,
-            })?;
+        let result = self.auth(self.http.delete(url.clone())).send().await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("DELETE", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("DELETE", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "DELETE",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         if resp.status().as_u16() == 404 {
             return Ok(());
         }
@@ -105,16 +131,25 @@ impl ServerClient {
 
     pub async fn list_dir(&self, path: &str) -> Result<Vec<ContentEntry>, ApiError> {
         let url = self.url(&format!("api/contents/{}", path.trim_start_matches('/')))?;
-        let resp = self
+        let result = self
             .auth(self.http.get(url.clone()))
             .query(&[("content", "1")])
             .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "GET",
-                url: url.to_string(),
-                source: e,
-            })?;
+            .await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("GET", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("GET", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "GET",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         let resp = check("GET", url.as_str(), resp).await?;
         let model: serde_json::Value = resp.json().await.map_err(|e| ApiError::Transport {
             method: "GET",
@@ -146,16 +181,25 @@ impl ServerClient {
 
     pub async fn download(&self, path: &str) -> Result<Vec<u8>, ApiError> {
         let url = self.url(&format!("api/contents/{}", path.trim_start_matches('/')))?;
-        let resp = self
+        let result = self
             .auth(self.http.get(url.clone()))
             .query(&[("format", "base64"), ("content", "1")])
             .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "GET",
-                url: url.to_string(),
-                source: e,
-            })?;
+            .await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("GET", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("GET", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "GET",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         let resp = check("GET", url.as_str(), resp).await?;
         let model: ContentModel = resp.json().await.map_err(|e| ApiError::Transport {
             method: "GET",
@@ -193,47 +237,71 @@ impl ServerClient {
             "format": "base64",
             "content": base64::engine::general_purpose::STANDARD.encode(bytes),
         });
-        let resp = self
+        let result = self
             .auth(self.http.put(url.clone()))
             .json(&body)
             .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "PUT",
-                url: url.to_string(),
-                source: e,
-            })?;
+            .await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("PUT", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("PUT", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "PUT",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         check("PUT", url.as_str(), resp).await.map(|_| ())
     }
 
     pub async fn mkdir(&self, path: &str) -> Result<(), ApiError> {
         let clean = path.trim_start_matches('/');
         let url = self.url(&format!("api/contents/{clean}"))?;
-        let resp = self
+        let result = self
             .auth(self.http.put(url.clone()))
             .json(&serde_json::json!({"type": "directory"}))
             .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "PUT",
-                url: url.to_string(),
-                source: e,
-            })?;
+            .await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("PUT", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("PUT", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "PUT",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         check("PUT", url.as_str(), resp).await.map(|_| ())
     }
 
     pub async fn delete_path(&self, path: &str) -> Result<(), ApiError> {
         let clean = path.trim_start_matches('/');
         let url = self.url(&format!("api/contents/{clean}"))?;
-        let resp = self
-            .auth(self.http.delete(url.clone()))
-            .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "DELETE",
-                url: url.to_string(),
-                source: e,
-            })?;
+        let result = self.auth(self.http.delete(url.clone())).send().await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("DELETE", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("DELETE", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "DELETE",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         check("DELETE", url.as_str(), resp).await.map(|_| ())
     }
 

@@ -12,6 +12,7 @@ pub struct HubClient {
     http: reqwest::Client,
     base: reqwest::Url,
     token: String,
+    verbose: bool,
 }
 
 impl HubClient {
@@ -25,7 +26,23 @@ impl HubClient {
             http: reqwest::Client::new(),
             base,
             token: token.to_string(),
+            verbose: false,
         })
+    }
+
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
+    pub fn verbose(&self) -> bool {
+        self.verbose
+    }
+
+    fn log(&self, method: &str, url: &str, outcome: &str) {
+        if self.verbose {
+            eprintln!("jhc: {method} {url} -> {outcome}");
+        }
     }
 
     pub fn base(&self) -> &reqwest::Url {
@@ -54,19 +71,22 @@ impl HubClient {
             let result = self.auth(self.http.get(url.clone())).send().await;
             match result {
                 Ok(resp) if resp.status().is_server_error() && attempt < 3 => {
-                    eprintln!(
-                        "warning: GET {url} attempt {attempt} returned {}; retrying",
-                        resp.status()
-                    );
+                    let status = resp.status();
+                    self.log("GET", url.as_str(), &status.to_string());
+                    eprintln!("warning: GET {url} attempt {attempt} returned {status}; retrying");
                     last = Some(ApiError::Status {
                         method: "GET",
                         url: url.to_string(),
-                        status: resp.status().as_u16(),
+                        status: status.as_u16(),
                         body: resp.text().await.unwrap_or_default(),
                     });
                 }
-                Ok(resp) => return check("GET", url.as_str(), resp).await,
+                Ok(resp) => {
+                    self.log("GET", url.as_str(), &resp.status().to_string());
+                    return check("GET", url.as_str(), resp).await;
+                }
                 Err(e) if attempt < 3 => {
+                    self.log("GET", url.as_str(), &format!("transport error: {e}"));
                     eprintln!("warning: GET {url} attempt {attempt} failed: {e}; retrying");
                     last = Some(ApiError::Transport {
                         method: "GET",
@@ -75,6 +95,7 @@ impl HubClient {
                     });
                 }
                 Err(e) => {
+                    self.log("GET", url.as_str(), &format!("transport error: {e}"));
                     return Err(ApiError::Transport {
                         method: "GET",
                         url: url.to_string(),
@@ -121,30 +142,45 @@ impl HubClient {
         options: &JsonMap,
     ) -> Result<(), ApiError> {
         let url = self.url(&Self::server_path(user, server))?;
-        let resp = self
+        let result = self
             .auth(self.http.post(url.clone()))
             .json(options)
             .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "POST",
-                url: url.to_string(),
-                source: e,
-            })?;
+            .await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("POST", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("POST", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "POST",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         check("POST", url.as_str(), resp).await.map(|_| ())
     }
 
     pub async fn stop(&self, user: &str, server: Option<&str>) -> Result<(), ApiError> {
         let url = self.url(&Self::server_path(user, server))?;
-        let resp = self
-            .auth(self.http.delete(url.clone()))
-            .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "DELETE",
-                url: url.to_string(),
-                source: e,
-            })?;
+        let result = self.auth(self.http.delete(url.clone())).send().await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("DELETE", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("DELETE", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "DELETE",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         check("DELETE", url.as_str(), resp).await.map(|_| ())
     }
 
@@ -206,16 +242,25 @@ impl HubClient {
 
     pub async fn create_token(&self, user: &str, note: &str) -> Result<NewToken, ApiError> {
         let url = self.url(&format!("hub/api/users/{user}/tokens"))?;
-        let resp = self
+        let result = self
             .auth(self.http.post(url.clone()))
             .json(&serde_json::json!({ "note": note }))
             .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "POST",
-                url: url.to_string(),
-                source: e,
-            })?;
+            .await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("POST", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("POST", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "POST",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         let resp = check("POST", url.as_str(), resp).await?;
         resp.json().await.map_err(|e| ApiError::Transport {
             method: "POST",
@@ -226,15 +271,21 @@ impl HubClient {
 
     pub async fn revoke_token(&self, user: &str, id: &str) -> Result<(), ApiError> {
         let url = self.url(&format!("hub/api/users/{user}/tokens/{id}"))?;
-        let resp = self
-            .auth(self.http.delete(url.clone()))
-            .send()
-            .await
-            .map_err(|e| ApiError::Transport {
-                method: "DELETE",
-                url: url.to_string(),
-                source: e,
-            })?;
+        let result = self.auth(self.http.delete(url.clone())).send().await;
+        let resp = match result {
+            Ok(resp) => {
+                self.log("DELETE", url.as_str(), &resp.status().to_string());
+                resp
+            }
+            Err(e) => {
+                self.log("DELETE", url.as_str(), &format!("transport error: {e}"));
+                return Err(ApiError::Transport {
+                    method: "DELETE",
+                    url: url.to_string(),
+                    source: e,
+                });
+            }
+        };
         check("DELETE", url.as_str(), resp).await.map(|_| ())
     }
 }

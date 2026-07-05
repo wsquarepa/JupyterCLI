@@ -203,3 +203,63 @@ fn help_copy_says_jupytercli_and_never_uses_em_dashes() {
         "peek help must document the tee-to-file long-job pattern:\n{peek_text}"
     );
 }
+
+#[tokio::test]
+async fn verbose_prints_request_summaries_without_the_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/hub/api/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "ww41", "servers": {}
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let init = common::client_bin()
+        .env("JHC_CONFIG_DIR", dir.path())
+        .env_remove("JUPYTERHUB_API_TOKEN")
+        .args([
+            "init",
+            "--url",
+            &server.uri(),
+            "--token",
+            "supersecrettok",
+            "--name",
+            "test",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let status = common::client_bin()
+        .env("JHC_CONFIG_DIR", dir.path())
+        .env_remove("JUPYTERHUB_API_TOKEN")
+        .args(["--verbose", "status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let stderr = String::from_utf8(status.stderr).unwrap();
+    assert!(stderr.contains("jhc: GET"), "stderr was: {stderr}");
+    assert!(stderr.contains("-> 200"));
+    assert!(
+        !stderr.contains("supersecrettok"),
+        "token must never appear in verbose output"
+    );
+
+    let quiet = common::client_bin()
+        .env("JHC_CONFIG_DIR", dir.path())
+        .env_remove("JUPYTERHUB_API_TOKEN")
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8(quiet.stderr)
+            .unwrap()
+            .contains("jhc: GET")
+    );
+}
