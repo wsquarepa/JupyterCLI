@@ -88,7 +88,7 @@ pub enum Command {
         #[arg(long)]
         shell: Option<String>,
         /// Command and arguments to run
-        #[arg(trailing_var_arg = true, required = true)]
+        #[arg(last = true)]
         command: Vec<String>,
     },
     /// List remote files
@@ -333,6 +333,11 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
             shell,
             command,
         }) => {
+            if command.is_empty() {
+                return Err(CliError::Usage(
+                    "exec requires a command to run".to_string(),
+                ));
+            }
             let code = shell::exec_cmd(
                 &Ctx::load(cli.hub.as_deref())?,
                 server.as_deref(),
