@@ -57,7 +57,13 @@ async fn dashboard_loop(
     let (hub_name, hub) = cfg.resolve_hub(hub_flag)?;
     // Verbose logging and retry warnings stay off in the TUI: stderr writes would corrupt the alternate screen.
     let client = HubClient::new(&hub.url, &hub.effective_token())?.with_retry_warnings(false);
-    let mut app = app::App::new(hub_name.to_string(), hub.presets.clone());
+    let size = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut app = app::App::new(
+        hub_name.to_string(),
+        hub.presets.clone(),
+        hub.effective_terminal_limit(),
+        size,
+    );
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut events = crossterm::event::EventStream::new();
@@ -73,6 +79,7 @@ async fn dashboard_loop(
         tokio::select! {
             event = events.next() => match event {
                 Some(Ok(crossterm::event::Event::Key(key))) => app.on_key(&key, Instant::now()),
+                Some(Ok(crossterm::event::Event::Resize(cols, rows))) => app.set_size(cols, rows),
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(CliError::Io(e)),
                 None => return Ok(()),
@@ -82,10 +89,7 @@ async fn dashboard_loop(
                     app.apply(message, Instant::now());
                 }
             }
-            _ = refresh.tick() => {
-                app.loading = true;
-                net::dispatch(app::Effect::Refresh, client.clone(), tx.clone());
-            }
+            _ = refresh.tick() => app.request_refresh(),
             _ = tick.tick() => app.tick(Instant::now()),
         }
 
@@ -95,16 +99,7 @@ async fn dashboard_loop(
                 app::Effect::Attach { target } => {
                     let message = suspend::attach_in_subprocess(&app.hub_name, &target).await?;
                     terminal.clear().map_err(CliError::Io)?;
-                    app.set_status(message, false, Instant::now());
-                    if let Some(server) = app.selected_server()
-                        && let Some(url) = server.url.clone()
-                    {
-                        let effect = app::Effect::FetchShells {
-                            server: server.display.clone(),
-                            url,
-                        };
-                        net::dispatch(effect, client.clone(), tx.clone());
-                    }
+                    app.after_attach(message, Instant::now());
                 }
                 other => net::dispatch(other, client.clone(), tx.clone()),
             }

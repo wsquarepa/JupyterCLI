@@ -63,6 +63,7 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent) -> Outcome {
             KeyCode::Enter => {
                 let (_, options) = start.entries[start.selected].clone();
                 Outcome::Commit(Effect::Start {
+                    op: 0,
                     server: start.server.clone(),
                     options,
                 })
@@ -176,6 +177,7 @@ mod tests {
             Outcome::Commit(Effect::Start {
                 server: None,
                 options,
+                ..
             }) => {
                 assert_eq!(options["resource"], serde_json::json!("2_a100"));
             }
@@ -204,18 +206,21 @@ mod tests {
         let make = || {
             Dialog::Confirm(ConfirmDialog {
                 message: "Stop default?".to_string(),
-                effect: Effect::Stop { server: None },
+                effect: Effect::Stop {
+                    op: 0,
+                    server: None,
+                },
             })
         };
         let mut dialog = make();
         assert!(matches!(
             handle_key(&mut dialog, &press(KeyCode::Enter)),
-            Outcome::Commit(Effect::Stop { server: None })
+            Outcome::Commit(Effect::Stop { server: None, .. })
         ));
         let mut dialog = make();
         assert!(matches!(
             handle_key(&mut dialog, &press(KeyCode::Char('y'))),
-            Outcome::Commit(Effect::Stop { server: None })
+            Outcome::Commit(Effect::Stop { server: None, .. })
         ));
         let mut dialog = make();
         assert!(matches!(
@@ -228,7 +233,10 @@ mod tests {
     fn confirm_footer_documents_the_y_and_n_synonyms() {
         let dialog = Dialog::Confirm(ConfirmDialog {
             message: "Stop default?".to_string(),
-            effect: Effect::Stop { server: None },
+            effect: Effect::Stop {
+                op: 0,
+                server: None,
+            },
         });
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

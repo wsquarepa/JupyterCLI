@@ -5,7 +5,7 @@ use crate::api::error::ApiError;
 use crate::api::server::ServerClient;
 use crate::api::types::User;
 
-use super::app::{AppEvent, Effect, ServerRow, ShellRow};
+use super::app::{AppEvent, Effect, ServerRow, TerminalRow};
 
 pub fn rows_from_user(user: &User) -> Vec<ServerRow> {
     let mut rows: Vec<ServerRow> = Vec::new();
@@ -49,22 +49,41 @@ pub fn rows_from_user(user: &User) -> Vec<ServerRow> {
 
 pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
-        let event = match effect {
-            Effect::Refresh => refresh(&client).await,
-            Effect::FetchShells { server, url } => fetch_shells(&client, server, &url).await,
-            Effect::Start { server, options } => {
-                start(&client, server.as_deref(), options, &tx).await
-            }
-            Effect::Stop { server } => stop(&client, server.as_deref()).await,
-            Effect::NewShell { server, url } => new_shell(&client, &server, &url).await,
-            Effect::KillShell { server, url, shell } => {
-                kill_shell(&client, &server, &url, &shell).await
-            }
+        let op = match &effect {
+            Effect::Refresh { op }
+            | Effect::FetchTerminals { op, .. }
+            | Effect::Start { op, .. }
+            | Effect::Stop { op, .. }
+            | Effect::NewTerminal { op, .. }
+            | Effect::KillTerminal { op, .. } => *op,
             Effect::Attach { .. } | Effect::Quit => {
                 unreachable!("attach and quit are handled by the event loop, not net::dispatch")
             }
         };
+        let event = match effect {
+            Effect::Refresh { op } => refresh(&client, op).await,
+            Effect::FetchTerminals { op, server, url } => {
+                fetch_terminals(&client, op, server, &url).await
+            }
+            Effect::Start {
+                op,
+                server,
+                options,
+            } => start(&client, op, server.as_deref(), options, &tx).await,
+            Effect::Stop { op, server } => stop(&client, op, server.as_deref()).await,
+            Effect::NewTerminal { op, server, url } => {
+                new_terminal(&client, op, &server, &url).await
+            }
+            Effect::KillTerminal {
+                op,
+                server,
+                url,
+                terminal,
+            } => kill_terminal(&client, op, &server, &url, &terminal).await,
+            Effect::Attach { .. } | Effect::Quit => unreachable!("checked above"),
+        };
         let event = event.unwrap_or_else(|e| AppEvent::OpFailed {
+            op,
             message: e.to_string(),
         });
         // A send failure means the UI is shutting down; nothing left to report to.
@@ -72,30 +91,38 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
     });
 }
 
-async fn refresh(client: &HubClient) -> Result<AppEvent, ApiError> {
+async fn refresh(client: &HubClient, op: u64) -> Result<AppEvent, ApiError> {
     let user = client.whoami().await?;
     Ok(AppEvent::Refreshed {
+        op,
         username: user.name.clone(),
         servers: rows_from_user(&user),
     })
 }
 
-async fn fetch_shells(client: &HubClient, server: String, url: &str) -> Result<AppEvent, ApiError> {
+async fn fetch_terminals(
+    client: &HubClient,
+    op: u64,
+    server: String,
+    url: &str,
+) -> Result<AppEvent, ApiError> {
     let sc = ServerClient::from_hub(client, url)?;
-    let shells = sc
+    let terminals = sc
         .terminals()
         .await?
         .into_iter()
-        .map(|t| ShellRow {
-            name: t.name,
-            last_activity: t.last_activity,
-        })
+        .map(|t| TerminalRow { name: t.name })
         .collect();
-    Ok(AppEvent::Shells { server, shells })
+    Ok(AppEvent::Terminals {
+        op,
+        server,
+        terminals,
+    })
 }
 
 async fn start(
     client: &HubClient,
+    op: u64,
     server: Option<&str>,
     options: crate::config::JsonMap,
     tx: &UnboundedSender<AppEvent>,
@@ -113,14 +140,16 @@ async fn start(
         })
         .await?;
     Ok(AppEvent::OpDone {
+        op,
         message: "server ready".to_string(),
     })
 }
 
-async fn stop(client: &HubClient, server: Option<&str>) -> Result<AppEvent, ApiError> {
+async fn stop(client: &HubClient, op: u64, server: Option<&str>) -> Result<AppEvent, ApiError> {
     let user = client.whoami().await?;
     client.stop(&user.name, server).await?;
     Ok(AppEvent::OpDone {
+        op,
         message: format!(
             "stop requested for {}",
             server.unwrap_or("the default server")
@@ -128,24 +157,32 @@ async fn stop(client: &HubClient, server: Option<&str>) -> Result<AppEvent, ApiE
     })
 }
 
-async fn new_shell(client: &HubClient, server: &str, url: &str) -> Result<AppEvent, ApiError> {
+async fn new_terminal(
+    client: &HubClient,
+    op: u64,
+    server: &str,
+    url: &str,
+) -> Result<AppEvent, ApiError> {
     let sc = ServerClient::from_hub(client, url)?;
     let terminal = sc.create_terminal().await?;
     Ok(AppEvent::OpDone {
-        message: format!("created shell {} on {server}", terminal.name),
+        op,
+        message: format!("created terminal {} on {server}", terminal.name),
     })
 }
 
-async fn kill_shell(
+async fn kill_terminal(
     client: &HubClient,
+    op: u64,
     server: &str,
     url: &str,
-    shell: &str,
+    terminal: &str,
 ) -> Result<AppEvent, ApiError> {
     let sc = ServerClient::from_hub(client, url)?;
-    sc.delete_terminal(shell).await?;
+    sc.delete_terminal(terminal).await?;
     Ok(AppEvent::OpDone {
-        message: format!("killed shell {shell} on {server}"),
+        op,
+        message: format!("killed terminal {terminal} on {server}"),
     })
 }
 
@@ -195,9 +232,11 @@ mod tests {
             .await;
         let client = HubClient::new(&server.uri(), "tok").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        dispatch(Effect::Refresh, client, tx);
+        dispatch(Effect::Refresh { op: 0 }, client, tx);
         match rx.recv().await.unwrap() {
-            AppEvent::Refreshed { username, servers } => {
+            AppEvent::Refreshed {
+                username, servers, ..
+            } => {
                 assert_eq!(username, "ww41");
                 assert_eq!(servers.len(), 2);
             }
@@ -238,6 +277,7 @@ mod tests {
             serde_json::from_str(r#"{"resource": "2_a100"}"#).unwrap();
         dispatch(
             Effect::Start {
+                op: 0,
                 server: None,
                 options,
             },
@@ -250,7 +290,7 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         match rx.recv().await.unwrap() {
-            AppEvent::OpDone { message } => assert!(message.contains("ready")),
+            AppEvent::OpDone { message, .. } => assert!(message.contains("ready")),
             other => panic!("unexpected event: {other:?}"),
         }
     }
@@ -265,9 +305,9 @@ mod tests {
             .await;
         let client = HubClient::new(&server.uri(), "tok").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        dispatch(Effect::Refresh, client, tx);
+        dispatch(Effect::Refresh { op: 0 }, client, tx);
         match rx.recv().await.unwrap() {
-            AppEvent::OpFailed { message } => assert!(message.contains("scope")),
+            AppEvent::OpFailed { message, .. } => assert!(message.contains("scope")),
             other => panic!("unexpected event: {other:?}"),
         }
     }

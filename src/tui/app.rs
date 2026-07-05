@@ -5,12 +5,15 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::config::JsonMap;
 
+use super::grid;
+
 pub const STATUS_TTL: Duration = Duration::from_secs(5);
+pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Servers,
-    Shells,
+    Grid,
 }
 
 #[derive(Debug, Clone)]
@@ -24,59 +27,96 @@ pub struct ServerRow {
 }
 
 #[derive(Debug, Clone)]
-pub struct ShellRow {
+pub struct TerminalRow {
     pub name: String,
-    pub last_activity: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum AppEvent {
     Refreshed {
+        op: u64,
         username: String,
         servers: Vec<ServerRow>,
     },
-    Shells {
+    Terminals {
+        op: u64,
         server: String,
-        shells: Vec<ShellRow>,
+        terminals: Vec<TerminalRow>,
     },
     Progress {
         message: String,
     },
     OpDone {
+        op: u64,
         message: String,
     },
     OpFailed {
+        op: u64,
         message: String,
     },
 }
 
 #[derive(Debug)]
 pub enum Effect {
-    Refresh,
-    FetchShells {
+    Refresh {
+        op: u64,
+    },
+    FetchTerminals {
+        op: u64,
         server: String,
         url: String,
     },
     Start {
+        op: u64,
         server: Option<String>,
         options: JsonMap,
     },
     Stop {
+        op: u64,
         server: Option<String>,
     },
-    NewShell {
+    NewTerminal {
+        op: u64,
         server: String,
         url: String,
     },
-    KillShell {
+    KillTerminal {
+        op: u64,
         server: String,
         url: String,
-        shell: String,
+        terminal: String,
     },
     Attach {
         target: String,
     },
     Quit,
+}
+
+impl Effect {
+    /// Spinner label for network effects; None for loop-handled effects.
+    fn label(&self) -> Option<&'static str> {
+        match self {
+            Effect::Refresh { .. } => Some("refreshing"),
+            Effect::FetchTerminals { .. } => Some("loading terminals"),
+            Effect::Start { .. } => Some("starting"),
+            Effect::Stop { .. } => Some("stopping"),
+            Effect::NewTerminal { .. } => Some("creating"),
+            Effect::KillTerminal { .. } => Some("killing"),
+            Effect::Attach { .. } | Effect::Quit => None,
+        }
+    }
+
+    fn set_op(&mut self, id: u64) {
+        match self {
+            Effect::Refresh { op }
+            | Effect::FetchTerminals { op, .. }
+            | Effect::Start { op, .. }
+            | Effect::Stop { op, .. }
+            | Effect::NewTerminal { op, .. }
+            | Effect::KillTerminal { op, .. } => *op = id,
+            Effect::Attach { .. } | Effect::Quit => {}
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -90,37 +130,91 @@ pub struct App {
     pub hub_name: String,
     pub username: Option<String>,
     pub servers: Vec<ServerRow>,
-    pub selected_server: usize,
-    pub shells: Vec<ShellRow>,
-    pub selected_shell: usize,
+    pub server_cursor: usize,
+    pub committed_server: Option<String>,
+    pub terminals: Vec<TerminalRow>,
+    pub grid_cursor: usize,
+    pub grid_scroll: usize,
     pub focus: Focus,
     pub dialog: Option<super::dialogs::Dialog>,
     pub status: Option<StatusMsg>,
     pub presets: BTreeMap<String, JsonMap>,
-    pub loading: bool,
+    pub terminal_limit: usize,
+    pub size: (u16, u16),
+    pub ops: BTreeMap<u64, &'static str>,
+    pub spinner_frame: usize,
+    next_op: u64,
     effects: Vec<Effect>,
 }
 
 impl App {
-    pub fn new(hub_name: String, presets: BTreeMap<String, JsonMap>) -> Self {
-        Self {
+    pub fn new(
+        hub_name: String,
+        presets: BTreeMap<String, JsonMap>,
+        terminal_limit: usize,
+        size: (u16, u16),
+    ) -> Self {
+        let mut app = Self {
             hub_name,
             username: None,
             servers: Vec::new(),
-            selected_server: 0,
-            shells: Vec::new(),
-            selected_shell: 0,
+            server_cursor: 0,
+            committed_server: None,
+            terminals: Vec::new(),
+            grid_cursor: 0,
+            grid_scroll: 0,
             focus: Focus::Servers,
             dialog: None,
             status: None,
             presets,
-            loading: true,
-            effects: vec![Effect::Refresh],
-        }
+            terminal_limit,
+            size,
+            ops: BTreeMap::new(),
+            spinner_frame: 0,
+            next_op: 1,
+            effects: Vec::new(),
+        };
+        app.request_refresh();
+        app
     }
 
-    pub fn selected_server(&self) -> Option<&ServerRow> {
-        self.servers.get(self.selected_server)
+    pub fn request_refresh(&mut self) {
+        self.push_effect(Effect::Refresh { op: 0 });
+    }
+
+    /// Op ids are stamped here; construction sites use a 0 placeholder.
+    fn push_effect(&mut self, mut effect: Effect) -> Option<u64> {
+        let id = effect.label().map(|label| {
+            let id = self.next_op;
+            self.next_op += 1;
+            self.ops.insert(id, label);
+            id
+        });
+        if let Some(id) = id {
+            effect.set_op(id);
+        }
+        self.effects.push(effect);
+        id
+    }
+
+    fn finish_op(&mut self, op: u64) {
+        self.ops.remove(&op);
+    }
+
+    /// Spinner glyph and the most recently started operation's label, while
+    /// any operation is in flight.
+    pub fn spinner(&self) -> Option<(&'static str, &'static str)> {
+        self.ops.iter().next_back().map(|(_, label)| {
+            (
+                SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()],
+                *label,
+            )
+        })
+    }
+
+    pub fn set_size(&mut self, cols: u16, rows: u16) {
+        self.size = (cols, rows);
+        self.ensure_grid_cursor_visible();
     }
 
     pub fn set_status(&mut self, text: String, error: bool, now: Instant) {
@@ -141,54 +235,134 @@ impl App {
         {
             self.status = None;
         }
+        if !self.ops.is_empty() {
+            self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        }
     }
 
-    fn attach_target(server: &ServerRow, shell: &ShellRow) -> String {
-        format!("{}:{}", server.name, shell.name)
+    pub fn committed_row(&self) -> Option<&ServerRow> {
+        let name = self.committed_server.as_deref()?;
+        self.servers.iter().find(|s| s.display == name)
     }
 
-    fn fetch_shells_for_selection(&mut self) {
-        self.shells.clear();
-        self.selected_shell = 0;
-        if let Some(server) = self.selected_server()
-            && server.ready
-            && let Some(url) = &server.url
-        {
-            self.effects.push(Effect::FetchShells {
-                server: server.display.clone(),
-                url: url.clone(),
-            });
+    pub fn displayed_terminals(&self) -> &[TerminalRow] {
+        &self.terminals[..self.terminals.len().min(grid::DISPLAY_CAP)]
+    }
+
+    pub fn hovered_terminal(&self) -> Option<&TerminalRow> {
+        if self.focus == Focus::Grid {
+            self.displayed_terminals().get(self.grid_cursor)
+        } else {
+            None
+        }
+    }
+
+    pub fn grid_columns(&self) -> usize {
+        grid::columns_for_width(grid::grid_inner_width(self.size.0))
+    }
+
+    fn grid_inner_height(&self) -> u16 {
+        // Main area minus the status bar row, minus the pane borders. Task 4
+        // subtracts the peek pane when it is visible.
+        self.size.1.saturating_sub(1).saturating_sub(2)
+    }
+
+    fn ensure_grid_cursor_visible(&mut self) {
+        let cols = self.grid_columns();
+        let visible = grid::visible_card_rows(self.grid_inner_height()).max(1);
+        let row = self.grid_cursor / cols;
+        if row < self.grid_scroll {
+            self.grid_scroll = row;
+        }
+        if row >= self.grid_scroll + visible {
+            self.grid_scroll = row + 1 - visible;
         }
     }
 
     pub fn apply(&mut self, event: AppEvent, now: Instant) {
         match event {
-            AppEvent::Refreshed { username, servers } => {
-                let keep = self.selected_server().map(|s| s.display.clone());
+            AppEvent::Refreshed {
+                op,
+                username,
+                servers,
+            } => {
+                self.finish_op(op);
+                let cursor_name = self
+                    .servers
+                    .get(self.server_cursor)
+                    .map(|s| s.display.clone());
                 self.username = Some(username);
                 self.servers = servers;
-                self.loading = false;
-                self.selected_server = keep
+                self.server_cursor = cursor_name
                     .and_then(|d| self.servers.iter().position(|s| s.display == d))
                     .unwrap_or(0);
-                self.fetch_shells_for_selection();
+                self.revalidate_commitment();
             }
-            AppEvent::Shells { server, shells } => {
-                let current = self.selected_server().map(|s| s.display.clone());
-                if current.as_deref() == Some(server.as_str())
-                    && self.selected_server().is_some_and(|s| s.ready)
-                {
-                    self.shells = shells;
-                    self.selected_shell =
-                        self.selected_shell.min(self.shells.len().saturating_sub(1));
+            AppEvent::Terminals {
+                op,
+                server,
+                terminals,
+            } => {
+                self.finish_op(op);
+                let valid = self.committed_server.as_deref() == Some(server.as_str())
+                    && self.committed_row().is_some_and(|s| s.ready);
+                if valid {
+                    self.terminals = sorted_terminals(terminals);
+                    let count = self.displayed_terminals().len();
+                    self.grid_cursor = self.grid_cursor.min(count.saturating_sub(1));
+                    self.ensure_grid_cursor_visible();
                 }
             }
             AppEvent::Progress { message } => self.set_status(message, false, now),
-            AppEvent::OpDone { message } => {
+            AppEvent::OpDone { op, message } => {
+                self.finish_op(op);
                 self.set_status(message, false, now);
-                self.effects.push(Effect::Refresh);
+                self.request_refresh();
             }
-            AppEvent::OpFailed { message } => self.set_status(message, true, now),
+            AppEvent::OpFailed { op, message } => {
+                self.finish_op(op);
+                self.set_status(message, true, now);
+            }
+        }
+    }
+
+    /// After a server refresh: keep a still-ready committed server (and
+    /// refetch its terminals so the grid stays fresh), or drop a commitment
+    /// whose server vanished or stopped.
+    fn revalidate_commitment(&mut self) {
+        let target = self
+            .committed_row()
+            .map(|r| (r.display.clone(), r.ready, r.url.clone()));
+        match target {
+            Some((server, true, Some(url))) => {
+                self.push_effect(Effect::FetchTerminals { op: 0, server, url });
+            }
+            None => {
+                if self.committed_server.is_some() {
+                    self.drop_commitment();
+                }
+            }
+            Some(_) => self.drop_commitment(),
+        }
+    }
+
+    fn drop_commitment(&mut self) {
+        self.committed_server = None;
+        self.terminals.clear();
+        self.grid_cursor = 0;
+        self.grid_scroll = 0;
+        if self.focus == Focus::Grid {
+            self.focus = Focus::Servers;
+        }
+    }
+
+    pub fn after_attach(&mut self, message: String, now: Instant) {
+        self.set_status(message, false, now);
+        let target = self
+            .committed_row()
+            .map(|r| (r.display.clone(), r.url.clone()));
+        if let Some((server, Some(url))) = target {
+            self.push_effect(Effect::FetchTerminals { op: 0, server, url });
         }
     }
 
@@ -202,149 +376,261 @@ impl App {
                 super::dialogs::Outcome::Close => self.dialog = None,
                 super::dialogs::Outcome::Commit(effect) => {
                     self.dialog = None;
-                    self.effects.push(effect);
+                    self.push_effect(effect);
                 }
             }
             return;
         }
         match key.code {
             KeyCode::Char('q') => self.effects.push(Effect::Quit),
-            KeyCode::Char('r') => {
-                self.loading = true;
-                self.effects.push(Effect::Refresh);
-            }
-            KeyCode::Left => self.focus = Focus::Servers,
-            KeyCode::Right if !self.shells.is_empty() => self.focus = Focus::Shells,
-            KeyCode::Up | KeyCode::Down => self.move_selection(key.code == KeyCode::Down),
-            KeyCode::Char('n') => match self.selected_server() {
-                Some(server) if server.ready && server.url.is_some() => {
-                    let effect = Effect::NewShell {
-                        server: server.display.clone(),
-                        url: server.url.clone().expect("checked is_some above"),
-                    };
-                    self.effects.push(effect);
-                }
-                _ => self.set_status(
-                    "the selected server is not ready; start it first".to_string(),
-                    true,
-                    now,
-                ),
+            KeyCode::Char('r') => self.request_refresh(),
+            KeyCode::Tab => self.toggle_focus(),
+            _ => match self.focus {
+                Focus::Servers => self.on_key_servers(key.code, now),
+                Focus::Grid => self.on_key_grid(key.code, now),
             },
-            KeyCode::Char('s') => self.open_start_dialog(now),
-            KeyCode::Char('x') => match self.selected_server() {
-                Some(server) if server.ready || server.pending.is_some() => {
-                    let target = (!server.name.is_empty()).then(|| server.name.clone());
-                    self.dialog = Some(super::dialogs::Dialog::Confirm(
-                        super::dialogs::ConfirmDialog {
-                            message: format!("Stop {}? Running work will be lost.", server.display),
-                            effect: Effect::Stop { server: target },
-                        },
-                    ));
-                }
-                _ => self.set_status("the selected server is not running".to_string(), true, now),
-            },
-            KeyCode::Char('k') => {
-                if self.focus == Focus::Shells
-                    && let (Some(server), Some(shell)) = (
-                        self.servers.get(self.selected_server),
-                        self.shells.get(self.selected_shell),
-                    )
-                    && let Some(url) = &server.url
-                {
-                    self.dialog = Some(super::dialogs::Dialog::Confirm(
-                        super::dialogs::ConfirmDialog {
-                            message: format!("Kill shell {} on {}?", shell.name, server.display),
-                            effect: Effect::KillShell {
-                                server: server.display.clone(),
-                                url: url.clone(),
-                                shell: shell.name.clone(),
-                            },
-                        },
-                    ));
-                }
-            }
-            KeyCode::Enter => self.on_enter(now),
+        }
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Servers if self.committed_server.is_some() => Focus::Grid,
+            Focus::Servers => Focus::Servers,
+            Focus::Grid => Focus::Servers,
+        };
+    }
+
+    fn on_key_servers(&mut self, code: KeyCode, now: Instant) {
+        match code {
+            KeyCode::Up => self.move_server_cursor(false),
+            KeyCode::Down => self.move_server_cursor(true),
+            KeyCode::Enter => self.enter_server(now),
+            KeyCode::Char('n') => self.new_terminal_from_servers(now),
+            KeyCode::Char('x') => self.confirm_stop_server(now),
             _ => {}
         }
     }
 
-    fn move_selection(&mut self, down: bool) {
-        match self.focus {
-            Focus::Servers => {
-                let len = self.servers.len();
-                if len == 0 {
-                    return;
-                }
-                let before = self.selected_server;
-                self.selected_server = if down {
-                    (self.selected_server + 1).min(len - 1)
-                } else {
-                    self.selected_server.saturating_sub(1)
-                };
-                if self.selected_server != before {
-                    self.fetch_shells_for_selection();
-                }
-            }
-            Focus::Shells => {
-                let len = self.shells.len();
-                if len == 0 {
-                    return;
-                }
-                self.selected_shell = if down {
-                    (self.selected_shell + 1).min(len - 1)
-                } else {
-                    self.selected_shell.saturating_sub(1)
-                };
-            }
+    fn on_key_grid(&mut self, code: KeyCode, now: Instant) {
+        match code {
+            KeyCode::Esc => self.focus = Focus::Servers,
+            KeyCode::Left => self.move_grid_cursor(-1, 0),
+            KeyCode::Right => self.move_grid_cursor(1, 0),
+            KeyCode::Up => self.move_grid_cursor(0, -1),
+            KeyCode::Down => self.move_grid_cursor(0, 1),
+            KeyCode::Enter => self.attach_hovered(),
+            KeyCode::Char('n') => self.new_terminal_on_committed(now),
+            KeyCode::Char('x') => self.confirm_kill_terminal(),
+            _ => {}
         }
     }
 
-    fn on_enter(&mut self, _now: Instant) {
-        match self.focus {
-            Focus::Servers => match self.selected_server() {
-                Some(server) if server.ready && !self.shells.is_empty() => {
-                    self.focus = Focus::Shells;
-                }
-                Some(server) if server.ready => {}
-                Some(_) => self.open_start_dialog(_now),
-                None => {}
+    fn move_server_cursor(&mut self, down: bool) {
+        let len = self.servers.len();
+        if len == 0 {
+            return;
+        }
+        self.server_cursor = if down {
+            (self.server_cursor + 1).min(len - 1)
+        } else {
+            self.server_cursor.saturating_sub(1)
+        };
+    }
+
+    fn move_grid_cursor(&mut self, dx: i32, dy: i32) {
+        let count = self.displayed_terminals().len();
+        if count == 0 {
+            return;
+        }
+        let cols = self.grid_columns();
+        let row = self.grid_cursor / cols;
+        let col = self.grid_cursor % cols;
+        let last_row = (count - 1) / cols;
+        let next = match (dx, dy) {
+            (-1, 0) if col > 0 => self.grid_cursor - 1,
+            (1, 0) if col + 1 < cols => (self.grid_cursor + 1).min(count - 1),
+            (0, -1) if row > 0 => self.grid_cursor - cols,
+            (0, 1) if row < last_row => (self.grid_cursor + cols).min(count - 1),
+            _ => self.grid_cursor,
+        };
+        self.grid_cursor = next;
+        self.ensure_grid_cursor_visible();
+    }
+
+    fn enter_server(&mut self, now: Instant) {
+        let Some(server) = self.servers.get(self.server_cursor) else {
+            return;
+        };
+        if server.ready && server.url.is_some() {
+            self.commit_cursor_server();
+            self.focus = Focus::Grid;
+        } else if server.ready {
+            self.set_status("the server reports no URL; refresh".to_string(), true, now);
+        } else if server.pending.is_some() {
+            self.set_status("a spawn is already in progress".to_string(), false, now);
+        } else if server.name.is_empty() {
+            self.dialog = Some(super::dialogs::Dialog::Start(
+                super::dialogs::StartDialog::new(None, &self.presets),
+            ));
+        } else {
+            self.set_status(
+                "named servers are started from the command line: jhc start NAME".to_string(),
+                true,
+                now,
+            );
+        }
+    }
+
+    fn commit_cursor_server(&mut self) {
+        let Some(server) = self.servers.get(self.server_cursor) else {
+            return;
+        };
+        let display = server.display.clone();
+        let url = server.url.clone();
+        if self.committed_server.as_deref() != Some(display.as_str()) {
+            self.terminals.clear();
+            self.grid_cursor = 0;
+            self.grid_scroll = 0;
+        }
+        self.committed_server = Some(display.clone());
+        if let Some(url) = url {
+            self.push_effect(Effect::FetchTerminals {
+                op: 0,
+                server: display,
+                url,
+            });
+        }
+    }
+
+    fn tui_terminal_cap(&self) -> usize {
+        self.terminal_limit.min(grid::DISPLAY_CAP)
+    }
+
+    /// True (and an error status is set) when the held terminal list is at the
+    /// interactive cap. Callers only invoke this when the held list belongs to
+    /// the server being created on.
+    fn reject_at_cap(&mut self, now: Instant) -> bool {
+        if self.terminals.len() < self.tui_terminal_cap() {
+            return false;
+        }
+        let message = if self.terminal_limit > grid::DISPLAY_CAP {
+            "the interactive interface caps at 999 terminals; use the CLI to create more"
+                .to_string()
+        } else {
+            format!("terminal limit reached ({})", self.tui_terminal_cap())
+        };
+        self.set_status(message, true, now);
+        true
+    }
+
+    fn new_terminal_from_servers(&mut self, now: Instant) {
+        let Some(server) = self.servers.get(self.server_cursor) else {
+            return;
+        };
+        if !(server.ready && server.url.is_some()) {
+            self.set_status(
+                "the selected server is not ready; start it first".to_string(),
+                true,
+                now,
+            );
+            return;
+        }
+        let same = self.committed_server.as_deref() == Some(server.display.as_str());
+        let display = server.display.clone();
+        let url = server.url.clone().expect("checked is_some above");
+        if same && self.reject_at_cap(now) {
+            return;
+        }
+        self.commit_cursor_server();
+        self.focus = Focus::Grid;
+        self.push_effect(Effect::NewTerminal {
+            op: 0,
+            server: display,
+            url,
+        });
+    }
+
+    fn new_terminal_on_committed(&mut self, now: Instant) {
+        if self.reject_at_cap(now) {
+            return;
+        }
+        let Some((server, url)) = self
+            .committed_row()
+            .and_then(|r| r.url.clone().map(|u| (r.display.clone(), u)))
+        else {
+            return;
+        };
+        self.push_effect(Effect::NewTerminal { op: 0, server, url });
+    }
+
+    fn confirm_stop_server(&mut self, now: Instant) {
+        let Some(server) = self.servers.get(self.server_cursor) else {
+            return;
+        };
+        if !(server.ready || server.pending.is_some()) {
+            self.set_status("the selected server is not running".to_string(), true, now);
+            return;
+        }
+        let target = (!server.name.is_empty()).then(|| server.name.clone());
+        self.dialog = Some(super::dialogs::Dialog::Confirm(
+            super::dialogs::ConfirmDialog {
+                message: format!("Stop {}? Running work will be lost.", server.display),
+                effect: Effect::Stop {
+                    op: 0,
+                    server: target,
+                },
             },
-            Focus::Shells => {
-                if let (Some(server), Some(shell)) = (
-                    self.servers.get(self.selected_server),
-                    self.shells.get(self.selected_shell),
-                ) {
-                    self.effects.push(Effect::Attach {
-                        target: Self::attach_target(server, shell),
-                    });
-                }
-            }
-        }
+        ));
     }
 
-    fn open_start_dialog(&mut self, now: Instant) {
-        match self.selected_server() {
-            Some(server) if !server.ready && server.pending.is_none() => {
-                if !server.name.is_empty() {
-                    self.set_status(
-                        "named servers are started from the command line: jhc start NAME"
-                            .to_string(),
-                        true,
-                        now,
-                    );
-                    return;
-                }
-                self.dialog = Some(super::dialogs::Dialog::Start(
-                    super::dialogs::StartDialog::new(None, &self.presets),
-                ));
-            }
-            Some(server) if server.ready => {
-                self.set_status(format!("{} is already running", server.display), false, now)
-            }
-            Some(_) => self.set_status("a spawn is already in progress".to_string(), false, now),
-            None => {}
-        }
+    fn confirm_kill_terminal(&mut self) {
+        let Some(terminal) = self.hovered_terminal().map(|t| t.name.clone()) else {
+            return;
+        };
+        let Some((server, url)) = self
+            .committed_row()
+            .and_then(|r| r.url.clone().map(|u| (r.display.clone(), u)))
+        else {
+            return;
+        };
+        self.dialog = Some(super::dialogs::Dialog::Confirm(
+            super::dialogs::ConfirmDialog {
+                message: format!("Kill {} on {}?", grid::card_label(&terminal), server),
+                effect: Effect::KillTerminal {
+                    op: 0,
+                    server,
+                    url,
+                    terminal,
+                },
+            },
+        ));
     }
+
+    fn attach_hovered(&mut self) {
+        let Some(terminal) = self.hovered_terminal().map(|t| t.name.clone()) else {
+            return;
+        };
+        let Some(server_name) = self.committed_row().map(|r| r.name.clone()) else {
+            return;
+        };
+        self.effects.push(Effect::Attach {
+            target: format!("{server_name}:{terminal}"),
+        });
+    }
+}
+
+/// Ascending numeric order; non-numeric names sort after numeric ones,
+/// lexicographically among themselves.
+fn sorted_terminals(mut terminals: Vec<TerminalRow>) -> Vec<TerminalRow> {
+    terminals.sort_by(
+        |a, b| match (a.name.parse::<u64>(), b.name.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => a.name.cmp(&b.name),
+        },
+    );
+    terminals
 }
 
 #[cfg(test)]
@@ -353,11 +639,11 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::{Duration, Instant};
 
-    fn press(code: KeyCode) -> KeyEvent {
+    pub(crate) fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn row(name: &str, ready: bool) -> ServerRow {
+    pub(crate) fn row(name: &str, ready: bool) -> ServerRow {
         ServerRow {
             name: name.to_string(),
             display: if name.is_empty() {
@@ -372,14 +658,47 @@ mod tests {
         }
     }
 
-    fn refreshed_app() -> (App, Instant) {
+    fn terminals(names: &[&str]) -> Vec<TerminalRow> {
+        names
+            .iter()
+            .map(|n| TerminalRow {
+                name: (*n).to_string(),
+            })
+            .collect()
+    }
+
+    /// 100x30 frame: grid inner width 78, so 4 cards per row; inner height
+    /// 27, so 4 visible card rows.
+    pub(crate) fn fresh_app() -> (App, Instant) {
         let now = Instant::now();
-        let mut app = App::new("icrn".to_string(), Default::default());
-        let _ = app.take_effects(); // discard the initial Refresh
+        let mut app = App::new("icrn".to_string(), Default::default(), 999, (100, 30));
+        let effects = app.take_effects();
+        assert!(matches!(effects.as_slice(), [Effect::Refresh { op: 1 }]));
         app.apply(
             AppEvent::Refreshed {
+                op: 1,
                 username: "ww41".to_string(),
-                servers: vec![row("", true), row("backup", true)],
+                servers: vec![row("", true), row("backup", true), row("lab", false)],
+            },
+            now,
+        );
+        (app, now)
+    }
+
+    /// fresh_app with the default server committed and terminals loaded.
+    pub(crate) fn committed_app(names: &[&str]) -> (App, Instant) {
+        let (mut app, now) = fresh_app();
+        app.on_key(&press(KeyCode::Enter), now);
+        let effects = app.take_effects();
+        let op = match effects.as_slice() {
+            [Effect::FetchTerminals { op, server, .. }] if server == "default" => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        app.apply(
+            AppEvent::Terminals {
+                op,
+                server: "default".to_string(),
+                terminals: terminals(names),
             },
             now,
         );
@@ -387,223 +706,328 @@ mod tests {
     }
 
     #[test]
-    fn new_queues_initial_refresh() {
-        let mut app = App::new("icrn".to_string(), Default::default());
-        assert!(matches!(app.take_effects().as_slice(), [Effect::Refresh]));
-        assert!(app.take_effects().is_empty());
-    }
-
-    #[test]
-    fn refresh_apply_fetches_shells_for_selected_ready_server() {
-        let (mut app, _) = refreshed_app();
-        let effects = app.take_effects();
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::FetchShells { server, .. }] if server == "default"
-        ));
-    }
-
-    #[test]
-    fn selection_move_refetches_shells() {
-        let (mut app, now) = refreshed_app();
+    fn new_registers_a_refresh_op() {
+        let mut app = App::new("icrn".to_string(), Default::default(), 999, (100, 30));
+        assert_eq!(app.ops.get(&1), Some(&"refreshing"));
+        assert!(app.spinner().is_some());
         let _ = app.take_effects();
-        app.on_key(&press(KeyCode::Down), now);
-        let effects = app.take_effects();
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::FetchShells { server, .. }] if server == "backup"
-        ));
-    }
-
-    #[test]
-    fn stale_shells_event_is_ignored() {
-        let (mut app, now) = refreshed_app();
-        app.apply(
-            AppEvent::Shells {
-                server: "backup".to_string(),
-                shells: vec![ShellRow {
-                    name: "1".to_string(),
-                    last_activity: None,
-                }],
-            },
-            now,
-        );
-        assert!(
-            app.shells.is_empty(),
-            "shells for an unselected server must be dropped"
-        );
-    }
-
-    #[test]
-    fn stale_shells_event_for_stopped_server_is_ignored() {
-        let (mut app, now) = refreshed_app();
         app.apply(
             AppEvent::Refreshed {
+                op: 1,
                 username: "ww41".to_string(),
-                servers: vec![row("", false), row("backup", true)],
+                servers: vec![],
             },
-            now,
+            Instant::now(),
         );
-        app.apply(
-            AppEvent::Shells {
-                server: "default".to_string(),
-                shells: vec![ShellRow {
-                    name: "1".to_string(),
-                    last_activity: None,
-                }],
-            },
-            now,
-        );
-        assert!(
-            app.shells.is_empty(),
-            "shells for a stopped server must be dropped"
-        );
+        assert!(app.ops.is_empty());
+        assert!(app.spinner().is_none());
     }
 
     #[test]
-    fn enter_on_shell_queues_attach_with_addressing() {
-        let (mut app, now) = refreshed_app();
+    fn cursor_movement_alone_fetches_nothing() {
+        let (mut app, now) = fresh_app();
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Down), now);
+        app.on_key(&press(KeyCode::Up), now);
+        assert!(app.take_effects().is_empty());
+        assert!(app.committed_server.is_none());
+    }
+
+    #[test]
+    fn enter_commits_fetches_and_focuses_grid() {
+        let (mut app, now) = fresh_app();
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Enter), now);
+        assert_eq!(app.committed_server.as_deref(), Some("default"));
+        assert_eq!(app.focus, Focus::Grid);
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::FetchTerminals { server, .. }] if server == "default"
+        ));
+    }
+
+    #[test]
+    fn enter_on_stopped_default_opens_start_dialog_and_named_redirects() {
+        let (mut app, now) = fresh_app();
         let _ = app.take_effects();
         app.apply(
-            AppEvent::Shells {
-                server: "default".to_string(),
-                shells: vec![ShellRow {
-                    name: "2".to_string(),
-                    last_activity: None,
+            AppEvent::Refreshed {
+                op: 99,
+                username: "ww41".to_string(),
+                servers: vec![row("", false), row("backup", false)],
+            },
+            now,
+        );
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Enter), now);
+        assert!(app.dialog.is_some());
+        app.on_key(&press(KeyCode::Esc), now);
+        app.on_key(&press(KeyCode::Down), now);
+        app.on_key(&press(KeyCode::Enter), now);
+        assert!(app.dialog.is_none());
+        let status = app.status.as_ref().expect("named server sets a status");
+        assert!(status.error);
+        assert!(status.text.contains("jhc start"));
+    }
+
+    #[test]
+    fn tab_needs_a_commitment_and_esc_returns() {
+        let (mut app, now) = fresh_app();
+        app.on_key(&press(KeyCode::Tab), now);
+        assert_eq!(app.focus, Focus::Servers);
+        app.on_key(&press(KeyCode::Enter), now);
+        assert_eq!(app.focus, Focus::Grid);
+        app.on_key(&press(KeyCode::Esc), now);
+        assert_eq!(app.focus, Focus::Servers);
+        app.on_key(&press(KeyCode::Tab), now);
+        assert_eq!(app.focus, Focus::Grid);
+    }
+
+    #[test]
+    fn refresh_keeps_valid_commitment_and_refetches() {
+        let (mut app, now) = committed_app(&["1"]);
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::Refreshed {
+                op: 50,
+                username: "ww41".to_string(),
+                servers: vec![row("", true)],
+            },
+            now,
+        );
+        assert_eq!(app.committed_server.as_deref(), Some("default"));
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::FetchTerminals { server, .. }] if server == "default"
+        ));
+    }
+
+    #[test]
+    fn refresh_drops_stopped_commitment_and_leaves_grid() {
+        let (mut app, now) = committed_app(&["1"]);
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::Refreshed {
+                op: 50,
+                username: "ww41".to_string(),
+                servers: vec![row("", false)],
+            },
+            now,
+        );
+        assert!(app.committed_server.is_none());
+        assert!(app.terminals.is_empty());
+        assert_eq!(app.focus, Focus::Servers);
+    }
+
+    #[test]
+    fn terminals_sort_numerically_and_stale_events_drop() {
+        let (mut app, now) = committed_app(&["10", "2", "zsh", "1"]);
+        let names: Vec<&str> = app.terminals.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["1", "2", "10", "zsh"]);
+        app.apply(
+            AppEvent::Terminals {
+                op: 77,
+                server: "backup".to_string(),
+                terminals: vec![TerminalRow {
+                    name: "9".to_string(),
                 }],
             },
             now,
         );
-        app.on_key(&press(KeyCode::Right), now); // focus shells
+        assert_eq!(app.terminals.len(), 4, "stale server terminals must drop");
+    }
+
+    #[test]
+    fn grid_cursor_moves_in_two_dimensions() {
+        // 100 wide -> 4 columns. 6 terminals: rows [0,1,2,3], [4,5].
+        let (mut app, now) = committed_app(&["1", "2", "3", "4", "5", "6"]);
+        assert_eq!(app.grid_columns(), 4);
+        app.on_key(&press(KeyCode::Right), now);
+        assert_eq!(app.grid_cursor, 1);
+        app.on_key(&press(KeyCode::Down), now);
+        assert_eq!(app.grid_cursor, 5);
+        app.on_key(&press(KeyCode::Down), now);
+        assert_eq!(app.grid_cursor, 5, "no row below");
+        app.on_key(&press(KeyCode::Up), now);
+        assert_eq!(app.grid_cursor, 1);
+        app.on_key(&press(KeyCode::Right), now);
+        app.on_key(&press(KeyCode::Right), now);
+        assert_eq!(app.grid_cursor, 3);
+        app.on_key(&press(KeyCode::Right), now);
+        assert_eq!(app.grid_cursor, 3, "no wrap at row end");
+        app.on_key(&press(KeyCode::Down), now);
+        assert_eq!(app.grid_cursor, 5, "shorter last row clamps");
+    }
+
+    #[test]
+    fn grid_scroll_follows_the_cursor() {
+        // 4 columns, 40 terminals = 10 rows; 30 rows tall -> inner height 27
+        // -> 4 visible card rows.
+        let names: Vec<String> = (1..=40).map(|i| i.to_string()).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (mut app, now) = committed_app(&refs);
+        assert_eq!(app.grid_scroll, 0);
+        for _ in 0..9 {
+            app.on_key(&press(KeyCode::Down), now);
+        }
+        assert_eq!(app.grid_cursor, 36);
+        assert_eq!(app.grid_scroll, 6, "row 9 visible needs scroll 6");
+        for _ in 0..9 {
+            app.on_key(&press(KeyCode::Up), now);
+        }
+        assert_eq!(app.grid_scroll, 0);
+    }
+
+    #[test]
+    fn enter_on_terminal_attaches_with_server_name_addressing() {
+        let (mut app, now) = committed_app(&["2"]);
+        let _ = app.take_effects();
         app.on_key(&press(KeyCode::Enter), now);
-        let effects = app.take_effects();
         assert!(matches!(
-            effects.as_slice(),
+            app.take_effects().as_slice(),
             [Effect::Attach { target }] if target == ":2"
         ));
     }
 
     #[test]
-    fn q_quits_and_refresh_preserves_selection_by_name() {
-        let (mut app, now) = refreshed_app();
+    fn n_in_grid_creates_and_n_at_cap_rejects() {
+        let (mut app, now) = committed_app(&["1"]);
         let _ = app.take_effects();
-        app.on_key(&press(KeyCode::Down), now); // select backup
+        app.on_key(&press(KeyCode::Char('n')), now);
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::NewTerminal { server, .. }] if server == "default"
+        ));
+
+        let names: Vec<String> = (1..=999).map(|i| i.to_string()).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (mut app, now) = committed_app(&refs);
         let _ = app.take_effects();
-        app.apply(
-            AppEvent::Refreshed {
-                username: "ww41".to_string(),
-                servers: vec![row("", true), row("backup", true)],
-            },
-            now,
-        );
-        assert_eq!(app.selected_server().unwrap().display, "backup");
-        app.on_key(&press(KeyCode::Char('q')), now);
-        assert!(matches!(app.take_effects().last(), Some(Effect::Quit)));
+        app.on_key(&press(KeyCode::Char('n')), now);
+        assert!(app.take_effects().is_empty());
+        let status = app.status.as_ref().expect("cap must set a status");
+        assert_eq!(status.text, "terminal limit reached (999)");
     }
 
     #[test]
-    fn status_expires_after_ttl() {
-        let (mut app, now) = refreshed_app();
+    fn n_at_cap_with_raised_config_points_at_the_cli() {
+        let now = Instant::now();
+        let mut app = App::new("icrn".to_string(), Default::default(), 1500, (100, 30));
+        let _ = app.take_effects();
         app.apply(
-            AppEvent::OpFailed {
-                message: "boom".to_string(),
+            AppEvent::Refreshed {
+                op: 1,
+                username: "ww41".to_string(),
+                servers: vec![row("", true)],
             },
             now,
         );
-        assert!(app.status.as_ref().is_some_and(|s| s.error));
-        app.tick(now + Duration::from_secs(4));
+        app.on_key(&press(KeyCode::Enter), now);
+        let effects = app.take_effects();
+        let op = match effects.as_slice() {
+            [Effect::FetchTerminals { op, .. }] => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        let many: Vec<TerminalRow> = (1..=999)
+            .map(|i| TerminalRow {
+                name: i.to_string(),
+            })
+            .collect();
+        app.apply(
+            AppEvent::Terminals {
+                op,
+                server: "default".to_string(),
+                terminals: many,
+            },
+            now,
+        );
+        app.on_key(&press(KeyCode::Char('n')), now);
+        assert!(app.take_effects().is_empty());
+        let status = app.status.as_ref().expect("cap must set a status");
+        assert!(status.text.contains("caps at 999"));
+        assert!(status.text.contains("CLI"));
+    }
+
+    #[test]
+    fn n_from_servers_commits_and_creates() {
+        let (mut app, now) = fresh_app();
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Char('n')), now);
+        assert_eq!(app.committed_server.as_deref(), Some("default"));
+        assert_eq!(app.focus, Focus::Grid);
+        let effects = app.take_effects();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::FetchTerminals { .. }, Effect::NewTerminal { server, .. }] if server == "default"
+        ));
+    }
+
+    #[test]
+    fn x_flows_open_confirm_and_commit() {
+        let (mut app, now) = fresh_app();
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Char('x')), now);
+        assert!(app.dialog.is_some());
+        app.on_key(&press(KeyCode::Char('q')), now);
+        assert!(app.dialog.is_some(), "q inside a dialog must not quit");
+        assert!(app.take_effects().is_empty());
+        app.on_key(&press(KeyCode::Enter), now);
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::Stop { server: None, .. }]
+        ));
+
+        let (mut app, now) = committed_app(&["2"]);
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Char('x')), now);
+        app.on_key(&press(KeyCode::Char('y')), now);
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::KillTerminal { terminal, .. }] if terminal == "2"
+        ));
+    }
+
+    #[test]
+    fn op_done_refreshes_and_status_expires() {
+        let (mut app, now) = committed_app(&["1"]);
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::OpDone {
+                op: 40,
+                message: "created shell 2 on default".to_string(),
+            },
+            now,
+        );
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::Refresh { .. }]
+        ));
         assert!(app.status.is_some());
         app.tick(now + STATUS_TTL + Duration::from_millis(1));
         assert!(app.status.is_none());
     }
 
     #[test]
-    fn n_on_ready_server_queues_new_shell_and_errors_when_not_ready() {
-        let (mut app, now) = refreshed_app();
+    fn after_attach_sets_status_and_refetches() {
+        let (mut app, now) = committed_app(&["1"]);
         let _ = app.take_effects();
-        app.on_key(&press(KeyCode::Char('n')), now);
+        app.after_attach("attach ended".to_string(), now);
+        assert!(app.status.is_some());
         assert!(matches!(
             app.take_effects().as_slice(),
-            [Effect::NewShell { server, .. }] if server == "default"
-        ));
-        app.apply(
-            AppEvent::Refreshed {
-                username: "ww41".to_string(),
-                servers: vec![row("", false)],
-            },
-            now,
-        );
-        let _ = app.take_effects();
-        app.on_key(&press(KeyCode::Char('n')), now);
-        assert!(app.take_effects().is_empty());
-        assert!(app.status.as_ref().is_some_and(|s| s.error));
-    }
-
-    #[test]
-    fn s_on_stopped_default_opens_start_dialog_and_enter_commits() {
-        let now = Instant::now();
-        let mut app = App::new("icrn".to_string(), Default::default());
-        let _ = app.take_effects();
-        app.apply(
-            AppEvent::Refreshed {
-                username: "ww41".to_string(),
-                servers: vec![row("", false)],
-            },
-            now,
-        );
-        let _ = app.take_effects();
-        app.on_key(&press(KeyCode::Char('s')), now);
-        assert!(app.dialog.is_some());
-        app.on_key(&press(KeyCode::Enter), now);
-        assert!(app.dialog.is_none());
-        assert!(matches!(
-            app.take_effects().as_slice(),
-            [Effect::Start { server: None, .. }]
+            [Effect::FetchTerminals { .. }]
         ));
     }
 
     #[test]
-    fn x_on_ready_server_opens_confirm_and_esc_cancels() {
-        let (mut app, now) = refreshed_app();
-        let _ = app.take_effects();
-        app.on_key(&press(KeyCode::Char('x')), now);
-        assert!(app.dialog.is_some());
-        app.on_key(&press(KeyCode::Esc), now);
-        assert!(app.dialog.is_none());
-        assert!(app.take_effects().is_empty());
-    }
-
-    #[test]
-    fn k_on_shell_opens_confirm_and_commits_kill() {
-        let (mut app, now) = refreshed_app();
-        let _ = app.take_effects();
-        app.apply(
-            AppEvent::Shells {
-                server: "default".to_string(),
-                shells: vec![ShellRow {
-                    name: "2".to_string(),
-                    last_activity: None,
-                }],
-            },
-            now,
-        );
-        app.on_key(&press(KeyCode::Right), now);
-        app.on_key(&press(KeyCode::Char('k')), now);
-        assert!(app.dialog.is_some());
-        app.on_key(&press(KeyCode::Enter), now);
-        assert!(matches!(
-            app.take_effects().as_slice(),
-            [Effect::KillShell { shell, .. }] if shell == "2"
-        ));
-    }
-
-    #[test]
-    fn q_inside_dialog_does_not_quit() {
-        let (mut app, now) = refreshed_app();
-        let _ = app.take_effects();
-        app.on_key(&press(KeyCode::Char('x')), now);
+    fn q_quits_and_spinner_advances_only_while_busy() {
+        let (mut app, now) = fresh_app();
+        app.tick(now);
+        assert_eq!(app.spinner_frame, 0, "no ops in flight");
+        app.request_refresh();
+        app.tick(now);
+        assert_eq!(app.spinner_frame, 1);
         app.on_key(&press(KeyCode::Char('q')), now);
-        assert!(app.take_effects().is_empty());
-        assert!(app.dialog.is_some());
+        assert!(matches!(app.take_effects().last(), Some(Effect::Quit)));
     }
 }
