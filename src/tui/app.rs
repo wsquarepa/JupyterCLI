@@ -70,6 +70,11 @@ pub enum AppEvent {
         op: u64,
         message: String,
     },
+    TerminalCreated {
+        op: u64,
+        server: String,
+        terminal: String,
+    },
     PeekOpened {
         op: u64,
         terminal: String,
@@ -183,6 +188,7 @@ pub struct App {
     pub hover: Option<HoverState>,
     pub peek: Option<PeekState>,
     peek_op: Option<u64>,
+    pending_select: Option<String>,
     next_op: u64,
     effects: Vec<Effect>,
 }
@@ -214,6 +220,7 @@ impl App {
             hover: None,
             peek: None,
             peek_op: None,
+            pending_select: None,
             next_op: 1,
             effects: Vec::new(),
         };
@@ -433,6 +440,18 @@ impl App {
                     let count = self.displayed_terminals().len();
                     self.grid_cursor = self.grid_cursor.min(count.saturating_sub(1));
                     self.ensure_grid_cursor_visible();
+                    // A pending create points the cursor at its new terminal
+                    // once the list refresh shows it; a missing name clears the
+                    // request so a failed create cannot hijack a later refresh.
+                    if let Some(name) = self.pending_select.take()
+                        && let Some(index) = self
+                            .displayed_terminals()
+                            .iter()
+                            .position(|t| t.name == name)
+                    {
+                        self.grid_cursor = index;
+                        self.ensure_grid_cursor_visible();
+                    }
                 }
             }
             AppEvent::Progress { message } => self.set_status(message, false, now),
@@ -444,6 +463,25 @@ impl App {
             AppEvent::OpFailed { op, message } => {
                 self.finish_op(op);
                 self.set_status(message, true, now);
+            }
+            AppEvent::TerminalCreated {
+                op,
+                server,
+                terminal,
+            } => {
+                self.finish_op(op);
+                self.set_status(
+                    format!("created terminal {terminal} on {server}"),
+                    false,
+                    now,
+                );
+                self.pending_select = Some(terminal);
+                let target = self
+                    .committed_row()
+                    .and_then(|r| r.url.clone().map(|u| (r.display.clone(), u)));
+                if let Some((server, url)) = target {
+                    self.push_effect(Effect::FetchTerminals { op: 0, server, url });
+                }
             }
             AppEvent::PeekOpened { op, terminal } => {
                 self.finish_op(op);
@@ -1179,6 +1217,61 @@ mod tests {
         let status = app.status.as_ref().expect("named sets a status");
         assert!(status.error);
         assert!(status.text.contains("jhc start"));
+    }
+
+    #[test]
+    fn creating_a_terminal_selects_it_in_the_grid() {
+        let (mut app, now) = committed_app(&["1", "2"]);
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Char('n')), now);
+        let op = match app.take_effects().as_slice() {
+            [Effect::NewTerminal { op, server, .. }] if server == "default" => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        app.apply(
+            AppEvent::TerminalCreated {
+                op,
+                server: "default".to_string(),
+                terminal: "5".to_string(),
+            },
+            now,
+        );
+        let status = app.status.as_ref().expect("create sets a status");
+        assert_eq!(status.text, "created terminal 5 on default");
+        assert!(!status.error);
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::FetchTerminals { server, .. }] if server == "default"
+        ));
+
+        // The refreshed list carries the new terminal; the cursor lands on it
+        // and the hover follows.
+        app.apply(
+            AppEvent::Terminals {
+                op: 900,
+                server: "default".to_string(),
+                terminals: terminals(&["1", "2", "5"]),
+            },
+            now,
+        );
+        assert_eq!(app.displayed_terminals()[app.grid_cursor].name, "5");
+        assert_eq!(app.hover.as_ref().map(|h| h.terminal.as_str()), Some("5"));
+
+        // A second list refresh must not re-select the same terminal.
+        app.on_key(&press(KeyCode::Left), now);
+        let moved = app.grid_cursor;
+        app.apply(
+            AppEvent::Terminals {
+                op: 901,
+                server: "default".to_string(),
+                terminals: terminals(&["1", "2", "5"]),
+            },
+            now,
+        );
+        assert_eq!(
+            app.grid_cursor, moved,
+            "a second Terminals must not re-select"
+        );
     }
 
     #[test]

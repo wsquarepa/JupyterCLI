@@ -227,9 +227,10 @@ async fn new_terminal(
 ) -> Result<AppEvent, ApiError> {
     let sc = ServerClient::from_hub(client, url)?;
     let terminal = sc.create_terminal().await?;
-    Ok(AppEvent::OpDone {
+    Ok(AppEvent::TerminalCreated {
         op,
-        message: format!("created terminal {} on {server}", terminal.name),
+        server: server.to_string(),
+        terminal: terminal.name,
     })
 }
 
