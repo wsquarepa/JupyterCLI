@@ -651,6 +651,9 @@ impl App {
                         create.step = super::dialogs::CreateStep::Starting;
                     }
                 }
+                super::dialogs::Outcome::SavePreset { name, options } => {
+                    self.push_effect(Effect::SavePreset { name, options });
+                }
             }
             return;
         }
@@ -1473,6 +1476,40 @@ mod tests {
             }
             other => panic!("expected a CreateNamed dialog, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn save_preset_outcome_emits_a_local_effect_without_an_op() {
+        let (mut app, now) = fresh_app();
+        app.dialog = Some(crate::tui::dialogs::Dialog::Start(
+            crate::tui::dialogs::StartDialog::new(None, &app.presets),
+        ));
+        // presets is empty in fresh_app, so entries = [hub defaults]; the
+        // "+ new preset" row is index 1.
+        app.on_key(&press(KeyCode::Down), now);
+        app.on_key(&press(KeyCode::Enter), now); // open editor
+        for c in "gpu".chars() {
+            app.on_key(&press(KeyCode::Char(c)), now);
+        }
+        app.on_key(&press(KeyCode::Enter), now); // -> Permalink step
+        for c in "x#fancy-forms-config={\"resource\":\"3_h200\"}".chars() {
+            app.on_key(&press(KeyCode::Char(c)), now);
+        }
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Enter), now); // parse + emit
+        let effects = app.take_effects();
+        match effects.as_slice() {
+            [Effect::SavePreset { name, options }] => {
+                assert_eq!(name, "gpu");
+                assert_eq!(options["resource"], serde_json::json!("3_h200"));
+            }
+            other => panic!("unexpected effects: {other:?}"),
+        }
+        assert!(app.ops.is_empty(), "SavePreset must not open a spinner op");
+        assert!(
+            app.dialog.is_some(),
+            "the dialog stays open until the save lands"
+        );
     }
 
     #[test]

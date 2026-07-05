@@ -53,6 +53,7 @@ pub struct StartDialog {
     pub server: Option<String>,
     pub entries: Vec<(String, JsonMap)>,
     pub selected: usize,
+    editor: Option<PresetEditor>,
 }
 
 fn preset_entries(presets: &BTreeMap<String, JsonMap>) -> Vec<(String, JsonMap)> {
@@ -67,6 +68,7 @@ impl StartDialog {
             server,
             entries: preset_entries(presets),
             selected: 0,
+            editor: None,
         }
     }
 
@@ -77,6 +79,32 @@ impl StartDialog {
             .iter()
             .position(|(name, _)| name == select)
             .unwrap_or(0);
+        self.editor = None;
+    }
+}
+
+#[derive(Debug)]
+enum EditorStep {
+    Name,
+    Permalink,
+}
+
+#[derive(Debug)]
+struct PresetEditor {
+    step: EditorStep,
+    name: super::input::LineInput,
+    permalink: super::input::LineInput,
+    error: Option<String>,
+}
+
+impl PresetEditor {
+    fn new() -> Self {
+        Self {
+            step: EditorStep::Name,
+            name: super::input::LineInput::new(false),
+            permalink: super::input::LineInput::new(false),
+            error: None,
+        }
     }
 }
 
@@ -92,27 +120,84 @@ pub enum Outcome {
     Close,
     Commit(Effect),
     Spawn(Effect),
+    SavePreset { name: String, options: JsonMap },
 }
 
 enum PickerOutcome {
     Stay,
     Close,
     Commit(JsonMap),
+    SavePreset { name: String, options: JsonMap },
 }
 
 fn handle_picker_key(picker: &mut StartDialog, key: &KeyEvent) -> PickerOutcome {
+    if picker.editor.is_some() {
+        return handle_editor_key(picker, key);
+    }
+    let add_row = picker.entries.len();
     match key.code {
         KeyCode::Up => {
             picker.selected = picker.selected.saturating_sub(1);
             PickerOutcome::Stay
         }
         KeyCode::Down => {
-            picker.selected = (picker.selected + 1).min(picker.entries.len() - 1);
+            picker.selected = (picker.selected + 1).min(add_row);
+            PickerOutcome::Stay
+        }
+        KeyCode::Enter if picker.selected == add_row => {
+            picker.editor = Some(PresetEditor::new());
             PickerOutcome::Stay
         }
         KeyCode::Enter => PickerOutcome::Commit(picker.entries[picker.selected].1.clone()),
         KeyCode::Esc => PickerOutcome::Close,
         _ => PickerOutcome::Stay,
+    }
+}
+
+fn handle_editor_key(picker: &mut StartDialog, key: &KeyEvent) -> PickerOutcome {
+    // Esc backs out of the editor regardless of step; handled before borrowing
+    // the editor so it can be replaced without a borrow conflict.
+    if key.code == KeyCode::Esc {
+        picker.editor = None;
+        return PickerOutcome::Stay;
+    }
+    let editor = picker.editor.as_mut().expect("guarded by editor.is_some()");
+    match editor.step {
+        EditorStep::Name => match key.code {
+            KeyCode::Enter => {
+                let name = editor.name.value().trim().to_string();
+                if name.is_empty() || name == "hub defaults" {
+                    editor.error = Some("enter a non-empty preset name".to_string());
+                    PickerOutcome::Stay
+                } else {
+                    editor.error = None;
+                    editor.step = EditorStep::Permalink;
+                    PickerOutcome::Stay
+                }
+            }
+            _ => {
+                editor.name.on_key(key);
+                editor.error = None;
+                PickerOutcome::Stay
+            }
+        },
+        EditorStep::Permalink => match key.code {
+            KeyCode::Enter => match parse_permalink(editor.permalink.value()) {
+                Ok(options) => PickerOutcome::SavePreset {
+                    name: editor.name.value().trim().to_string(),
+                    options,
+                },
+                Err(message) => {
+                    editor.error = Some(message);
+                    PickerOutcome::Stay
+                }
+            },
+            _ => {
+                editor.permalink.on_key(key);
+                editor.error = None;
+                PickerOutcome::Stay
+            }
+        },
     }
 }
 
@@ -130,14 +215,58 @@ fn picker_row(text: &str, selected: bool, width: usize) -> Line<'static> {
 }
 
 fn render_picker(picker: &StartDialog, width: usize) -> Vec<Line<'static>> {
-    picker
+    if let Some(editor) = &picker.editor {
+        return render_editor(editor);
+    }
+    let add_row = picker.entries.len();
+    let mut lines: Vec<Line> = picker
         .entries
         .iter()
         .enumerate()
         .map(|(index, (name, _))| {
             picker_row(&preset_entry_text(name), index == picker.selected, width)
         })
-        .collect()
+        .collect();
+    lines.push(picker_row(
+        " + new preset",
+        picker.selected == add_row,
+        width,
+    ));
+    lines
+}
+
+fn render_editor(editor: &PresetEditor) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    match editor.step {
+        EditorStep::Name => {
+            lines.push(Line::from("New preset: name"));
+            lines.push(Line::from(""));
+            lines.push(super::wizard::input_line("Name", &editor.name, true));
+        }
+        EditorStep::Permalink => {
+            lines.push(Line::from("New preset: paste spawn permalink"));
+            lines.push(Line::from(""));
+            lines.push(super::wizard::input_line(
+                "Permalink",
+                &editor.permalink,
+                true,
+            ));
+        }
+    }
+    if let Some(error) = &editor.error {
+        lines.push(Line::from(""));
+        for wrapped in super::wizard::wrap_text(error, super::wizard::CONTENT_WIDTH) {
+            lines.push(Line::from(wrapped));
+        }
+    }
+    lines
+}
+
+fn editor_hints(step: &EditorStep) -> &'static str {
+    match step {
+        EditorStep::Name => " Enter: continue  Esc: back ",
+        EditorStep::Permalink => " Enter: save  Esc: back ",
+    }
 }
 
 pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome {
@@ -150,6 +279,7 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome 
                 server: start.server.clone(),
                 options,
             }),
+            PickerOutcome::SavePreset { name, options } => Outcome::SavePreset { name, options },
         },
         Dialog::Confirm(confirm) => match key.code {
             KeyCode::Enter | KeyCode::Char('y') => {
@@ -190,6 +320,9 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome 
                     server: Some(create.input.value().to_string()),
                     options,
                 }),
+                PickerOutcome::SavePreset { name, options } => {
+                    Outcome::SavePreset { name, options }
+                }
             },
             CreateStep::Starting => match key.code {
                 KeyCode::Esc => Outcome::Close,
@@ -205,6 +338,25 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome 
 /// top border.
 fn preset_entry_text(name: &str) -> String {
     format!(" {name}")
+}
+
+/// Marker that precedes the url-encoded JSON options in a hub spawn permalink.
+/// Ceiling: recognizes only the fancy-forms spawner's permalink format; other
+/// spawners are unsupported. Upgrade path: branch on additional markers.
+const FANCY_FORMS_MARKER: &str = "fancy-forms-config=";
+
+/// Extract the `user_options` JSON embedded in a fancy-forms spawn permalink.
+/// The value after the marker is percent-encoded once in the `?next=` wrapped
+/// form and already decoded in the direct `#...` form; a single percent-decode
+/// is correct for both. The parsed map is returned verbatim.
+fn parse_permalink(raw: &str) -> Result<JsonMap, String> {
+    let tail = raw
+        .split_once(FANCY_FORMS_MARKER)
+        .map(|(_, tail)| tail)
+        .ok_or_else(|| "no fancy-forms-config found in the permalink".to_string())?;
+    let decoded = percent_encoding::percent_decode_str(tail.trim()).decode_utf8_lossy();
+    serde_json::from_str::<JsonMap>(&decoded)
+        .map_err(|e| format!("permalink options are not valid JSON: {e}"))
 }
 
 pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
@@ -227,12 +379,11 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
             let mut content = vec![Line::from("")];
             content.extend(body);
             frame.render_widget(Paragraph::new(content), inner);
-            super::render::render_hints_below_dialog(
-                frame,
-                rect,
-                area,
-                " Up/Down: navigate  Enter: start  Esc: cancel ",
-            );
+            let hints = match &start.editor {
+                None => " Up/Down: navigate  Enter: start  Esc: cancel ",
+                Some(editor) => editor_hints(&editor.step),
+            };
+            super::render::render_hints_below_dialog(frame, rect, area, hints);
         }
         Dialog::Confirm(confirm) => {
             let rect = super::render::centered_rect(60, 5, area);
@@ -276,8 +427,10 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
                     }
                 }
                 CreateStep::Preset => {
-                    lines.push(Line::from("Step 2 of 2: choose a preset"));
-                    lines.push(Line::from(""));
+                    if create.picker.editor.is_none() {
+                        lines.push(Line::from("Step 2 of 2: choose a preset"));
+                        lines.push(Line::from(""));
+                    }
                     lines.extend(render_picker(&create.picker, super::wizard::CONTENT_WIDTH));
                 }
                 CreateStep::Starting => {
@@ -289,7 +442,10 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
             }
             let hints = match create.step {
                 CreateStep::Name => " Enter: continue  Esc: cancel ",
-                CreateStep::Preset => " Up/Down: navigate  Enter: start  Esc: cancel ",
+                CreateStep::Preset => match &create.picker.editor {
+                    None => " Up/Down: navigate  Enter: start  Esc: cancel ",
+                    Some(editor) => editor_hints(&editor.step),
+                },
                 CreateStep::Starting => "",
             };
             let height = lines.len() as u16 + 4;
@@ -609,6 +765,145 @@ mod tests {
             assert!(matches!(d.step, CreateStep::Name));
             assert!(d.flash.is_some());
         }
+    }
+
+    #[test]
+    fn parse_permalink_reads_wrapped_and_direct_forms_verbatim() {
+        let wrapped = "https://hub.example.edu/hub/login?next=/hub/spawn%23fancy-forms-config=\
+%7B%22profile%22%3A%22environments%22%2C%22image%3Aunlisted_choice%22%3A%22%22%7D";
+        let map = parse_permalink(wrapped).unwrap();
+        assert_eq!(map["profile"], serde_json::json!("environments"));
+        assert_eq!(
+            map["image:unlisted_choice"],
+            serde_json::json!(""),
+            "empty auxiliary keys are retained verbatim"
+        );
+
+        let direct =
+            "https://hub.example.edu/hub/spawn#fancy-forms-config={\"resource\":\"3_h200\"}";
+        let map = parse_permalink(direct).unwrap();
+        assert_eq!(map["resource"], serde_json::json!("3_h200"));
+    }
+
+    #[test]
+    fn parse_permalink_rejects_missing_marker_and_bad_json() {
+        assert!(parse_permalink("https://hub.example.edu/hub/spawn").is_err());
+        assert!(parse_permalink("x#fancy-forms-config=not-json").is_err());
+    }
+
+    #[test]
+    fn new_preset_row_opens_editor_and_esc_returns_without_closing() {
+        let now = Instant::now();
+        let mut dialog = Dialog::Start(StartDialog::new(None, &presets()));
+        // entries = [hub defaults, a100]; the "+ new preset" row is index 2.
+        handle_key(&mut dialog, &press(KeyCode::Down), now);
+        handle_key(&mut dialog, &press(KeyCode::Down), now);
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        if let Dialog::Start(start) = &dialog {
+            assert!(start.editor.is_some(), "the +new row opens the editor");
+        }
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Esc), now),
+            Outcome::Stay
+        ));
+        if let Dialog::Start(start) = &dialog {
+            assert!(start.editor.is_none(), "Esc returns to the picker");
+        }
+    }
+
+    #[test]
+    fn editor_advances_name_to_permalink_then_saves() {
+        let now = Instant::now();
+        let mut dialog = Dialog::Start(StartDialog::new(None, &presets()));
+        for _ in 0..2 {
+            handle_key(&mut dialog, &press(KeyCode::Down), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now); // open editor
+        for c in "gpu".chars() {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now); // -> Permalink step
+        for c in "x#fancy-forms-config={\"resource\":\"3_h200\"}".chars() {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        match handle_key(&mut dialog, &press(KeyCode::Enter), now) {
+            Outcome::SavePreset { name, options } => {
+                assert_eq!(name, "gpu");
+                assert_eq!(options["resource"], serde_json::json!("3_h200"));
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn editor_rejects_empty_name_and_bad_permalink() {
+        let now = Instant::now();
+        let mut dialog = Dialog::Start(StartDialog::new(None, &presets()));
+        for _ in 0..2 {
+            handle_key(&mut dialog, &press(KeyCode::Down), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now); // open editor
+        // Empty name: stays on Name with an error.
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        if let Dialog::Start(start) = &dialog {
+            let editor = start.editor.as_ref().unwrap();
+            assert!(matches!(editor.step, EditorStep::Name));
+            assert!(editor.error.is_some());
+        }
+        // Valid name, then a bad permalink: stays on Permalink with an error.
+        for c in "gpu".chars() {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now);
+        for c in "nope".chars() {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        if let Dialog::Start(start) = &dialog {
+            let editor = start.editor.as_ref().unwrap();
+            assert!(matches!(editor.step, EditorStep::Permalink));
+            assert!(editor.error.is_some());
+        }
+    }
+
+    #[test]
+    fn start_and_create_named_pickers_show_the_new_preset_row() {
+        let start = Dialog::Start(StartDialog::new(None, &presets()));
+        assert!(render_to_text(&start).contains("+ new preset"));
+
+        let now = Instant::now();
+        let mut create = create_dialog();
+        for c in "gpu".chars() {
+            handle_key(&mut create, &press(KeyCode::Char(c)), now);
+        }
+        handle_key(&mut create, &press(KeyCode::Enter), now); // -> Preset step
+        assert!(render_to_text(&create).contains("+ new preset"));
+    }
+
+    #[test]
+    fn editor_render_prompts_for_the_permalink() {
+        let now = Instant::now();
+        let mut dialog = Dialog::Start(StartDialog::new(None, &presets()));
+        for _ in 0..2 {
+            handle_key(&mut dialog, &press(KeyCode::Down), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now);
+        for c in "gpu".chars() {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now); // -> Permalink step
+        let text = render_to_text(&dialog);
+        assert!(text.contains("paste spawn permalink"), "buffer:\n{text}");
+        assert!(text.contains("Permalink"), "buffer:\n{text}");
     }
 
     #[test]
