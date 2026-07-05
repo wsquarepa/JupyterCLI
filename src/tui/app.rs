@@ -9,6 +9,23 @@ use super::grid;
 
 pub const STATUS_TTL: Duration = Duration::from_secs(5);
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const PEEK_DEBOUNCE: Duration = Duration::from_millis(300);
+pub const PEEK_BUFFER_LINES: usize = 200;
+
+#[derive(Debug)]
+pub struct HoverState {
+    pub terminal: String,
+    pub since: Instant,
+    pub started: bool,
+}
+
+#[derive(Debug)]
+pub struct PeekState {
+    pub terminal: String,
+    pub connected: bool,
+    pub error: Option<String>,
+    pub lines: std::collections::VecDeque<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -54,6 +71,19 @@ pub enum AppEvent {
         op: u64,
         message: String,
     },
+    PeekOpened {
+        op: u64,
+        terminal: String,
+    },
+    PeekChunk {
+        terminal: String,
+        text: String,
+    },
+    PeekFailed {
+        op: u64,
+        terminal: String,
+        message: String,
+    },
 }
 
 #[derive(Debug)]
@@ -86,6 +116,12 @@ pub enum Effect {
         url: String,
         terminal: String,
     },
+    PeekStart {
+        op: u64,
+        url: String,
+        terminal: String,
+    },
+    PeekStop,
     Attach {
         target: String,
     },
@@ -102,7 +138,8 @@ impl Effect {
             Effect::Stop { .. } => Some("stopping"),
             Effect::NewTerminal { .. } => Some("creating"),
             Effect::KillTerminal { .. } => Some("killing"),
-            Effect::Attach { .. } | Effect::Quit => None,
+            Effect::PeekStart { .. } => Some("connecting"),
+            Effect::PeekStop | Effect::Attach { .. } | Effect::Quit => None,
         }
     }
 
@@ -113,8 +150,9 @@ impl Effect {
             | Effect::Start { op, .. }
             | Effect::Stop { op, .. }
             | Effect::NewTerminal { op, .. }
-            | Effect::KillTerminal { op, .. } => *op = id,
-            Effect::Attach { .. } | Effect::Quit => {}
+            | Effect::KillTerminal { op, .. }
+            | Effect::PeekStart { op, .. } => *op = id,
+            Effect::PeekStop | Effect::Attach { .. } | Effect::Quit => {}
         }
     }
 }
@@ -143,6 +181,9 @@ pub struct App {
     pub size: (u16, u16),
     pub ops: BTreeMap<u64, &'static str>,
     pub spinner_frame: usize,
+    pub hover: Option<HoverState>,
+    pub peek: Option<PeekState>,
+    peek_op: Option<u64>,
     next_op: u64,
     effects: Vec<Effect>,
 }
@@ -171,6 +212,9 @@ impl App {
             size,
             ops: BTreeMap::new(),
             spinner_frame: 0,
+            hover: None,
+            peek: None,
+            peek_op: None,
             next_op: 1,
             effects: Vec::new(),
         };
@@ -238,6 +282,35 @@ impl App {
         if !self.ops.is_empty() {
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
         }
+        let due = self
+            .hover
+            .as_ref()
+            .is_some_and(|h| !h.started && now.duration_since(h.since) >= PEEK_DEBOUNCE);
+        if due {
+            let target = self.committed_row().and_then(|r| r.url.clone());
+            if let Some(url) = target {
+                let terminal = self
+                    .hover
+                    .as_ref()
+                    .expect("due is only true when hover is Some")
+                    .terminal
+                    .clone();
+                self.peek = Some(PeekState {
+                    terminal: terminal.clone(),
+                    connected: false,
+                    error: None,
+                    lines: std::collections::VecDeque::new(),
+                });
+                self.peek_op = self.push_effect(Effect::PeekStart {
+                    op: 0,
+                    url,
+                    terminal,
+                });
+                if let Some(hover) = &mut self.hover {
+                    hover.started = true;
+                }
+            }
+        }
     }
 
     pub fn committed_row(&self) -> Option<&ServerRow> {
@@ -261,10 +334,53 @@ impl App {
         grid::columns_for_width(grid::grid_inner_width(self.size.0))
     }
 
+    pub fn peek_visible(&self) -> bool {
+        self.hover.is_some()
+    }
+
+    /// Reconcile the hover with the current cursor. A dialog, a focus change,
+    /// or a cursor move ends the old hover (closing its socket); resting on a
+    /// new card starts the debounce clock.
+    fn sync_hover(&mut self, now: Instant) {
+        let current = if self.dialog.is_none() {
+            self.hovered_terminal().map(|t| t.name.clone())
+        } else {
+            None
+        };
+        let unchanged = self.hover.as_ref().map(|h| h.terminal.as_str()) == current.as_deref();
+        if unchanged {
+            return;
+        }
+        self.teardown_peek();
+        if let Some(terminal) = current {
+            self.hover = Some(HoverState {
+                terminal,
+                since: now,
+                started: false,
+            });
+        }
+    }
+
+    fn teardown_peek(&mut self) {
+        let had_socket = self.hover.as_ref().is_some_and(|h| h.started) || self.peek.is_some();
+        if had_socket {
+            self.effects.push(Effect::PeekStop);
+        }
+        if let Some(op) = self.peek_op.take() {
+            self.finish_op(op);
+        }
+        self.hover = None;
+        self.peek = None;
+    }
+
     fn grid_inner_height(&self) -> u16 {
-        // Main area minus the status bar row, minus the pane borders. Task 4
-        // subtracts the peek pane when it is visible.
-        self.size.1.saturating_sub(1).saturating_sub(2)
+        let main = self.size.1.saturating_sub(1);
+        let grid_pane = if self.peek_visible() {
+            main.saturating_sub(grid::peek_height(main))
+        } else {
+            main
+        };
+        grid_pane.saturating_sub(2)
     }
 
     fn ensure_grid_cursor_visible(&mut self) {
@@ -323,7 +439,41 @@ impl App {
                 self.finish_op(op);
                 self.set_status(message, true, now);
             }
+            AppEvent::PeekOpened { op, terminal } => {
+                self.finish_op(op);
+                if self.peek_op == Some(op) {
+                    self.peek_op = None;
+                }
+                if let Some(peek) = &mut self.peek
+                    && peek.terminal == terminal
+                {
+                    peek.connected = true;
+                }
+            }
+            AppEvent::PeekChunk { terminal, text } => {
+                if let Some(peek) = &mut self.peek
+                    && peek.terminal == terminal
+                {
+                    push_chunk(&mut peek.lines, &text);
+                }
+            }
+            AppEvent::PeekFailed {
+                op,
+                terminal,
+                message,
+            } => {
+                self.finish_op(op);
+                if self.peek_op == Some(op) {
+                    self.peek_op = None;
+                }
+                if let Some(peek) = &mut self.peek
+                    && peek.terminal == terminal
+                {
+                    peek.error = Some(message);
+                }
+            }
         }
+        self.sync_hover(now);
     }
 
     /// After a server refresh: keep a still-ready committed server (and
@@ -370,6 +520,11 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        self.handle_key(key, now);
+        self.sync_hover(now);
+    }
+
+    fn handle_key(&mut self, key: &KeyEvent, now: Instant) {
         if let Some(dialog) = &mut self.dialog {
             match super::dialogs::handle_key(dialog, key) {
                 super::dialogs::Outcome::Stay => {}
@@ -613,6 +768,7 @@ impl App {
         let Some(server_name) = self.committed_row().map(|r| r.name.clone()) else {
             return;
         };
+        self.teardown_peek();
         self.effects.push(Effect::Attach {
             target: format!("{server_name}:{terminal}"),
         });
@@ -631,6 +787,34 @@ fn sorted_terminals(mut terminals: Vec<TerminalRow>) -> Vec<TerminalRow> {
         },
     );
     terminals
+}
+
+/// Append an ANSI-stripped chunk to the peek line buffer. "\r\n" ends a line;
+/// a bare "\r" emulates the terminal's overwrite by clearing the current
+/// line. Ceiling: a "\r\n" split across two chunks clears one line wrongly;
+/// the upgrade path is buffering a trailing "\r" until the next chunk.
+fn push_chunk(lines: &mut std::collections::VecDeque<String>, text: &str) {
+    if lines.is_empty() {
+        lines.push_back(String::new());
+    }
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\n' => lines.push_back(String::new()),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                    lines.push_back(String::new());
+                } else {
+                    lines.back_mut().expect("seeded above").clear();
+                }
+            }
+            _ => lines.back_mut().expect("seeded above").push(ch),
+        }
+    }
+    while lines.len() > PEEK_BUFFER_LINES {
+        lines.pop_front();
+    }
 }
 
 #[cfg(test)]
@@ -871,7 +1055,10 @@ mod tests {
             app.on_key(&press(KeyCode::Down), now);
         }
         assert_eq!(app.grid_cursor, 36);
-        assert_eq!(app.grid_scroll, 6, "row 9 visible needs scroll 6");
+        assert_eq!(
+            app.grid_scroll, 7,
+            "row 9 visible with 3 rows needs scroll 7"
+        );
         for _ in 0..9 {
             app.on_key(&press(KeyCode::Up), now);
         }
@@ -1029,5 +1216,158 @@ mod tests {
         assert_eq!(app.spinner_frame, 1);
         app.on_key(&press(KeyCode::Char('q')), now);
         assert!(matches!(app.take_effects().last(), Some(Effect::Quit)));
+    }
+
+    #[test]
+    fn hover_starts_peek_only_after_the_debounce() {
+        let (mut app, now) = committed_app(&["1", "2"]);
+        let _ = app.take_effects();
+        assert!(app.peek_visible(), "grid focus + cursor on a card hovers");
+        app.tick(now + Duration::from_millis(100));
+        assert!(app.take_effects().is_empty(), "before the debounce");
+        app.tick(now + PEEK_DEBOUNCE);
+        let effects = app.take_effects();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::PeekStart { terminal, .. }] if terminal == "1"
+        ));
+        assert_eq!(app.ops.values().next_back(), Some(&"connecting"));
+        app.tick(now + PEEK_DEBOUNCE + Duration::from_millis(200));
+        assert!(app.take_effects().is_empty(), "never starts twice");
+    }
+
+    #[test]
+    fn skimming_across_cards_never_connects() {
+        let (mut app, now) = committed_app(&["1", "2", "3"]);
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Right), now + Duration::from_millis(100));
+        app.on_key(&press(KeyCode::Right), now + Duration::from_millis(200));
+        app.tick(now + Duration::from_millis(400));
+        // Hover on "3" began at t=200ms; 400ms is before its 300ms debounce.
+        assert!(app.take_effects().is_empty());
+        app.tick(now + Duration::from_millis(501));
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::PeekStart { terminal, .. }] if terminal == "3"
+        ));
+    }
+
+    #[test]
+    fn moving_off_a_live_peek_stops_it_and_closes_the_op() {
+        let (mut app, now) = committed_app(&["1", "2"]);
+        let _ = app.take_effects();
+        app.tick(now + PEEK_DEBOUNCE);
+        let _ = app.take_effects();
+        assert!(!app.ops.is_empty(), "connecting op open");
+        app.on_key(&press(KeyCode::Right), now + Duration::from_millis(400));
+        let effects = app.take_effects();
+        assert!(matches!(effects.as_slice(), [Effect::PeekStop]));
+        assert!(app.ops.is_empty(), "abort must close the connecting op");
+        assert!(app.peek.is_none());
+        assert!(app.hover.is_some(), "the new card is now hovered");
+    }
+
+    #[test]
+    fn focus_change_and_dialogs_tear_the_hover_down() {
+        let (mut app, now) = committed_app(&["1"]);
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Esc), now);
+        assert!(app.hover.is_none());
+        assert!(!app.peek_visible());
+
+        let (mut app, now) = committed_app(&["1"]);
+        let _ = app.take_effects();
+        app.tick(now + PEEK_DEBOUNCE);
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Char('x')), now); // opens the kill confirm
+        let effects = app.take_effects();
+        assert!(matches!(effects.as_slice(), [Effect::PeekStop]));
+        assert!(app.hover.is_none());
+    }
+
+    #[test]
+    fn peek_events_flow_into_lines_and_stale_chunks_drop() {
+        let (mut app, now) = committed_app(&["1"]);
+        let _ = app.take_effects();
+        app.tick(now + PEEK_DEBOUNCE);
+        let _ = app.take_effects();
+        let op = *app.ops.keys().next_back().expect("connecting op");
+        app.apply(
+            AppEvent::PeekOpened {
+                op,
+                terminal: "1".to_string(),
+            },
+            now,
+        );
+        assert!(app.ops.is_empty());
+        assert!(app.peek.as_ref().is_some_and(|p| p.connected));
+        app.apply(
+            AppEvent::PeekChunk {
+                terminal: "1".to_string(),
+                text: "$ watch date\r\nSat Jul  5".to_string(),
+            },
+            now,
+        );
+        app.apply(
+            AppEvent::PeekChunk {
+                terminal: "9".to_string(),
+                text: "other terminal".to_string(),
+            },
+            now,
+        );
+        let peek = app.peek.as_ref().expect("peek state");
+        let lines: Vec<&str> = peek.lines.iter().map(String::as_str).collect();
+        assert_eq!(lines, ["$ watch date", "Sat Jul  5"]);
+    }
+
+    #[test]
+    fn peek_failure_sets_the_error_and_closes_the_op() {
+        let (mut app, now) = committed_app(&["1"]);
+        let _ = app.take_effects();
+        app.tick(now + PEEK_DEBOUNCE);
+        let _ = app.take_effects();
+        let op = *app.ops.keys().next_back().expect("connecting op");
+        app.apply(
+            AppEvent::PeekFailed {
+                op,
+                terminal: "1".to_string(),
+                message: "connection refused".to_string(),
+            },
+            now,
+        );
+        assert!(app.ops.is_empty());
+        assert_eq!(
+            app.peek.as_ref().and_then(|p| p.error.as_deref()),
+            Some("connection refused")
+        );
+    }
+
+    #[test]
+    fn attach_emits_peekstop_before_attach() {
+        let (mut app, now) = committed_app(&["2"]);
+        let _ = app.take_effects();
+        app.tick(now + PEEK_DEBOUNCE);
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Enter), now + Duration::from_millis(400));
+        let effects = app.take_effects();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::PeekStop, Effect::Attach { target }] if target == ":2"
+        ));
+    }
+
+    #[test]
+    fn push_chunk_handles_carriage_returns_and_the_cap() {
+        let mut lines = std::collections::VecDeque::new();
+        push_chunk(&mut lines, "progress 10%\rprogress 90%\r\ndone\n");
+        let collected: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert_eq!(collected, ["progress 90%", "done", ""]);
+
+        let mut lines = std::collections::VecDeque::new();
+        for i in 0..250 {
+            push_chunk(&mut lines, &format!("line {i}\n"));
+        }
+        assert_eq!(lines.len(), PEEK_BUFFER_LINES);
+        assert_eq!(lines.front().map(String::as_str), Some("line 51"));
     }
 }

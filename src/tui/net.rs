@@ -4,6 +4,7 @@ use crate::api::HubClient;
 use crate::api::error::ApiError;
 use crate::api::server::ServerClient;
 use crate::api::types::User;
+use crate::api::ws::TermSocket;
 
 use super::app::{AppEvent, Effect, ServerRow, TerminalRow};
 
@@ -56,8 +57,8 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
             | Effect::Stop { op, .. }
             | Effect::NewTerminal { op, .. }
             | Effect::KillTerminal { op, .. } => *op,
-            Effect::Attach { .. } | Effect::Quit => {
-                unreachable!("attach and quit are handled by the event loop, not net::dispatch")
+            Effect::PeekStart { .. } | Effect::PeekStop | Effect::Attach { .. } | Effect::Quit => {
+                unreachable!("peek effects are handled by the event loop, not net::dispatch")
             }
         };
         let event = match effect {
@@ -80,7 +81,9 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
                 url,
                 terminal,
             } => kill_terminal(&client, op, &server, &url, &terminal).await,
-            Effect::Attach { .. } | Effect::Quit => unreachable!("checked above"),
+            Effect::PeekStart { .. } | Effect::PeekStop | Effect::Attach { .. } | Effect::Quit => {
+                unreachable!("peek effects are handled by the event loop, not net::dispatch")
+            }
         };
         let event = event.unwrap_or_else(|e| AppEvent::OpFailed {
             op,
@@ -89,6 +92,66 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
         // A send failure means the UI is shutting down; nothing left to report to.
         let _ = tx.send(event);
     });
+}
+
+/// Read-only follower for one terminal: connects the terminado WebSocket,
+/// forwards ANSI-stripped stdout chunks, and pings every 30 s of silence so
+/// idle proxies keep the connection alive. Never sends stdin or set_size (the
+/// PTY keeps the size of its real consumers). The caller owns the returned
+/// handle and aborts it to stop following.
+pub fn spawn_peek(
+    op: u64,
+    url: String,
+    terminal: String,
+    client: HubClient,
+    tx: UnboundedSender<AppEvent>,
+) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        let connect = async {
+            let sc = ServerClient::from_hub(&client, &url)?;
+            let ws_url = sc.ws_terminal_url(&terminal)?;
+            TermSocket::connect(&ws_url, client.token()).await
+        };
+        let mut sock = match connect.await {
+            Ok(sock) => sock,
+            Err(e) => {
+                let _ = tx.send(AppEvent::PeekFailed {
+                    op,
+                    terminal,
+                    message: e.to_string(),
+                });
+                return;
+            }
+        };
+        let _ = tx.send(AppEvent::PeekOpened {
+            op,
+            terminal: terminal.clone(),
+        });
+        let mut stripper = crate::shellops::AnsiStripper::new();
+        loop {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(30), sock.next_frame()).await;
+            match frame {
+                Err(_) => {
+                    if sock.ping().await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Ok(Some(crate::api::ws::TermFrame::Stdout(text)))) => {
+                    let clean = stripper.push(&text);
+                    if !clean.is_empty() {
+                        let _ = tx.send(AppEvent::PeekChunk {
+                            terminal: terminal.clone(),
+                            text: clean,
+                        });
+                    }
+                }
+                Ok(Ok(Some(_))) => continue,
+                Ok(Ok(None)) | Ok(Err(_)) => break,
+            }
+        }
+    })
+    .abort_handle()
 }
 
 async fn refresh(client: &HubClient, op: u64) -> Result<AppEvent, ApiError> {
@@ -308,6 +371,69 @@ mod tests {
         dispatch(Effect::Refresh { op: 0 }, client, tx);
         match rx.recv().await.unwrap() {
             AppEvent::OpFailed { message, .. } => assert!(message.contains("scope")),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// Minimal terminado endpoint: accepts one WebSocket, sends setup plus
+    /// the given stdout frames, then holds the socket open.
+    async fn ws_terminal(frames: Vec<String>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            ws.send(Message::Text("[\"setup\", {}]".to_string().into()))
+                .await
+                .unwrap();
+            for frame in frames {
+                ws.send(Message::Text(frame.into())).await.unwrap();
+            }
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn spawn_peek_streams_stripped_chunks() {
+        let addr = ws_terminal(vec![
+            serde_json::json!(["stdout", "\u{1b}[32mhello\u{1b}[0m\r\nworld"]).to_string(),
+        ])
+        .await;
+        let client = HubClient::new(&format!("http://{addr}"), "tok").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = spawn_peek(7, "/user/ww41/".to_string(), "1".to_string(), client, tx);
+        match rx.recv().await.unwrap() {
+            AppEvent::PeekOpened { op, terminal } => {
+                assert_eq!(op, 7);
+                assert_eq!(terminal, "1");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        match rx.recv().await.unwrap() {
+            AppEvent::PeekChunk { text, .. } => assert_eq!(text, "hello\nworld"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn spawn_peek_reports_connect_failure() {
+        // Bind and drop a listener to get a port that refuses connections.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = dead.local_addr().unwrap();
+        drop(dead);
+        let client = HubClient::new(&format!("http://{addr}"), "tok").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _handle = spawn_peek(9, "/user/ww41/".to_string(), "1".to_string(), client, tx);
+        match rx.recv().await.unwrap() {
+            AppEvent::PeekFailed { op, terminal, .. } => {
+                assert_eq!(op, 9);
+                assert_eq!(terminal, "1");
+            }
             other => panic!("unexpected event: {other:?}"),
         }
     }

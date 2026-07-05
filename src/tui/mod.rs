@@ -70,6 +70,7 @@ async fn dashboard_loop(
     let mut refresh = tokio::time::interval(REFRESH_EVERY);
     refresh.tick().await; // consume the immediate first tick; App::new queued a Refresh already
     let mut tick = tokio::time::interval(TICK_EVERY);
+    let mut peek: Option<tokio::task::AbortHandle> = None;
 
     loop {
         terminal
@@ -95,8 +96,33 @@ async fn dashboard_loop(
 
         for effect in app.take_effects() {
             match effect {
-                app::Effect::Quit => return Ok(()),
+                app::Effect::Quit => {
+                    if let Some(handle) = peek.take() {
+                        handle.abort();
+                    }
+                    return Ok(());
+                }
+                app::Effect::PeekStop => {
+                    if let Some(handle) = peek.take() {
+                        handle.abort();
+                    }
+                }
+                app::Effect::PeekStart { op, url, terminal } => {
+                    if let Some(handle) = peek.take() {
+                        handle.abort();
+                    }
+                    peek = Some(net::spawn_peek(
+                        op,
+                        url,
+                        terminal,
+                        client.clone(),
+                        tx.clone(),
+                    ));
+                }
                 app::Effect::Attach { target } => {
+                    if let Some(handle) = peek.take() {
+                        handle.abort();
+                    }
                     let message = suspend::attach_in_subprocess(&app.hub_name, &target).await?;
                     terminal.clear().map_err(CliError::Io)?;
                     app.after_attach(message, Instant::now());
