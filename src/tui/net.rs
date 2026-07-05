@@ -384,6 +384,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_spawn_streams_progress_then_done() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/hub/api/user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(user_json(false)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/hub/api/users/ww41/servers/gpu"))
+            .and(body_json(serde_json::json!({"resource": "2_a100"})))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/hub/api/users/ww41/servers/gpu/progress"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"progress\": 50, \"message\": \"pod pending\"}\n\ndata: {\"progress\": 100, \"ready\": true}\n\n",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = HubClient::new(&server.uri(), "tok").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let options: crate::config::JsonMap =
+            serde_json::from_str(r#"{"resource": "2_a100"}"#).unwrap();
+        dispatch(
+            Effect::Start {
+                op: 5,
+                server: Some("gpu".to_string()),
+                options,
+            },
+            client,
+            tx,
+        );
+        loop {
+            match rx.recv().await.unwrap() {
+                AppEvent::OpDone { op, message } => {
+                    assert_eq!(op, 5);
+                    assert!(message.contains("ready"));
+                    break;
+                }
+                AppEvent::Progress { .. } => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn failures_surface_as_op_failed() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
