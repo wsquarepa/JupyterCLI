@@ -13,6 +13,7 @@ pub struct HubClient {
     base: reqwest::Url,
     token: String,
     verbose: bool,
+    retry_warnings: bool,
 }
 
 impl HubClient {
@@ -27,11 +28,17 @@ impl HubClient {
             base,
             token: token.to_string(),
             verbose: false,
+            retry_warnings: true,
         })
     }
 
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    pub fn with_retry_warnings(mut self, enabled: bool) -> Self {
+        self.retry_warnings = enabled;
         self
     }
 
@@ -73,7 +80,11 @@ impl HubClient {
                 Ok(resp) if resp.status().is_server_error() && attempt < 3 => {
                     let status = resp.status();
                     self.log("GET", url.as_str(), &status.to_string());
-                    eprintln!("warning: GET {url} attempt {attempt} returned {status}; retrying");
+                    if self.retry_warnings {
+                        eprintln!(
+                            "warning: GET {url} attempt {attempt} returned {status}; retrying"
+                        );
+                    }
                     last = Some(ApiError::Status {
                         method: "GET",
                         url: url.to_string(),
@@ -87,7 +98,9 @@ impl HubClient {
                 }
                 Err(e) if attempt < 3 => {
                     self.log("GET", url.as_str(), &format!("transport error: {e}"));
-                    eprintln!("warning: GET {url} attempt {attempt} failed: {e}; retrying");
+                    if self.retry_warnings {
+                        eprintln!("warning: GET {url} attempt {attempt} failed: {e}; retrying");
+                    }
                     last = Some(ApiError::Transport {
                         method: "GET",
                         url: url.to_string(),
@@ -359,6 +372,22 @@ mod tests {
             .mount(&server)
             .await;
         let err = client(&server).await.whoami().await.unwrap_err();
+        assert!(err.to_string().contains("502"));
+    }
+
+    #[tokio::test]
+    async fn retry_still_raises_with_warnings_suppressed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/hub/api/user"))
+            .respond_with(ResponseTemplate::new(502))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let client = HubClient::new(&server.uri(), "tok")
+            .unwrap()
+            .with_retry_warnings(false);
+        let err = client.whoami().await.unwrap_err();
         assert!(err.to_string().contains("502"));
     }
 
