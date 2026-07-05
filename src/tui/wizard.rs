@@ -165,6 +165,7 @@ pub fn render(
     backdrop: &crate::tui::app::App,
     spinner_frame: usize,
 ) {
+    use ratatui::layout::Rect;
     use ratatui::style::Style;
     use ratatui::text::Span;
     use ratatui::widgets::Clear;
@@ -251,7 +252,7 @@ pub fn render(
     };
 
     let area = frame.area();
-    let height = lines.len() as u16 + 3;
+    let height = lines.len() as u16 + 4;
     let rect = super::render::centered_rect(64, height, area);
     frame.render_widget(Clear, rect);
     let block = super::render::dialog_block(" JupyterCLI setup ");
@@ -259,7 +260,12 @@ pub fn render(
     frame.render_widget(block, rect);
     let mut content = vec![Line::from("")];
     content.extend(lines);
-    frame.render_widget(Paragraph::new(content), inner);
+    let padded = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(2),
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(content), padded);
     if !hints.is_empty() {
         super::render::render_hints_below_dialog(frame, rect, area, hints);
     }
@@ -495,6 +501,42 @@ mod tests {
         assert!(
             !text.contains("abc"),
             "token must never render in clear text"
+        );
+    }
+
+    #[test]
+    fn welcome_dialog_pads_content_away_from_its_borders() {
+        let state = WizardState::new();
+        let mut backdrop = crate::tui::app::App::new(
+            "not configured".to_string(),
+            Default::default(),
+            999,
+            (90, 24),
+        );
+        let _ = backdrop.take_effects();
+        backdrop.ops.clear();
+        let backend = ratatui::backend::TestBackend::new(90, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &backdrop, 0))
+            .unwrap();
+        let text = crate::tui::render::buffer_text(&terminal);
+        assert!(
+            text.contains("│ Welcome to JupyterCLI."),
+            "content needs one column of padding after the left border:\n{text}"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        let content_row = lines
+            .iter()
+            .position(|l| l.contains("This wizard"))
+            .expect("welcome body line");
+        let bottom_row = lines
+            .iter()
+            .position(|l| l.contains('└'))
+            .expect("dialog bottom border");
+        assert!(
+            bottom_row > content_row + 1,
+            "a blank row must sit above the bottom border:\n{text}"
         );
     }
 
