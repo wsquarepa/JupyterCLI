@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub type JsonMap = serde_json::Map<String, serde_json::Value>;
+pub use crate::api::types::JsonMap;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {

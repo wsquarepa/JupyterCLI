@@ -1,8 +1,9 @@
-mod common;
+#[path = "common/mock_terminado.rs"]
+mod mock_terminado;
 
-use common::mock_terminado::MockTerminado;
 use jhc::api::ws::{TermFrame, TermSocket};
 use jhc::shellops;
+use mock_terminado::MockTerminado;
 
 #[tokio::test]
 async fn connect_replay_stdin_roundtrip() {
