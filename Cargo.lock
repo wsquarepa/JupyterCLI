@@ -1164,6 +1164,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures-util",
+ "percent-encoding",
  "rand 0.10.2",
  "ratatui",
  "reqwest",

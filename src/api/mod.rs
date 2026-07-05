@@ -4,8 +4,20 @@ pub mod sse;
 pub mod types;
 pub mod ws;
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+
 use error::{ApiError, check};
 use types::{JsonMap, NewToken, ProgressEvent, TokenInfo, User};
+
+/// Percent-encode a server name for use as a single URL path segment. Encodes
+/// everything outside the unreserved set so a name like `a b` or `a?b` reaches
+/// the hub verbatim after it decodes the segment. This is transport encoding,
+/// not name normalization.
+const NAME_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 
 #[derive(Clone)]
 pub struct HubClient {
@@ -154,7 +166,10 @@ impl HubClient {
 
     fn server_path(user: &str, server: Option<&str>) -> String {
         match server {
-            Some(name) => format!("hub/api/users/{user}/servers/{name}"),
+            Some(name) => {
+                let encoded = utf8_percent_encode(name, NAME_SEGMENT);
+                format!("hub/api/users/{user}/servers/{encoded}")
+            }
             None => format!("hub/api/users/{user}/server"),
         }
     }
@@ -357,6 +372,24 @@ mod tests {
         client(&server)
             .await
             .spawn("ww41", Some("backup"), &opts)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_percent_encodes_the_server_name_segment() {
+        // A `?` would otherwise be parsed by Url::join as the query separator,
+        // truncating the path; encoding keeps it inside the name segment.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hub/api/users/ww41/servers/a%3Fb"))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client(&server)
+            .await
+            .spawn("ww41", Some("a?b"), &JsonMap::new())
             .await
             .unwrap();
     }
