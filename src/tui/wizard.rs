@@ -287,6 +287,7 @@ pub fn render(
         Step::Failed => (
             vec![
                 Body::Text("The connection test failed:".to_string()),
+                Body::Text(String::new()),
                 Body::Text(state.error.clone().unwrap_or_default()),
             ],
             " any key: re-enter the token  Esc: quit ",
@@ -605,6 +606,40 @@ mod tests {
         assert!(
             !text.contains("abc"),
             "token must never render in clear text"
+        );
+    }
+
+    #[test]
+    fn failed_step_separates_the_error_from_the_heading() {
+        let mut state = WizardState::new();
+        state.fail("token invalid or expired".to_string());
+        let mut backdrop = crate::tui::app::App::new(
+            "not configured".to_string(),
+            Default::default(),
+            999,
+            (90, 24),
+        );
+        let _ = backdrop.take_effects();
+        backdrop.ops.clear();
+        let backend = ratatui::backend::TestBackend::new(90, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &backdrop, 0))
+            .unwrap();
+        let text = crate::tui::render::buffer_text(&terminal);
+        let lines: Vec<&str> = text.lines().collect();
+        let heading_row = lines
+            .iter()
+            .position(|l| l.contains("The connection test failed:"))
+            .expect("failed heading row");
+        let error_row = lines
+            .iter()
+            .position(|l| l.contains("token invalid or expired"))
+            .expect("generated error row");
+        assert_eq!(
+            error_row,
+            heading_row + 2,
+            "a blank row must separate the heading from the error:\n{text}"
         );
     }
 
