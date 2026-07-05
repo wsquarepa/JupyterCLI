@@ -107,7 +107,13 @@ async fn dashboard_loop(
                         handle.abort();
                     }
                 }
-                app::Effect::PeekStart { op, url, terminal } => {
+                app::Effect::PeekStart {
+                    op,
+                    url,
+                    terminal,
+                    rows,
+                    cols,
+                } => {
                     if let Some(handle) = peek.take() {
                         handle.abort();
                     }
@@ -115,6 +121,8 @@ async fn dashboard_loop(
                         op,
                         url,
                         terminal,
+                        rows,
+                        cols,
                         client.clone(),
                         tx.clone(),
                     ));

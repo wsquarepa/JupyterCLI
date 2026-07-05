@@ -94,16 +94,20 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
     });
 }
 
-/// Read-only follower for one terminal: connects the terminado WebSocket,
-/// forwards raw stdout chunks (escape sequences intact, for the peek pane's
-/// terminal emulator), and pings every 30 s of silence so idle proxies keep
-/// the connection alive. Never sends stdin or set_size (the PTY keeps the size
-/// of its real consumers). The caller owns the returned handle and aborts it
-/// to stop following.
+/// Follower for one terminal: connects the terminado WebSocket, forwards raw
+/// stdout chunks (escape sequences intact, for the peek pane's terminal
+/// emulator), and pings every 30 s of silence so idle proxies keep the
+/// connection alive. Sends exactly one set_size on connect to force a SIGWINCH
+/// repaint and reflow the PTY to the peek pane (a deliberate reversal of the
+/// earlier read-only rule: attach later restores the user's real size on its
+/// own connect, see src/attach.rs:104). It NEVER sends stdin. The caller owns
+/// the returned handle and aborts it to stop following.
 pub fn spawn_peek(
     op: u64,
     url: String,
     terminal: String,
+    rows: u16,
+    cols: u16,
     client: HubClient,
     tx: UnboundedSender<AppEvent>,
 ) -> tokio::task::AbortHandle {
@@ -124,6 +128,14 @@ pub fn spawn_peek(
                 return;
             }
         };
+        if let Err(e) = sock.send_size(rows, cols).await {
+            let _ = tx.send(AppEvent::PeekFailed {
+                op,
+                terminal,
+                message: e.to_string(),
+            });
+            return;
+        }
         let _ = tx.send(AppEvent::PeekOpened {
             op,
             terminal: terminal.clone(),
@@ -378,11 +390,18 @@ mod tests {
     use futures_util::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::tungstenite::Message;
 
-    /// Minimal terminado endpoint: accepts one WebSocket, sends setup plus
-    /// the given stdout frames, then holds the socket open.
-    async fn ws_terminal(frames: Vec<String>) -> std::net::SocketAddr {
+    /// Minimal terminado endpoint: accepts one WebSocket, sends setup plus the
+    /// given stdout frames, then forwards every text frame the client sends
+    /// over the returned channel while holding the socket open.
+    async fn ws_terminal(
+        frames: Vec<String>,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (received_tx, received_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -392,20 +411,32 @@ mod tests {
             for frame in frames {
                 ws.send(Message::Text(frame.into())).await.unwrap();
             }
-            while let Some(Ok(_)) = ws.next().await {}
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Text(text) = message {
+                    let _ = received_tx.send(text.to_string());
+                }
+            }
         });
-        addr
+        (addr, received_rx)
     }
 
     #[tokio::test]
-    async fn spawn_peek_streams_raw_chunks() {
-        let addr = ws_terminal(vec![
+    async fn spawn_peek_sizes_then_streams_raw_chunks() {
+        let (addr, mut received) = ws_terminal(vec![
             serde_json::json!(["stdout", "\u{1b}[32mhello\u{1b}[0m\r\nworld"]).to_string(),
         ])
         .await;
         let client = HubClient::new(&format!("http://{addr}"), "tok").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = spawn_peek(7, "/user/ww41/".to_string(), "1".to_string(), client, tx);
+        let handle = spawn_peek(
+            7,
+            "/user/ww41/".to_string(),
+            "1".to_string(),
+            12,
+            140,
+            client,
+            tx,
+        );
         match rx.recv().await.unwrap() {
             AppEvent::PeekOpened { op, terminal } => {
                 assert_eq!(op, 7);
@@ -419,6 +450,9 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+        let frame = received.recv().await.expect("peek sends a set_size frame");
+        let decoded: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(decoded, serde_json::json!(["set_size", 12, 140]));
         handle.abort();
     }
 
@@ -430,7 +464,15 @@ mod tests {
         drop(dead);
         let client = HubClient::new(&format!("http://{addr}"), "tok").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _handle = spawn_peek(9, "/user/ww41/".to_string(), "1".to_string(), client, tx);
+        let _handle = spawn_peek(
+            9,
+            "/user/ww41/".to_string(),
+            "1".to_string(),
+            12,
+            140,
+            client,
+            tx,
+        );
         match rx.recv().await.unwrap() {
             AppEvent::PeekFailed { op, terminal, .. } => {
                 assert_eq!(op, 9);

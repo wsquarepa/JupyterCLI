@@ -23,6 +23,8 @@ pub struct PeekState {
     pub terminal: String,
     pub connected: bool,
     pub error: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
     pub parser: vt100::Parser,
 }
 
@@ -124,6 +126,8 @@ pub enum Effect {
         op: u64,
         url: String,
         terminal: String,
+        rows: u16,
+        cols: u16,
     },
     PeekStop,
     Attach {
@@ -301,23 +305,29 @@ impl App {
                     .expect("due is only true when hover is Some")
                     .terminal
                     .clone();
+                let cols = grid::grid_inner_width(self.size.0).max(1);
+                let rows = grid::peek_height(self.size.1.saturating_sub(1))
+                    .saturating_sub(2)
+                    .max(1);
                 self.peek = Some(PeekState {
                     terminal: terminal.clone(),
                     connected: false,
                     error: None,
-                    // The real PTY size is not queryable over the terminals API
-                    // and peek never sends set_size (it is a read-only observer),
-                    // so the parser is deliberately oversized instead of matched.
-                    // Content formatted for any realistic PTY width then renders
-                    // without artificial wrapping and the pane truncates at its
-                    // own width. Ceiling: absolute cursor addressing beyond 100
-                    // rows or 400 columns still clamps to this grid.
-                    parser: vt100::Parser::new(100, 400, 0),
+                    rows,
+                    cols,
+                    // Peek resizes the PTY to the pane on connect, so the parser
+                    // and PTY agree on the size by construction and full-screen
+                    // apps repaint into this exact grid. Ceiling: a terminal
+                    // resize mid-hover keeps these dimensions until the next
+                    // hover, which reconnects at the new size.
+                    parser: vt100::Parser::new(rows, cols, 0),
                 });
                 self.peek_op = self.push_effect(Effect::PeekStart {
                     op: 0,
                     url,
                     terminal,
+                    rows,
+                    cols,
                 });
                 if let Some(hover) = &mut self.hover {
                     hover.started = true;
@@ -1352,9 +1362,15 @@ mod tests {
         assert!(app.take_effects().is_empty(), "before the debounce");
         app.tick(now + PEEK_DEBOUNCE);
         let effects = app.take_effects();
+        // 100x30 frame: grid inner width 78, peek pane inner height 5.
         assert!(matches!(
             effects.as_slice(),
-            [Effect::PeekStart { terminal, .. }] if terminal == "1"
+            [Effect::PeekStart {
+                terminal,
+                rows: 5,
+                cols: 78,
+                ..
+            }] if terminal == "1"
         ));
         assert_eq!(app.ops.values().next_back(), Some(&"connecting"));
         app.tick(now + PEEK_DEBOUNCE + Duration::from_millis(200));
@@ -1449,11 +1465,40 @@ mod tests {
     }
 
     #[test]
-    fn peek_screen_does_not_wrap_lines_at_80_columns() {
-        let (mut app, now) = committed_app(&["1"]);
+    fn peek_screen_does_not_wrap_below_its_pane_width() {
+        // A 177-column frame gives a 140-column peek parser, so a 120-char line
+        // fits on one row without the parser wrapping it.
+        let now = Instant::now();
+        let mut app = App::new("icrn".to_string(), Default::default(), 999, (177, 30));
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::Refreshed {
+                op: 1,
+                username: "ww41".to_string(),
+                servers: vec![row("", true)],
+            },
+            now,
+        );
+        app.on_key(&press(KeyCode::Enter), now);
+        let op = match app.take_effects().as_slice() {
+            [Effect::FetchTerminals { op, .. }] => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        app.apply(
+            AppEvent::Terminals {
+                op,
+                server: "default".to_string(),
+                terminals: terminals(&["1"]),
+            },
+            now,
+        );
         let _ = app.take_effects();
         app.tick(now + PEEK_DEBOUNCE);
-        let _ = app.take_effects();
+        let cols = match app.take_effects().as_slice() {
+            [Effect::PeekStart { cols, .. }] => *cols,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        assert_eq!(cols, 140);
         let op = *app.ops.keys().next_back().expect("connecting op");
         app.apply(
             AppEvent::PeekOpened {
@@ -1471,7 +1516,7 @@ mod tests {
             now,
         );
         let peek = app.peek.as_ref().expect("peek state");
-        let rows: Vec<String> = peek.parser.screen().rows(0, 400).collect();
+        let rows: Vec<String> = peek.parser.screen().rows(0, cols).collect();
         assert_eq!(rows[0].trim_end(), line, "a 120-char line stays on one row");
         assert_eq!(rows[1].trim_end(), "", "nothing wraps onto the next row");
     }
