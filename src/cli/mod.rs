@@ -154,6 +154,11 @@ pub enum ShellCmd {
         text: Vec<String>,
     },
     /// Print a shell's recent output
+    #[command(
+        after_help = "peek shows only the terminal's bounded scrollback, so output from a \
+long-running job can scroll past the ceiling and be lost. For long jobs, capture to a file and \
+fetch it instead:\n  jhc shell send SHELL -- 'cmd |& tee job.log'\n  jhc cp SHELL:job.log ./job.log"
+    )]
     Peek {
         /// Shell as [SERVER:]SHELL
         shell: String,
@@ -248,7 +253,25 @@ pub fn options_from_flags(flags: &[String]) -> Result<JsonMap, CliError> {
 }
 
 pub fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // exec reserves every non-125 exit for the remote command's status, so a clap
+            // usage error under exec must surface as 125, not clap's default 2. Heuristic:
+            // the first non-flag argument names the subcommand. `use_stderr()` is true only
+            // for real errors, so --help/--version (exit 0, stdout) still take err.exit().
+            let targets_exec = std::env::args()
+                .skip(1)
+                .find(|arg| !arg.starts_with('-'))
+                .as_deref()
+                == Some("exec");
+            if targets_exec && err.use_stderr() {
+                eprint!("{err}");
+                return std::process::ExitCode::from(crate::shellops::JHC_FAILURE_EXIT as u8);
+            }
+            err.exit();
+        }
+    };
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {

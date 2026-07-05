@@ -44,12 +44,19 @@ pub async fn run(url: Option<String>, token: Option<String>, name: String) -> Re
         },
         Err(e) => return Err(e.into()),
     };
+    // Re-running init to refresh a token must not discard presets imported for an
+    // existing hub of the same name.
+    let presets = cfg
+        .hubs
+        .get(&name)
+        .map(|existing| existing.presets.clone())
+        .unwrap_or_default();
     cfg.hubs.insert(
         name.clone(),
         HubConfig {
             url: url.clone(),
             token,
-            presets: Default::default(),
+            presets,
         },
     );
     if !cfg.hubs.contains_key(&cfg.default_hub) {
