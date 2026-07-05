@@ -1,0 +1,205 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+pub type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("no configuration found at {0}")]
+    NotFound(PathBuf),
+    #[error("cannot determine the config directory: no home directory")]
+    NoConfigDir,
+    #[error("failed to read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid config {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("config serialization failed: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("unknown hub '{name}': configured hubs are {available}")]
+    UnknownHub { name: String, available: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub default_hub: String,
+    #[serde(default)]
+    pub hubs: BTreeMap<String, HubConfig>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubConfig {
+    pub url: String,
+    pub token: String,
+    #[serde(default)]
+    pub presets: BTreeMap<String, JsonMap>,
+}
+
+impl Config {
+    pub fn resolve_hub(&self, name: Option<&str>) -> Result<(&str, &HubConfig), ConfigError> {
+        let wanted = name.unwrap_or(&self.default_hub);
+        match self.hubs.get_key_value(wanted) {
+            Some((k, v)) => Ok((k.as_str(), v)),
+            None => Err(ConfigError::UnknownHub {
+                name: wanted.to_string(),
+                available: self.hubs.keys().cloned().collect::<Vec<_>>().join(", "),
+            }),
+        }
+    }
+}
+
+impl HubConfig {
+    pub fn effective_token(&self) -> String {
+        std::env::var("JUPYTERHUB_API_TOKEN").unwrap_or_else(|_| self.token.clone())
+    }
+}
+
+pub fn dir() -> Result<PathBuf, ConfigError> {
+    if let Ok(over) = std::env::var("JHC_CONFIG_DIR") {
+        return Ok(PathBuf::from(over));
+    }
+    dirs::config_dir()
+        .map(|d| d.join("jhc"))
+        .ok_or(ConfigError::NoConfigDir)
+}
+
+pub fn path() -> Result<PathBuf, ConfigError> {
+    Ok(dir()?.join("config.toml"))
+}
+
+pub fn load() -> Result<Config, ConfigError> {
+    load_from(&dir()?)
+}
+
+pub fn save(cfg: &Config) -> Result<PathBuf, ConfigError> {
+    save_to(cfg, &dir()?)
+}
+
+fn load_from(dir: &Path) -> Result<Config, ConfigError> {
+    let path = dir.join("config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ConfigError::NotFound(path));
+        }
+        Err(e) => return Err(ConfigError::Read { path, source: e }),
+    };
+    toml::from_str(&text).map_err(|e| ConfigError::Parse { path, source: e })
+}
+
+fn save_to(cfg: &Config, dir: &Path) -> Result<PathBuf, ConfigError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join("config.toml");
+    std::fs::create_dir_all(dir).map_err(|e| ConfigError::Write {
+        path: path.clone(),
+        source: e,
+    })?;
+    let text = toml::to_string_pretty(cfg)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| ConfigError::Write {
+            path: path.clone(),
+            source: e,
+        })?;
+    file.write_all(text.as_bytes())
+        .map_err(|e| ConfigError::Write {
+            path: path.clone(),
+            source: e,
+        })?;
+    Ok(path)
+}
+
+pub fn permissions_are_loose(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.permissions().mode() & 0o077 != 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> &'static str {
+        r#"
+default_hub = "icrn"
+
+[hubs.icrn]
+url = "https://jupyter.example.edu"
+token = "tok123"
+
+[hubs.icrn.presets.a100]
+profile = "environments"
+image = "vscode"
+gpus = 2
+debug = true
+"#
+    }
+
+    #[test]
+    fn parses_presets_with_typed_values() {
+        let cfg: Config = toml::from_str(sample()).unwrap();
+        let preset = &cfg.hubs["icrn"].presets["a100"];
+        assert_eq!(preset["profile"], serde_json::json!("environments"));
+        assert_eq!(preset["gpus"], serde_json::json!(2));
+        assert_eq!(preset["debug"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn rejects_unknown_keys() {
+        let bad = "default_hub = \"x\"\nsurprise = 1\n";
+        assert!(toml::from_str::<Config>(bad).is_err());
+    }
+
+    #[test]
+    fn resolve_hub_default_and_override() {
+        let cfg: Config = toml::from_str(sample()).unwrap();
+        assert_eq!(cfg.resolve_hub(None).unwrap().0, "icrn");
+        assert_eq!(cfg.resolve_hub(Some("icrn")).unwrap().0, "icrn");
+        let err = cfg.resolve_hub(Some("nope")).unwrap_err();
+        assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn save_writes_0600_and_roundtrips() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(sample()).unwrap();
+        let path = save_to(&cfg, dir.path()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let loaded = load_from(dir.path()).unwrap();
+        assert_eq!(loaded.default_hub, "icrn");
+        assert!(!permissions_are_loose(&path));
+    }
+
+    #[test]
+    fn load_missing_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            load_from(dir.path()),
+            Err(ConfigError::NotFound(_))
+        ));
+    }
+}
