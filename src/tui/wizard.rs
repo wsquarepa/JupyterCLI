@@ -223,10 +223,13 @@ fn input_line(label: &str, input: &LineInput, active: bool) -> ratatui::text::Li
     ])
 }
 
-/// A wizard content row: `Text` is plain prose to word-wrap; `Row` is an input
-/// or spinner row rendered verbatim (its cursor windowing is already sized).
+/// A wizard content row: `Text` is plain prose to word-wrap; `Indented` wraps
+/// two columns narrower and prefixes each resulting line with two spaces;
+/// `Row` is an input or spinner row rendered verbatim (its cursor windowing is
+/// already sized).
 enum Body {
     Text(String),
+    Indented(String),
     Row(Line<'static>),
 }
 
@@ -301,7 +304,10 @@ pub fn render(
                             Body::Text(
                                 "A running server was found with these options:".to_string(),
                             ),
-                            Body::Text(format!("  {}", rendered.join(" "))),
+                            // Wrapped un-indented, then indented per line: wrap_text
+                            // drops leading spaces, so a pre-indented string would
+                            // render flush-left.
+                            Body::Indented(rendered.join(" ")),
                             Body::Text(
                                 "Save them as preset 'imported' for one-key starts?".to_string(),
                             ),
@@ -340,6 +346,10 @@ pub fn render(
             Body::Text(text) => wrap_text(&text, CONTENT_WIDTH)
                 .into_iter()
                 .map(Line::from)
+                .collect::<Vec<Line>>(),
+            Body::Indented(text) => wrap_text(&text, CONTENT_WIDTH.saturating_sub(2))
+                .into_iter()
+                .map(|line| Line::from(format!("  {line}")))
                 .collect::<Vec<Line>>(),
             Body::Row(line) => vec![line],
         })
