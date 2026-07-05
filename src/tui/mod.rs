@@ -1,3 +1,4 @@
+pub mod input;
 pub mod render;
 
 use crate::cli::CliError;
