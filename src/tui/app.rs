@@ -625,14 +625,23 @@ impl App {
     }
 
     fn on_key_servers(&mut self, code: KeyCode, now: Instant) {
+        let synthetic = self.server_cursor == self.servers.len();
         match code {
             KeyCode::Up => self.move_server_cursor(false),
             KeyCode::Down => self.move_server_cursor(true),
+            KeyCode::Enter if synthetic => self.open_create_named(),
+            KeyCode::Char('n') if synthetic => self.open_create_named(),
             KeyCode::Enter => self.enter_server(now),
             KeyCode::Char('n') => self.start_server_dialog(now),
             KeyCode::Char('x') => self.confirm_stop_server(now),
             _ => {}
         }
+    }
+
+    fn open_create_named(&mut self) {
+        self.dialog = Some(super::dialogs::Dialog::CreateNamed(
+            super::dialogs::CreateNamedDialog::new(&self.presets),
+        ));
     }
 
     fn on_key_grid(&mut self, code: KeyCode, now: Instant) {
@@ -650,12 +659,11 @@ impl App {
     }
 
     fn move_server_cursor(&mut self, down: bool) {
-        let len = self.servers.len();
-        if len == 0 {
-            return;
-        }
+        // The synthetic "+ new named server" row sits at index servers.len(),
+        // so the cursor range is 0..=servers.len().
+        let max = self.servers.len();
         self.server_cursor = if down {
-            (self.server_cursor + 1).min(len - 1)
+            (self.server_cursor + 1).min(max)
         } else {
             self.server_cursor.saturating_sub(1)
         };
@@ -1614,5 +1622,33 @@ mod tests {
             effects.as_slice(),
             [Effect::PeekStop, Effect::Attach { target }] if target == ":2"
         ));
+    }
+
+    #[test]
+    fn cursor_reaches_the_synthetic_row_and_n_opens_create_named() {
+        let (mut app, now) = fresh_app();
+        // servers = [default, backup, lab]; the synthetic row is index 3.
+        for _ in 0..5 {
+            app.on_key(&press(KeyCode::Down), now);
+        }
+        assert_eq!(app.server_cursor, app.servers.len());
+        app.on_key(&press(KeyCode::Char('n')), now);
+        assert!(matches!(
+            app.dialog,
+            Some(crate::tui::dialogs::Dialog::CreateNamed(_))
+        ));
+    }
+
+    #[test]
+    fn x_on_the_synthetic_row_does_nothing() {
+        let (mut app, now) = fresh_app();
+        for _ in 0..5 {
+            app.on_key(&press(KeyCode::Down), now);
+        }
+        assert_eq!(app.server_cursor, app.servers.len());
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Char('x')), now);
+        assert!(app.dialog.is_none());
+        assert!(app.take_effects().is_empty());
     }
 }

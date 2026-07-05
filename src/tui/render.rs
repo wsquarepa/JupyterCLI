@@ -75,16 +75,36 @@ fn draw_servers(frame: &mut Frame, app: &App, area: Rect) {
     if visible == 0 {
         return;
     }
+    let total = app.servers.len() + 1;
     let offset = app.server_cursor.saturating_sub(visible.saturating_sub(1));
-    let lines: Vec<Line> = app
-        .servers
-        .iter()
-        .enumerate()
-        .skip(offset)
+    let lines: Vec<Line> = (offset..total)
         .take(visible)
-        .map(|(index, server)| server_line(app, index, server, inner.width))
+        .map(|index| match app.servers.get(index) {
+            Some(server) => server_line(app, index, server, inner.width),
+            None => synthetic_row_line(app, index, inner.width),
+        })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn synthetic_row_line(app: &App, index: usize, width: u16) -> Line<'static> {
+    let label = "+ new named server";
+    if index == app.server_cursor {
+        let pad_len = usize::from(width)
+            .saturating_sub(2)
+            .saturating_sub(label.chars().count());
+        Line::from(Span::styled(
+            format!("  {label}{}", " ".repeat(pad_len)),
+            Style::default()
+                .fg(theme::SELECTION_FG)
+                .bg(theme::SELECTION_BG),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!("  {label}"),
+            Style::default().fg(theme::DIMMED),
+        ))
+    }
 }
 
 fn server_line(app: &App, index: usize, server: &ServerRow, width: u16) -> Line<'static> {
@@ -708,5 +728,14 @@ mod tests {
         );
         let text = rendered(&app);
         assert!(!text.contains("refreshing"));
+    }
+
+    #[test]
+    fn servers_pane_shows_the_synthetic_new_row() {
+        // A wide frame keeps the servers pane (20% of frame width) wider
+        // than the label, so it isn't clipped before the assertion below.
+        let (app, _) = app_with_servers();
+        let text = rendered_sized(&app, 150, 30);
+        assert!(text.contains("+ new named server"), "buffer:\n{text}");
     }
 }
