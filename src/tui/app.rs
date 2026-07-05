@@ -298,12 +298,14 @@ impl App {
                     terminal: terminal.clone(),
                     connected: false,
                     error: None,
-                    // 24x80 is terminado's default PTY size. Ceiling: we cannot
-                    // query the real PTY size over the terminals API, so a session
-                    // resized past 80x24 by an attach clamps coordinates to this
-                    // grid. Upgrade path: query or negotiate the size if
-                    // jupyter-server ever exposes it.
-                    parser: vt100::Parser::new(24, 80, 0),
+                    // The real PTY size is not queryable over the terminals API
+                    // and peek never sends set_size (it is a read-only observer),
+                    // so the parser is deliberately oversized instead of matched.
+                    // Content formatted for any realistic PTY width then renders
+                    // without artificial wrapping and the pane truncates at its
+                    // own width. Ceiling: absolute cursor addressing beyond 100
+                    // rows or 400 columns still clamps to this grid.
+                    parser: vt100::Parser::new(100, 400, 0),
                 });
                 self.peek_op = self.push_effect(Effect::PeekStart {
                     op: 0,
@@ -1297,6 +1299,34 @@ mod tests {
         let rows: Vec<String> = peek.parser.screen().rows(0, 80).collect();
         assert_eq!(rows[0].trim_end(), "first line");
         assert_eq!(rows[1].trim_end(), "second line");
+    }
+
+    #[test]
+    fn peek_screen_does_not_wrap_lines_at_80_columns() {
+        let (mut app, now) = committed_app(&["1"]);
+        let _ = app.take_effects();
+        app.tick(now + PEEK_DEBOUNCE);
+        let _ = app.take_effects();
+        let op = *app.ops.keys().next_back().expect("connecting op");
+        app.apply(
+            AppEvent::PeekOpened {
+                op,
+                terminal: "1".to_string(),
+            },
+            now,
+        );
+        let line = "x".repeat(120);
+        app.apply(
+            AppEvent::PeekChunk {
+                terminal: "1".to_string(),
+                text: line.clone(),
+            },
+            now,
+        );
+        let peek = app.peek.as_ref().expect("peek state");
+        let rows: Vec<String> = peek.parser.screen().rows(0, 400).collect();
+        assert_eq!(rows[0].trim_end(), line, "a 120-char line stays on one row");
+        assert_eq!(rows[1].trim_end(), "", "nothing wraps onto the next row");
     }
 
     #[test]

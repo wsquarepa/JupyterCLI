@@ -276,7 +276,7 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
     // Tail-anchor the emulated screen: show the window ending at the last
     // painted row so a shell prompt (bottom of the screen) stays visible while
     // a full-screen app's most recent region shows through.
-    let rows: Vec<String> = peek.parser.screen().rows(0, 80).collect();
+    let rows: Vec<String> = peek.parser.screen().rows(0, 400).collect();
     let Some(last) = rows.iter().rposition(|r| r.chars().any(|c| c != ' ')) else {
         return;
     };
