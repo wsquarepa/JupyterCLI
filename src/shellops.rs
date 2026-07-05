@@ -140,7 +140,7 @@ enum ExecState {
 
 // Longest suffix of `buf` that equals a proper prefix of `needle`, in bytes.
 // A full match is handled by the caller's `find`, so the overlap is capped at `needle.len() - 1`.
-fn end_sentinel_overlap(buf: &str, needle: &str) -> usize {
+fn sentinel_overlap(buf: &str, needle: &str) -> usize {
     let b = buf.as_bytes();
     let n = needle.as_bytes();
     let max = b.len().min(n.len().saturating_sub(1));
@@ -179,11 +179,11 @@ impl ExecParser {
                         self.buf.drain(..pos + self.start_marker.len());
                         self.state = ExecState::Streaming;
                     } else {
-                        let keep = self
-                            .start_marker
-                            .len()
-                            .saturating_sub(1)
-                            .min(self.buf.len());
+                        // Retain only the buffer suffix that could be the start of a split
+                        // start sentinel. The marker is pure ASCII, so any overlapping suffix
+                        // is ASCII and `buf.len() - keep` lands on a char boundary; a byte-count
+                        // retention would panic on multibyte pre-start output.
+                        let keep = sentinel_overlap(&self.buf, &self.start_marker);
                         self.buf.drain(..self.buf.len() - keep);
                         return (out, None);
                     }
@@ -208,7 +208,7 @@ impl ExecParser {
                     // Retain only the buffer suffix that could be the start of a split end
                     // sentinel; emit everything before it. `end_prefix` is ASCII, so any
                     // overlapping suffix is ASCII and `buf.len() - keep` lands on a char boundary.
-                    let keep = end_sentinel_overlap(&self.buf, &self.end_prefix);
+                    let keep = sentinel_overlap(&self.buf, &self.end_prefix);
                     let emit: String = self.buf.drain(..self.buf.len() - keep).collect();
                     out.push_str(&normalize_crlf(&emit, &mut self.pending_cr));
                     return (out, None);
@@ -388,6 +388,19 @@ mod tests {
         let echoed = format!("printf '\\036{n}:S\\036'; {{ ls; }}\r\n");
         let (out, code) = p.push(&echoed);
         assert_eq!((out.as_str(), code), ("", None));
+    }
+
+    #[test]
+    fn exec_parser_multibyte_pre_start_output_does_not_panic() {
+        let n = "abcd1234";
+        let mut p = ExecParser::new(n);
+        // 24 bytes of 2-byte chars: the old byte-count retention drained to a
+        // non-char-boundary index and panicked.
+        let (out1, code1) = p.push(&"\u{e9}".repeat(12));
+        assert_eq!((out1.as_str(), code1), ("", None));
+        let (out2, code2) = p.push(&format!("\x1e{n}:S\x1eok\r\n\x1e{n}:0\x1e"));
+        assert_eq!(out2, "ok\n");
+        assert_eq!(code2, Some(0));
     }
 
     #[test]
