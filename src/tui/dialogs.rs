@@ -81,27 +81,62 @@ pub enum Outcome {
     Spawn(Effect),
 }
 
+enum PickerOutcome {
+    Stay,
+    Close,
+    Commit(JsonMap),
+}
+
+fn handle_picker_key(picker: &mut StartDialog, key: &KeyEvent) -> PickerOutcome {
+    match key.code {
+        KeyCode::Up => {
+            picker.selected = picker.selected.saturating_sub(1);
+            PickerOutcome::Stay
+        }
+        KeyCode::Down => {
+            picker.selected = (picker.selected + 1).min(picker.entries.len() - 1);
+            PickerOutcome::Stay
+        }
+        KeyCode::Enter => PickerOutcome::Commit(picker.entries[picker.selected].1.clone()),
+        KeyCode::Esc => PickerOutcome::Close,
+        _ => PickerOutcome::Stay,
+    }
+}
+
+fn picker_row(text: &str, selected: bool, width: usize) -> Line<'static> {
+    if selected {
+        Line::from(Span::styled(
+            format!("{text:<width$}"),
+            Style::default()
+                .fg(crate::tui::theme::SELECTION_FG)
+                .bg(crate::tui::theme::SELECTION_BG),
+        ))
+    } else {
+        Line::from(text.to_string())
+    }
+}
+
+fn render_picker(picker: &StartDialog, width: usize) -> Vec<Line<'static>> {
+    picker
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| {
+            picker_row(&preset_entry_text(name), index == picker.selected, width)
+        })
+        .collect()
+}
+
 pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome {
     match dialog {
-        Dialog::Start(start) => match key.code {
-            KeyCode::Up => {
-                start.selected = start.selected.saturating_sub(1);
-                Outcome::Stay
-            }
-            KeyCode::Down => {
-                start.selected = (start.selected + 1).min(start.entries.len() - 1);
-                Outcome::Stay
-            }
-            KeyCode::Enter => {
-                let (_, options) = start.entries[start.selected].clone();
-                Outcome::Commit(Effect::Start {
-                    op: 0,
-                    server: start.server.clone(),
-                    options,
-                })
-            }
-            KeyCode::Esc => Outcome::Close,
-            _ => Outcome::Stay,
+        Dialog::Start(start) => match handle_picker_key(start, key) {
+            PickerOutcome::Stay => Outcome::Stay,
+            PickerOutcome::Close => Outcome::Close,
+            PickerOutcome::Commit(options) => Outcome::Commit(Effect::Start {
+                op: 0,
+                server: start.server.clone(),
+                options,
+            }),
         },
         Dialog::Confirm(confirm) => match key.code {
             KeyCode::Enter | KeyCode::Char('y') => {
@@ -134,27 +169,14 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome 
                     Outcome::Stay
                 }
             },
-            CreateStep::Preset => match key.code {
-                KeyCode::Up => {
-                    create.picker.selected = create.picker.selected.saturating_sub(1);
-                    Outcome::Stay
-                }
-                KeyCode::Down => {
-                    create.picker.selected =
-                        (create.picker.selected + 1).min(create.picker.entries.len() - 1);
-                    Outcome::Stay
-                }
-                KeyCode::Enter => {
-                    let (_, options) = create.picker.entries[create.picker.selected].clone();
-                    let name = create.input.value().to_string();
-                    Outcome::Spawn(Effect::Start {
-                        op: 0,
-                        server: Some(name),
-                        options,
-                    })
-                }
-                KeyCode::Esc => Outcome::Close,
-                _ => Outcome::Stay,
+            CreateStep::Preset => match handle_picker_key(&mut create.picker, key) {
+                PickerOutcome::Stay => Outcome::Stay,
+                PickerOutcome::Close => Outcome::Close,
+                PickerOutcome::Commit(options) => Outcome::Spawn(Effect::Start {
+                    op: 0,
+                    server: Some(create.input.value().to_string()),
+                    options,
+                }),
             },
             CreateStep::Starting => match key.code {
                 KeyCode::Esc => Outcome::Close,
@@ -176,32 +198,22 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
     let area = frame.area();
     match dialog {
         Dialog::Start(start) => {
-            let height = (start.entries.len() as u16).saturating_add(4);
+            let dialog_width = 60u16.min(area.width);
+            let width = usize::from(dialog_width.saturating_sub(2));
+            let body = render_picker(start, width);
+            let height = body.len() as u16 + 4;
             let rect = super::render::centered_rect(60, height, area);
             frame.render_widget(Clear, rect);
             let title = match &start.server {
                 Some(server) => format!(" Start {server} "),
                 None => " Start the default server ".to_string(),
             };
-            let width = usize::from(rect.width.saturating_sub(2));
-            let mut lines: Vec<Line> = vec![Line::from("")];
-            lines.extend(start.entries.iter().enumerate().map(|(index, (name, _))| {
-                let text = preset_entry_text(name);
-                if index == start.selected {
-                    Line::from(Span::styled(
-                        format!("{text:<width$}"),
-                        Style::default()
-                            .fg(crate::tui::theme::SELECTION_FG)
-                            .bg(crate::tui::theme::SELECTION_BG),
-                    ))
-                } else {
-                    Line::from(text)
-                }
-            }));
             let block = super::render::dialog_block(&title);
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
-            frame.render_widget(Paragraph::new(lines), inner);
+            let mut content = vec![Line::from("")];
+            content.extend(body);
+            frame.render_widget(Paragraph::new(content), inner);
             super::render::render_hints_below_dialog(
                 frame,
                 rect,
@@ -253,19 +265,7 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
                 CreateStep::Preset => {
                     lines.push(Line::from("Step 2 of 2: choose a preset"));
                     lines.push(Line::from(""));
-                    for (index, (name, _)) in create.picker.entries.iter().enumerate() {
-                        let text = preset_entry_text(name);
-                        if index == create.picker.selected {
-                            lines.push(Line::from(Span::styled(
-                                format!("{text:<width$}", width = super::wizard::CONTENT_WIDTH),
-                                Style::default()
-                                    .fg(crate::tui::theme::SELECTION_FG)
-                                    .bg(crate::tui::theme::SELECTION_BG),
-                            )));
-                        } else {
-                            lines.push(Line::from(text));
-                        }
-                    }
+                    lines.extend(render_picker(&create.picker, super::wizard::CONTENT_WIDTH));
                 }
                 CreateStep::Starting => {
                     let name = create.input.value();
