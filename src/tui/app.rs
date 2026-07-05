@@ -566,7 +566,7 @@ impl App {
             KeyCode::Up => self.move_server_cursor(false),
             KeyCode::Down => self.move_server_cursor(true),
             KeyCode::Enter => self.enter_server(now),
-            KeyCode::Char('n') => self.new_terminal_from_servers(now),
+            KeyCode::Char('n') => self.start_server_dialog(now),
             KeyCode::Char('x') => self.confirm_stop_server(now),
             _ => {}
         }
@@ -627,7 +627,20 @@ impl App {
             self.focus = Focus::Grid;
         } else if server.ready {
             self.set_status("the server reports no URL; refresh".to_string(), true, now);
-        } else if server.pending.is_some() {
+        } else {
+            self.spawn_stopped_server(now);
+        }
+    }
+
+    /// Dialog/status paths for a not-yet-ready cursor server, shared by Enter
+    /// and by `n` in the Servers pane: a pending spawn reports progress, a
+    /// stopped default opens the Start dialog, and a stopped named server
+    /// points at the command line.
+    fn spawn_stopped_server(&mut self, now: Instant) {
+        let Some(server) = self.servers.get(self.server_cursor) else {
+            return;
+        };
+        if server.pending.is_some() {
             self.set_status("a spawn is already in progress".to_string(), false, now);
         } else if server.name.is_empty() {
             self.dialog = Some(super::dialogs::Dialog::Start(
@@ -639,6 +652,21 @@ impl App {
                 true,
                 now,
             );
+        }
+    }
+
+    /// `n` in the Servers pane starts the cursor server: a ready server is
+    /// already running (info status), and anything else follows the shared
+    /// stopped-server paths.
+    fn start_server_dialog(&mut self, now: Instant) {
+        let Some(server) = self.servers.get(self.server_cursor) else {
+            return;
+        };
+        if server.ready {
+            let display = server.display.clone();
+            self.set_status(format!("{display} is already running"), false, now);
+        } else {
+            self.spawn_stopped_server(now);
         }
     }
 
@@ -682,33 +710,6 @@ impl App {
         };
         self.set_status(message, true, now);
         true
-    }
-
-    fn new_terminal_from_servers(&mut self, now: Instant) {
-        let Some(server) = self.servers.get(self.server_cursor) else {
-            return;
-        };
-        if !(server.ready && server.url.is_some()) {
-            self.set_status(
-                "the selected server is not ready; start it first".to_string(),
-                true,
-                now,
-            );
-            return;
-        }
-        let same = self.committed_server.as_deref() == Some(server.display.as_str());
-        let display = server.display.clone();
-        let url = server.url.clone().expect("checked is_some above");
-        if same && self.reject_at_cap(now) {
-            return;
-        }
-        self.commit_cursor_server();
-        self.focus = Focus::Grid;
-        self.push_effect(Effect::NewTerminal {
-            op: 0,
-            server: display,
-            url,
-        });
     }
 
     fn new_terminal_on_committed(&mut self, now: Instant) {
@@ -1114,17 +1115,70 @@ mod tests {
     }
 
     #[test]
-    fn n_from_servers_commits_and_creates() {
+    fn n_in_servers_pane_opens_the_start_flow() {
         let (mut app, now) = fresh_app();
         let _ = app.take_effects();
+        let pending = ServerRow {
+            name: "run".to_string(),
+            display: "run".to_string(),
+            ready: false,
+            pending: Some("starting".to_string()),
+            options: JsonMap::new(),
+            url: None,
+        };
+        app.apply(
+            AppEvent::Refreshed {
+                op: 5,
+                username: "ww41".to_string(),
+                servers: vec![
+                    row("", false),
+                    row("backup", true),
+                    pending,
+                    row("lab", false),
+                ],
+            },
+            now,
+        );
+        let _ = app.take_effects();
+
+        // Stopped default: opens the Start dialog, no effects, no focus change.
         app.on_key(&press(KeyCode::Char('n')), now);
-        assert_eq!(app.committed_server.as_deref(), Some("default"));
-        assert_eq!(app.focus, Focus::Grid);
-        let effects = app.take_effects();
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::FetchTerminals { .. }, Effect::NewTerminal { server, .. }] if server == "default"
+            app.dialog,
+            Some(crate::tui::dialogs::Dialog::Start(_))
         ));
+        assert_eq!(app.focus, Focus::Servers);
+        assert!(app.committed_server.is_none());
+        assert!(app.take_effects().is_empty());
+        app.on_key(&press(KeyCode::Esc), now);
+        assert!(app.dialog.is_none());
+
+        // Ready: an info status, no dialog, no effects, no focus change.
+        app.on_key(&press(KeyCode::Down), now);
+        app.on_key(&press(KeyCode::Char('n')), now);
+        assert!(app.dialog.is_none());
+        assert!(app.take_effects().is_empty());
+        assert_eq!(app.focus, Focus::Servers);
+        let status = app.status.as_ref().expect("ready sets a status");
+        assert!(!status.error);
+        assert_eq!(status.text, "backup is already running");
+
+        // Pending: an info status about a spawn in progress.
+        app.on_key(&press(KeyCode::Down), now);
+        app.on_key(&press(KeyCode::Char('n')), now);
+        assert!(app.take_effects().is_empty());
+        let status = app.status.as_ref().expect("pending sets a status");
+        assert!(!status.error);
+        assert_eq!(status.text, "a spawn is already in progress");
+
+        // Stopped named: an error pointing at the command line.
+        app.on_key(&press(KeyCode::Down), now);
+        app.on_key(&press(KeyCode::Char('n')), now);
+        assert!(app.dialog.is_none());
+        assert!(app.take_effects().is_empty());
+        let status = app.status.as_ref().expect("named sets a status");
+        assert!(status.error);
+        assert!(status.text.contains("jhc start"));
     }
 
     #[test]
