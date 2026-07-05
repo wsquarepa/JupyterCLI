@@ -4,45 +4,83 @@ pub mod input;
 pub mod net;
 pub mod render;
 
+use std::time::{Duration, Instant};
+
+use futures_util::StreamExt as _;
+
+use crate::api::HubClient;
 use crate::cli::CliError;
-use crate::config::{self, ConfigError};
+use crate::config::{self, Config, ConfigError};
+
+const REFRESH_EVERY: Duration = Duration::from_secs(15);
+const TICK_EVERY: Duration = Duration::from_millis(500);
 
 pub async fn run(hub_flag: Option<&str>) -> Result<(), CliError> {
-    match config::load() {
-        Ok(cfg) => {
-            let _ = (cfg, hub_flag);
-            placeholder_loop().await
-        }
-        Err(ConfigError::NotFound(_)) => placeholder_loop().await,
-        Err(e) => Err(e.into()),
-    }
-}
-
-async fn placeholder_loop() -> Result<(), CliError> {
-    use futures_util::StreamExt as _;
-    let mut terminal = ratatui::init();
-    let mut events = crossterm::event::EventStream::new();
-    let result = loop {
-        if let Err(e) = terminal.draw(|frame| {
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new("JupyterCLI: loading. Press q to quit."),
-                frame.area(),
-            );
-        }) {
-            break Err(CliError::Io(e));
-        }
-        match events.next().await {
-            Some(Ok(crossterm::event::Event::Key(key)))
-                if key.kind == crossterm::event::KeyEventKind::Press
-                    && key.code == crossterm::event::KeyCode::Char('q') =>
-            {
-                break Ok(());
-            }
-            Some(Ok(_)) => {}
-            Some(Err(e)) => break Err(CliError::Io(e)),
-            None => break Ok(()),
-        }
+    let cfg = match config::load() {
+        Ok(cfg) => cfg,
+        // Task 9 routes NotFound into the wizard; until then the CLI guidance applies.
+        Err(e @ ConfigError::NotFound(_)) => return Err(e.into()),
+        Err(e) => return Err(e.into()),
     };
+    let mut terminal = ratatui::init();
+    let result = dashboard_loop(&mut terminal, cfg, hub_flag).await;
     ratatui::restore();
     result
+}
+
+async fn dashboard_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    cfg: Config,
+    hub_flag: Option<&str>,
+) -> Result<(), CliError> {
+    let (hub_name, hub) = cfg.resolve_hub(hub_flag)?;
+    let client = HubClient::new(&hub.url, &hub.effective_token())?;
+    let mut app = app::App::new(hub_name.to_string(), hub.presets.clone());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = crossterm::event::EventStream::new();
+    let mut refresh = tokio::time::interval(REFRESH_EVERY);
+    refresh.tick().await; // consume the immediate first tick; App::new queued a Refresh already
+    let mut tick = tokio::time::interval(TICK_EVERY);
+
+    loop {
+        terminal
+            .draw(|frame| render::draw(frame, &app))
+            .map_err(CliError::Io)?;
+
+        tokio::select! {
+            event = events.next() => match event {
+                Some(Ok(crossterm::event::Event::Key(key))) => app.on_key(&key, Instant::now()),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(CliError::Io(e)),
+                None => return Ok(()),
+            },
+            message = rx.recv() => {
+                if let Some(message) = message {
+                    app.apply(message, Instant::now());
+                }
+            }
+            _ = refresh.tick() => {
+                app.loading = true;
+                net::dispatch(app::Effect::Refresh, client.clone(), tx.clone());
+            }
+            _ = tick.tick() => app.tick(Instant::now()),
+        }
+
+        for effect in app.take_effects() {
+            match effect {
+                app::Effect::Quit => return Ok(()),
+                app::Effect::Attach { target } => {
+                    // Task 8 replaces this arm with the suspend/subprocess flow.
+                    let _ = target;
+                    app.set_status(
+                        "attach lands in the next milestone step".to_string(),
+                        true,
+                        Instant::now(),
+                    );
+                }
+                other => net::dispatch(other, client.clone(), tx.clone()),
+            }
+        }
+    }
 }
