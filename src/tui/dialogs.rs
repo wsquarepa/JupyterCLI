@@ -164,13 +164,12 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome 
     }
 }
 
-fn preset_entry_text(name: &str, options: &JsonMap) -> String {
-    if options.is_empty() {
-        format!(" {name}")
-    } else {
-        let rendered: Vec<String> = options.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        format!(" {name}  {}", rendered.join(" "))
-    }
+/// A preset row shows only the preset name; the options are deliberately not
+/// rendered here (they overflow the dialog and the name already identifies the
+/// preset). The committed server's options remain visible in the grid pane's
+/// top border.
+fn preset_entry_text(name: &str) -> String {
+    format!(" {name}")
 }
 
 pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
@@ -186,25 +185,19 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
             };
             let width = usize::from(rect.width.saturating_sub(2));
             let mut lines: Vec<Line> = vec![Line::from("")];
-            lines.extend(
-                start
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .map(|(index, (name, options))| {
-                        let text = preset_entry_text(name, options);
-                        if index == start.selected {
-                            Line::from(Span::styled(
-                                format!("{text:<width$}"),
-                                Style::default()
-                                    .fg(crate::tui::theme::SELECTION_FG)
-                                    .bg(crate::tui::theme::SELECTION_BG),
-                            ))
-                        } else {
-                            Line::from(text)
-                        }
-                    }),
-            );
+            lines.extend(start.entries.iter().enumerate().map(|(index, (name, _))| {
+                let text = preset_entry_text(name);
+                if index == start.selected {
+                    Line::from(Span::styled(
+                        format!("{text:<width$}"),
+                        Style::default()
+                            .fg(crate::tui::theme::SELECTION_FG)
+                            .bg(crate::tui::theme::SELECTION_BG),
+                    ))
+                } else {
+                    Line::from(text)
+                }
+            }));
             let block = super::render::dialog_block(&title);
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
@@ -260,8 +253,8 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
                 CreateStep::Preset => {
                     lines.push(Line::from("Step 2 of 2: choose a preset"));
                     lines.push(Line::from(""));
-                    for (index, (name, options)) in create.picker.entries.iter().enumerate() {
-                        let text = preset_entry_text(name, options);
+                    for (index, (name, _)) in create.picker.entries.iter().enumerate() {
+                        let text = preset_entry_text(name);
                         if index == create.picker.selected {
                             lines.push(Line::from(Span::styled(
                                 format!("{text:<width$}", width = super::wizard::CONTENT_WIDTH),
@@ -506,6 +499,10 @@ mod tests {
         assert!(text.contains("Start the default server"));
         assert!(text.contains("hub defaults"));
         assert!(text.contains("a100"));
+        assert!(
+            !text.contains("resource"),
+            "preset options must not render in the picker; buffer was:\n{text}"
+        );
         assert!(text.contains("Enter: start"));
     }
 
@@ -546,6 +543,10 @@ mod tests {
         );
         assert!(text.contains("hub defaults"), "buffer was:\n{text}");
         assert!(text.contains("a100"), "buffer was:\n{text}");
+        assert!(
+            !text.contains("resource"),
+            "preset options must not render in the picker; buffer was:\n{text}"
+        );
     }
 
     #[test]
