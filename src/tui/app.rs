@@ -682,25 +682,24 @@ impl App {
     }
 
     /// Dialog/status paths for a not-yet-ready cursor server, shared by Enter
-    /// and by `n` in the Servers pane: a pending spawn reports progress, a
-    /// stopped default opens the Start dialog, and a stopped named server
-    /// points at the command line.
+    /// and by `n` in the Servers pane: a pending spawn reports progress, and any
+    /// stopped server (default or named) opens the Start preset picker. A named
+    /// server carries its name into the spawn so the picker restarts it directly.
     fn spawn_stopped_server(&mut self, now: Instant) {
         let Some(server) = self.servers.get(self.server_cursor) else {
             return;
         };
         if server.pending.is_some() {
             self.set_status("a spawn is already in progress".to_string(), false, now);
-        } else if server.name.is_empty() {
-            self.dialog = Some(super::dialogs::Dialog::Start(
-                super::dialogs::StartDialog::new(None, &self.presets),
-            ));
         } else {
-            self.set_status(
-                "named servers are started from the command line: jhc start NAME".to_string(),
-                true,
-                now,
-            );
+            let target = if server.name.is_empty() {
+                None
+            } else {
+                Some(server.name.clone())
+            };
+            self.dialog = Some(super::dialogs::Dialog::Start(
+                super::dialogs::StartDialog::new(target, &self.presets),
+            ));
         }
     }
 
@@ -962,7 +961,24 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_stopped_default_opens_start_dialog_and_named_redirects() {
+    fn stopped_named_row_opens_start_dialog_with_its_name() {
+        let (mut app, now) = fresh_app();
+        // fresh_app's servers are [default(ready), backup(ready), lab(stopped)];
+        // move the cursor to the stopped named row "lab".
+        app.on_key(&press(KeyCode::Down), now);
+        app.on_key(&press(KeyCode::Down), now);
+        assert_eq!(app.servers[app.server_cursor].display, "lab");
+        app.on_key(&press(KeyCode::Enter), now);
+        match &app.dialog {
+            Some(crate::tui::dialogs::Dialog::Start(start)) => {
+                assert_eq!(start.server.as_deref(), Some("lab"));
+            }
+            other => panic!("expected a Start dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_stopped_default_and_named_rows_open_start_dialog() {
         let (mut app, now) = fresh_app();
         let _ = app.take_effects();
         app.apply(
@@ -975,14 +991,19 @@ mod tests {
         );
         let _ = app.take_effects();
         app.on_key(&press(KeyCode::Enter), now);
-        assert!(app.dialog.is_some());
+        assert!(matches!(
+            app.dialog,
+            Some(crate::tui::dialogs::Dialog::Start(_))
+        ));
         app.on_key(&press(KeyCode::Esc), now);
         app.on_key(&press(KeyCode::Down), now);
         app.on_key(&press(KeyCode::Enter), now);
-        assert!(app.dialog.is_none());
-        let status = app.status.as_ref().expect("named server sets a status");
-        assert!(status.error);
-        assert!(status.text.contains("jhc start"));
+        match &app.dialog {
+            Some(crate::tui::dialogs::Dialog::Start(start)) => {
+                assert_eq!(start.server.as_deref(), Some("backup"));
+            }
+            other => panic!("expected a Start dialog, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1223,14 +1244,16 @@ mod tests {
         assert!(!status.error);
         assert_eq!(status.text, "a spawn is already in progress");
 
-        // Stopped named: an error pointing at the command line.
+        // Stopped named: opens the Start dialog with its name.
         app.on_key(&press(KeyCode::Down), now);
         app.on_key(&press(KeyCode::Char('n')), now);
-        assert!(app.dialog.is_none());
+        match &app.dialog {
+            Some(crate::tui::dialogs::Dialog::Start(start)) => {
+                assert_eq!(start.server.as_deref(), Some("lab"));
+            }
+            other => panic!("expected a Start dialog, got {other:?}"),
+        }
         assert!(app.take_effects().is_empty());
-        let status = app.status.as_ref().expect("named sets a status");
-        assert!(status.error);
-        assert!(status.text.contains("jhc start"));
     }
 
     #[test]
