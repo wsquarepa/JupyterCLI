@@ -95,10 +95,11 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
 }
 
 /// Read-only follower for one terminal: connects the terminado WebSocket,
-/// forwards ANSI-stripped stdout chunks, and pings every 30 s of silence so
-/// idle proxies keep the connection alive. Never sends stdin or set_size (the
-/// PTY keeps the size of its real consumers). The caller owns the returned
-/// handle and aborts it to stop following.
+/// forwards raw stdout chunks (escape sequences intact, for the peek pane's
+/// terminal emulator), and pings every 30 s of silence so idle proxies keep
+/// the connection alive. Never sends stdin or set_size (the PTY keeps the size
+/// of its real consumers). The caller owns the returned handle and aborts it
+/// to stop following.
 pub fn spawn_peek(
     op: u64,
     url: String,
@@ -127,7 +128,6 @@ pub fn spawn_peek(
             op,
             terminal: terminal.clone(),
         });
-        let mut stripper = crate::shellops::AnsiStripper::new();
         loop {
             let frame =
                 tokio::time::timeout(std::time::Duration::from_secs(30), sock.next_frame()).await;
@@ -138,11 +138,10 @@ pub fn spawn_peek(
                     }
                 }
                 Ok(Ok(Some(crate::api::ws::TermFrame::Stdout(text)))) => {
-                    let clean = stripper.push(&text);
-                    if !clean.is_empty() {
+                    if !text.is_empty() {
                         let _ = tx.send(AppEvent::PeekChunk {
                             terminal: terminal.clone(),
-                            text: clean,
+                            text,
                         });
                     }
                 }
@@ -398,7 +397,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_peek_streams_stripped_chunks() {
+    async fn spawn_peek_streams_raw_chunks() {
         let addr = ws_terminal(vec![
             serde_json::json!(["stdout", "\u{1b}[32mhello\u{1b}[0m\r\nworld"]).to_string(),
         ])
@@ -414,7 +413,9 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         match rx.recv().await.unwrap() {
-            AppEvent::PeekChunk { text, .. } => assert_eq!(text, "hello\nworld"),
+            AppEvent::PeekChunk { text, .. } => {
+                assert_eq!(text, "\u{1b}[32mhello\u{1b}[0m\r\nworld")
+            }
             other => panic!("unexpected event: {other:?}"),
         }
         handle.abort();

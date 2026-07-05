@@ -273,13 +273,19 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let visible = usize::from(inner.height);
-    let start = peek.lines.len().saturating_sub(visible);
-    let lines: Vec<Line> = peek
-        .lines
+    // Tail-anchor the emulated screen: show the window ending at the last
+    // painted row so a shell prompt (bottom of the screen) stays visible while
+    // a full-screen app's most recent region shows through.
+    let rows: Vec<String> = peek.parser.screen().rows(0, 80).collect();
+    let Some(last) = rows.iter().rposition(|r| r.chars().any(|c| c != ' ')) else {
+        return;
+    };
+    let height = usize::from(inner.height);
+    let start = (last + 1).saturating_sub(height);
+    let width = usize::from(inner.width);
+    let lines: Vec<Line> = rows[start..=last]
         .iter()
-        .skip(start)
-        .map(|l| Line::from(l.chars().take(usize::from(inner.width)).collect::<String>()))
+        .map(|r| Line::from(r.chars().take(width).collect::<String>()))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -618,6 +624,20 @@ mod tests {
         let text = rendered(&app);
         assert!(text.contains("GPU 0: A100"), "buffer:\n{text}");
         assert!(!text.contains("connecting..."));
+
+        // A cursor-addressed repaint must land on separate screen rows, not
+        // concatenate the way a naive line stream would.
+        app.apply(
+            AppEvent::PeekChunk {
+                terminal: "1".to_string(),
+                text: "\u{1b}[2J\u{1b}[1;1Halpha\u{1b}[2;1Hbeta".to_string(),
+            },
+            now,
+        );
+        let text = rendered(&app);
+        assert!(text.contains("alpha"), "buffer:\n{text}");
+        assert!(text.contains("beta"), "buffer:\n{text}");
+        assert!(!text.contains("alphabeta"), "buffer:\n{text}");
     }
 
     #[test]

@@ -10,7 +10,6 @@ use super::grid;
 pub const STATUS_TTL: Duration = Duration::from_secs(5);
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const PEEK_DEBOUNCE: Duration = Duration::from_millis(300);
-pub const PEEK_BUFFER_LINES: usize = 200;
 
 #[derive(Debug)]
 pub struct HoverState {
@@ -19,12 +18,12 @@ pub struct HoverState {
     pub started: bool,
 }
 
-#[derive(Debug)]
+// vt100::Parser has no Debug impl, so PeekState cannot derive it.
 pub struct PeekState {
     pub terminal: String,
     pub connected: bool,
     pub error: Option<String>,
-    pub lines: std::collections::VecDeque<String>,
+    pub parser: vt100::Parser,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,7 +298,12 @@ impl App {
                     terminal: terminal.clone(),
                     connected: false,
                     error: None,
-                    lines: std::collections::VecDeque::new(),
+                    // 24x80 is terminado's default PTY size. Ceiling: we cannot
+                    // query the real PTY size over the terminals API, so a session
+                    // resized past 80x24 by an attach clamps coordinates to this
+                    // grid. Upgrade path: query or negotiate the size if
+                    // jupyter-server ever exposes it.
+                    parser: vt100::Parser::new(24, 80, 0),
                 });
                 self.peek_op = self.push_effect(Effect::PeekStart {
                     op: 0,
@@ -454,7 +458,7 @@ impl App {
                 if let Some(peek) = &mut self.peek
                     && peek.terminal == terminal
                 {
-                    push_chunk(&mut peek.lines, &text);
+                    peek.parser.process(text.as_bytes());
                 }
             }
             AppEvent::PeekFailed {
@@ -787,34 +791,6 @@ fn sorted_terminals(mut terminals: Vec<TerminalRow>) -> Vec<TerminalRow> {
         },
     );
     terminals
-}
-
-/// Append an ANSI-stripped chunk to the peek line buffer. "\r\n" ends a line;
-/// a bare "\r" emulates the terminal's overwrite by clearing the current
-/// line. Ceiling: a "\r\n" split across two chunks clears one line wrongly;
-/// the upgrade path is buffering a trailing "\r" until the next chunk.
-fn push_chunk(lines: &mut std::collections::VecDeque<String>, text: &str) {
-    if lines.is_empty() {
-        lines.push_back(String::new());
-    }
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\n' => lines.push_back(String::new()),
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                    lines.push_back(String::new());
-                } else {
-                    lines.back_mut().expect("seeded above").clear();
-                }
-            }
-            _ => lines.back_mut().expect("seeded above").push(ch),
-        }
-    }
-    while lines.len() > PEEK_BUFFER_LINES {
-        lines.pop_front();
-    }
 }
 
 #[cfg(test)]
@@ -1286,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn peek_events_flow_into_lines_and_stale_chunks_drop() {
+    fn peek_events_paint_the_screen_and_stale_chunks_drop() {
         let (mut app, now) = committed_app(&["1"]);
         let _ = app.take_effects();
         app.tick(now + PEEK_DEBOUNCE);
@@ -1301,10 +1277,12 @@ mod tests {
         );
         assert!(app.ops.is_empty());
         assert!(app.peek.as_ref().is_some_and(|p| p.connected));
+        // Cursor addressing paints row 1 before row 0; a faithful screen shows
+        // them in screen order, not arrival order.
         app.apply(
             AppEvent::PeekChunk {
                 terminal: "1".to_string(),
-                text: "$ watch date\r\nSat Jul  5".to_string(),
+                text: "\u{1b}[2;1Hsecond line\u{1b}[1;1Hfirst line".to_string(),
             },
             now,
         );
@@ -1316,8 +1294,9 @@ mod tests {
             now,
         );
         let peek = app.peek.as_ref().expect("peek state");
-        let lines: Vec<&str> = peek.lines.iter().map(String::as_str).collect();
-        assert_eq!(lines, ["$ watch date", "Sat Jul  5"]);
+        let rows: Vec<String> = peek.parser.screen().rows(0, 80).collect();
+        assert_eq!(rows[0].trim_end(), "first line");
+        assert_eq!(rows[1].trim_end(), "second line");
     }
 
     #[test]
@@ -1354,20 +1333,5 @@ mod tests {
             effects.as_slice(),
             [Effect::PeekStop, Effect::Attach { target }] if target == ":2"
         ));
-    }
-
-    #[test]
-    fn push_chunk_handles_carriage_returns_and_the_cap() {
-        let mut lines = std::collections::VecDeque::new();
-        push_chunk(&mut lines, "progress 10%\rprogress 90%\r\ndone\n");
-        let collected: Vec<&str> = lines.iter().map(String::as_str).collect();
-        assert_eq!(collected, ["progress 90%", "done", ""]);
-
-        let mut lines = std::collections::VecDeque::new();
-        for i in 0..250 {
-            push_chunk(&mut lines, &format!("line {i}\n"));
-        }
-        assert_eq!(lines.len(), PEEK_BUFFER_LINES);
-        assert_eq!(lines.front().map(String::as_str), Some("line 51"));
     }
 }
