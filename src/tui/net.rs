@@ -400,6 +400,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn named_spawn_failure_reports_op_failed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/hub/api/user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(user_json(false)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/hub/api/users/ww41/servers/gpu"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("already running"))
+            .mount(&server)
+            .await;
+        let client = HubClient::new(&server.uri(), "tok").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        dispatch(
+            Effect::Start {
+                op: 7,
+                server: Some("gpu".to_string()),
+                options: Default::default(),
+            },
+            client,
+            tx,
+        );
+        loop {
+            match rx.recv().await.unwrap() {
+                AppEvent::OpFailed { op, .. } => {
+                    assert_eq!(op, 7);
+                    break;
+                }
+                AppEvent::Progress { .. } => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
     use futures_util::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::tungstenite::Message;
 

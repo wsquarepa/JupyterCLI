@@ -194,6 +194,7 @@ pub struct App {
     pub peek: Option<PeekState>,
     peek_op: Option<u64>,
     pending_select: Option<String>,
+    pending_server_select: Option<String>,
     next_op: u64,
     effects: Vec<Effect>,
 }
@@ -226,6 +227,7 @@ impl App {
             peek: None,
             peek_op: None,
             pending_select: None,
+            pending_server_select: None,
             next_op: 1,
             effects: Vec::new(),
         };
@@ -443,6 +445,11 @@ impl App {
                     .and_then(|d| self.servers.iter().position(|s| s.display == d))
                     .unwrap_or(0);
                 self.revalidate_commitment();
+                if let Some(name) = self.pending_server_select.take()
+                    && let Some(index) = self.servers.iter().position(|s| s.display == name)
+                {
+                    self.server_cursor = index;
+                }
             }
             AppEvent::Terminals {
                 op,
@@ -475,11 +482,28 @@ impl App {
             AppEvent::Progress { message } => self.set_status(message, false, now),
             AppEvent::OpDone { op, message } => {
                 self.finish_op(op);
+                let created = match &self.dialog {
+                    Some(super::dialogs::Dialog::CreateNamed(create)) if create.op == Some(op) => {
+                        Some(create.input.value().to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(name) = created {
+                    self.dialog = None;
+                    self.pending_server_select = Some(name);
+                }
                 self.set_status(message, false, now);
                 self.request_refresh();
             }
             AppEvent::OpFailed { op, message } => {
                 self.finish_op(op);
+                if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog
+                    && create.op == Some(op)
+                {
+                    create.op = None;
+                    create.error = Some(message.clone());
+                    create.step = super::dialogs::CreateStep::Name;
+                }
                 self.set_status(message, true, now);
             }
             AppEvent::TerminalCreated {
@@ -1650,5 +1674,67 @@ mod tests {
         app.on_key(&press(KeyCode::Char('x')), now);
         assert!(app.dialog.is_none());
         assert!(app.take_effects().is_empty());
+    }
+
+    fn open_create_at_starting(app: &mut App, now: Instant, name: &str, op: u64) {
+        app.dialog = Some(crate::tui::dialogs::Dialog::CreateNamed(
+            crate::tui::dialogs::CreateNamedDialog::new(&app.presets),
+        ));
+        if let Some(crate::tui::dialogs::Dialog::CreateNamed(d)) = &mut app.dialog {
+            for c in name.chars() {
+                d.input.on_key(&press(KeyCode::Char(c)));
+            }
+            d.op = Some(op);
+            d.step = crate::tui::dialogs::CreateStep::Starting;
+        }
+        let _ = now;
+    }
+
+    #[test]
+    fn spawn_failure_reverts_to_name_and_preserves_input() {
+        let (mut app, now) = fresh_app();
+        open_create_at_starting(&mut app, now, "gpu", 42);
+        app.apply(
+            AppEvent::OpFailed {
+                op: 42,
+                message: "already running".to_string(),
+            },
+            now,
+        );
+        match &app.dialog {
+            Some(crate::tui::dialogs::Dialog::CreateNamed(d)) => {
+                assert!(matches!(d.step, crate::tui::dialogs::CreateStep::Name));
+                assert_eq!(d.input.value(), "gpu");
+                assert_eq!(d.error.as_deref(), Some("already running"));
+                assert!(d.op.is_none());
+            }
+            other => panic!("expected CreateNamed dialog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_success_closes_dialog_and_selects_new_row() {
+        let (mut app, now) = fresh_app();
+        open_create_at_starting(&mut app, now, "gpu", 43);
+        app.apply(
+            AppEvent::OpDone {
+                op: 43,
+                message: "started gpu".to_string(),
+            },
+            now,
+        );
+        assert!(app.dialog.is_none());
+        // The follow-up refresh reports the new ready row; the cursor lands on it.
+        app.apply(
+            AppEvent::Refreshed {
+                op: 99,
+                username: "ww41".to_string(),
+                servers: vec![row("", true), row("gpu", true)],
+            },
+            now,
+        );
+        assert_eq!(app.servers[app.server_cursor].display, "gpu");
+        assert!(app.committed_server.is_none());
+        assert_eq!(app.focus, Focus::Servers);
     }
 }
