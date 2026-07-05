@@ -1,13 +1,16 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::Frame;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::api::HubClient;
 use crate::cli::CliError;
 use crate::config::{self, Config, HubConfig, JsonMap};
 
 use super::input::LineInput;
+
+type Identity = (String, Option<JsonMap>);
+type IdentityHandle = tokio::task::JoinHandle<Result<Identity, CliError>>;
 
 #[derive(Debug)]
 pub enum Step {
@@ -120,99 +123,226 @@ impl WizardState {
     }
 }
 
-pub fn render(frame: &mut Frame, state: &WizardState) {
-    let block = Block::new().borders(Borders::ALL).title("JupyterCLI setup");
+fn input_line(label: &str, input: &LineInput, active: bool) -> ratatui::text::Line<'static> {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::Span;
+    let style = if active {
+        Style::default()
+            .fg(crate::tui::theme::BORDER_FOCUSED)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let display = input.display();
+    let chars: Vec<char> = display.chars().collect();
+    let cursor = input.cursor().min(chars.len());
+    if !active {
+        return ratatui::text::Line::from(vec![
+            Span::styled(format!("  {label}: "), style),
+            Span::styled(display, style),
+        ]);
+    }
+    let before: String = chars[..cursor].iter().collect();
+    let at: String = chars
+        .get(cursor)
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| " ".to_string());
+    let after: String = chars
+        .get(cursor + 1..)
+        .map(|s| s.iter().collect())
+        .unwrap_or_default();
+    ratatui::text::Line::from(vec![
+        Span::styled(format!("> {label}: "), style),
+        Span::styled(before, style),
+        Span::styled(at, style.add_modifier(Modifier::REVERSED)),
+        Span::styled(after, style),
+    ])
+}
+
+pub fn render(
+    frame: &mut Frame,
+    state: &WizardState,
+    backdrop: &crate::tui::app::App,
+    spinner_frame: usize,
+) {
+    use ratatui::style::Style;
+    use ratatui::text::Span;
+    use ratatui::widgets::Clear;
+
+    super::render::draw(frame, backdrop);
+
     let url = state.url.value().trim_end_matches('/').to_string();
-    let lines: Vec<Line> = match &state.step {
-        Step::Welcome => vec![
-            Line::from("Welcome to JupyterCLI."),
-            Line::from("This wizard connects you to a JupyterHub in three steps."),
-            Line::from(""),
-            Line::from("Enter continue  Esc quit"),
-        ],
-        Step::Url => vec![
-            Line::from("Step 1 of 3: hub base URL"),
-            Line::from("Example: https://jupyter.example.edu"),
-            Line::from(""),
-            Line::from(format!("> {}", state.url.display())),
-            Line::from(""),
-            Line::from("Enter continue  Esc quit"),
-        ],
-        Step::Token => vec![
-            Line::from("Step 2 of 3: API token"),
-            Line::from(format!("Create one in the browser at {url}/hub/token")),
-            Line::from(""),
-            Line::from(format!("> {}", state.token.display())),
-            Line::from(""),
-            Line::from("Enter test the connection  Esc quit"),
-        ],
-        Step::Testing => vec![Line::from("Step 3 of 3: testing the connection...")],
-        Step::Failed => vec![
-            Line::from("The connection test failed:"),
-            Line::from(state.error.clone().unwrap_or_default()),
-            Line::from(""),
-            Line::from("Press any key to re-enter the token  Esc quit"),
-        ],
+    let (lines, hints): (Vec<Line>, &str) = match &state.step {
+        Step::Welcome => (
+            vec![
+                Line::from("Welcome to JupyterCLI."),
+                Line::from("This wizard connects you to a JupyterHub in three steps."),
+            ],
+            " Enter: continue  Esc: quit ",
+        ),
+        Step::Url => (
+            vec![
+                Line::from("Step 1 of 3: hub base URL"),
+                Line::from("Example: https://jupyter.example.edu"),
+                Line::from(""),
+                input_line("URL", &state.url, true),
+            ],
+            " Enter: continue  Esc: quit ",
+        ),
+        Step::Token => (
+            vec![
+                Line::from("Step 2 of 3: API token"),
+                Line::from(format!("Create one in the browser at {url}/hub/token")),
+                Line::from(""),
+                input_line("Token", &state.token, true),
+            ],
+            " Enter: test the connection  Esc: quit ",
+        ),
+        Step::Testing => {
+            let glyph = crate::tui::app::SPINNER_FRAMES
+                [spinner_frame % crate::tui::app::SPINNER_FRAMES.len()];
+            (
+                vec![Line::from(Span::styled(
+                    format!("Step 3 of 3: {glyph} testing the connection..."),
+                    Style::default().fg(crate::tui::theme::SPINNER),
+                ))],
+                "",
+            )
+        }
+        Step::Failed => (
+            vec![
+                Line::from("The connection test failed:"),
+                Line::from(state.error.clone().unwrap_or_default()),
+            ],
+            " any key: re-enter the token  Esc: quit ",
+        ),
         Step::PresetOffer => {
             let username = state.username.clone().unwrap_or_default();
             match &state.found_options {
                 Some(options) => {
                     let rendered: Vec<String> =
                         options.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    (
+                        vec![
+                            Line::from(format!("Connected as {username}. Configuration saved.")),
+                            Line::from(""),
+                            Line::from("A running server was found with these options:"),
+                            Line::from(format!("  {}", rendered.join(" "))),
+                            Line::from("Save them as preset 'imported' for one-key starts?"),
+                        ],
+                        " y: save  n: skip  Esc: quit ",
+                    )
+                }
+                None => (
                     vec![
                         Line::from(format!("Connected as {username}. Configuration saved.")),
                         Line::from(""),
-                        Line::from("A running server was found with these options:"),
-                        Line::from(format!("  {}", rendered.join(" "))),
-                        Line::from("Save them as preset 'imported' for one-key starts?"),
-                        Line::from(""),
-                        Line::from("y save  n skip  Esc quit"),
-                    ]
-                }
-                None => vec![
-                    Line::from(format!("Connected as {username}. Configuration saved.")),
-                    Line::from(""),
-                    Line::from("JupyterCLI cannot list your hub's environment and resource"),
-                    Line::from("options because JupyterHub does not expose them over its API."),
-                    Line::from(format!(
-                        "Start a server once in the browser at {url}/hub/spawn,"
-                    )),
-                    Line::from("then run: jhc preset import"),
-                    Line::from(""),
-                    Line::from("Enter open the dashboard"),
-                ],
+                        Line::from("JupyterCLI cannot list your hub's environment and resource"),
+                        Line::from("options because JupyterHub does not expose them over its API."),
+                        Line::from(format!(
+                            "Start a server once in the browser at {url}/hub/spawn,"
+                        )),
+                        Line::from("then run: jhc preset import"),
+                    ],
+                    " Enter: open the dashboard ",
+                ),
             }
         }
     };
-    frame.render_widget(Paragraph::new(lines).block(block), frame.area());
+
+    let area = frame.area();
+    let height = lines.len() as u16 + 3;
+    let rect = super::render::centered_rect(64, height, area);
+    frame.render_widget(Clear, rect);
+    let block = super::render::dialog_block(" JupyterCLI setup ");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let mut content = vec![Line::from("")];
+    content.extend(lines);
+    frame.render_widget(Paragraph::new(content), inner);
+    if !hints.is_empty() {
+        super::render::render_hints_below_dialog(frame, rect, area, hints);
+    }
 }
 
 pub async fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Config>, CliError> {
     use futures_util::StreamExt as _;
+
+    // The unconfigured dashboard rendered behind the setup dialog. Drain the
+    // constructor's refresh effect and op so no request fires and no spinner
+    // shows: there is no hub to talk to yet.
+    let size = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut backdrop = crate::tui::app::App::new(
+        "not configured".to_string(),
+        Default::default(),
+        crate::shellops::TERMINAL_LIMIT,
+        size,
+    );
+    let _ = backdrop.take_effects();
+    backdrop.ops.clear();
+
     let mut events = crossterm::event::EventStream::new();
     let mut state = WizardState::new();
     let mut saved: Option<Config> = None;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut spinner_frame = 0usize;
+    let mut pending: Option<IdentityHandle> = None;
 
     loop {
         terminal
-            .draw(|frame| render(frame, &state))
+            .draw(|frame| render(frame, &state, &backdrop, spinner_frame))
             .map_err(CliError::Io)?;
-        let Some(event) = events.next().await else {
-            return Ok(None);
-        };
-        let key = match event.map_err(CliError::Io)? {
-            crossterm::event::Event::Key(key) => key,
-            _ => continue,
-        };
-        match state.on_key(&key) {
-            WizardAction::None => {}
-            WizardAction::Abort => return Ok(None),
-            WizardAction::TestConnection => {
-                // Draw the Testing frame before the await so the user sees it.
-                terminal
-                    .draw(|frame| render(frame, &state))
-                    .map_err(CliError::Io)?;
-                match fetch_identity(&state).await {
+
+        tokio::select! {
+            event = events.next() => {
+                let event = match event {
+                    None => return Ok(None),
+                    Some(event) => event.map_err(CliError::Io)?,
+                };
+                let key = match event {
+                    crossterm::event::Event::Key(key) => key,
+                    crossterm::event::Event::Resize(cols, rows) => {
+                        backdrop.set_size(cols, rows);
+                        continue;
+                    }
+                    _ => continue,
+                };
+                match state.on_key(&key) {
+                    WizardAction::None => {}
+                    WizardAction::Abort => return Ok(None),
+                    WizardAction::TestConnection => {
+                        let url = state.url.value().to_string();
+                        let token = state.token.value().to_string();
+                        pending = Some(tokio::spawn(async move {
+                            fetch_identity(&url, &token).await
+                        }));
+                    }
+                    WizardAction::SavePreset => {
+                        let mut config = saved.take().expect("preset offer only follows a save");
+                        if let Some(options) = state.found_options.clone() {
+                            let hub = config
+                                .hubs
+                                .get_mut("default")
+                                .expect("wizard saved the hub under the name 'default'");
+                            hub.presets.insert("imported".to_string(), options);
+                            config::save(&config)?;
+                        }
+                        return Ok(Some(config));
+                    }
+                    WizardAction::SkipPreset => {
+                        return Ok(Some(
+                            saved.take().expect("preset offer only follows a save"),
+                        ));
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                spinner_frame = spinner_frame.wrapping_add(1);
+            }
+            result = async { pending.as_mut().expect("guarded by pending.is_some()").await }, if pending.is_some() => {
+                pending = None;
+                let outcome = result.map_err(|e| CliError::Io(std::io::Error::other(e)))?;
+                match outcome {
                     Ok((username, options)) => {
                         let config = build_config(&state);
                         config::save(&config)?;
@@ -221,23 +351,6 @@ pub async fn run(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Confi
                     }
                     Err(e) => state.fail(e.to_string()),
                 }
-            }
-            WizardAction::SavePreset => {
-                let mut config = saved.take().expect("preset offer only follows a save");
-                if let Some(options) = state.found_options.clone() {
-                    let hub = config
-                        .hubs
-                        .get_mut("default")
-                        .expect("wizard saved the hub under the name 'default'");
-                    hub.presets.insert("imported".to_string(), options);
-                    config::save(&config)?;
-                }
-                return Ok(Some(config));
-            }
-            WizardAction::SkipPreset => {
-                return Ok(Some(
-                    saved.take().expect("preset offer only follows a save"),
-                ));
             }
         }
     }
@@ -259,8 +372,8 @@ fn build_config(state: &WizardState) -> Config {
     }
 }
 
-async fn fetch_identity(state: &WizardState) -> Result<(String, Option<JsonMap>), CliError> {
-    let client = HubClient::new(state.url.value(), state.token.value())?.with_retry_warnings(false);
+async fn fetch_identity(url: &str, token: &str) -> Result<(String, Option<JsonMap>), CliError> {
+    let client = HubClient::new(url, token)?.with_retry_warnings(false);
     let user = client.whoami().await?;
     let options = user
         .servers
@@ -355,21 +468,29 @@ mod tests {
     }
 
     #[test]
-    fn render_names_the_product_and_masks_the_token() {
+    fn render_overlays_the_setup_dialog_on_the_dashboard() {
         let mut state = WizardState::new();
         state.on_key(&press(KeyCode::Enter));
         type_text(&mut state, "https://x");
         state.on_key(&press(KeyCode::Enter));
         type_text(&mut state, "abc");
-        let backend = ratatui::backend::TestBackend::new(70, 12);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &state)).unwrap();
-        let text = crate::tui::render::buffer_text(&terminal);
-        assert!(text.contains("JupyterCLI"));
-        assert!(
-            text.contains("hub/token"),
-            "token guidance must name <url>/hub/token"
+        let mut backdrop = crate::tui::app::App::new(
+            "not configured".to_string(),
+            Default::default(),
+            999,
+            (90, 24),
         );
+        let _ = backdrop.take_effects();
+        backdrop.ops.clear();
+        let backend = ratatui::backend::TestBackend::new(90, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &backdrop, 0))
+            .unwrap();
+        let text = crate::tui::render::buffer_text(&terminal);
+        assert!(text.contains("JupyterCLI setup"), "buffer:\n{text}");
+        assert!(text.contains(" Servers "), "backdrop must show:\n{text}");
+        assert!(text.contains("hub/token"));
         assert!(text.contains("***"));
         assert!(
             !text.contains("abc"),
@@ -398,7 +519,7 @@ mod tests {
         state.on_key(&press(KeyCode::Enter));
         type_text(&mut state, "tok");
 
-        let (username, options) = fetch_identity(&state).await.unwrap();
+        let (username, options) = fetch_identity(&server.uri(), "tok").await.unwrap();
         assert_eq!(username, "ww41");
         assert_eq!(options.unwrap()["resource"], serde_json::json!("2_a100"));
 
@@ -421,13 +542,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut state = WizardState::new();
-        state.on_key(&press(KeyCode::Enter));
-        type_text(&mut state, &server.uri());
-        state.on_key(&press(KeyCode::Enter));
-        type_text(&mut state, "bad");
-
-        let err = fetch_identity(&state).await.unwrap_err();
+        let err = fetch_identity(&server.uri(), "bad").await.unwrap_err();
         assert!(err.to_string().contains("token invalid or expired"));
     }
 }
