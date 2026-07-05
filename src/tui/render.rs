@@ -1,74 +1,292 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Stylize as _;
+use ratatui::style::{Style, Stylize as _};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::app::{App, Focus};
-
-const HINTS: &str = "Tab: switch focus | r: refresh | q: quit";
+use super::app::{App, Focus, ServerRow, TerminalRow};
+use super::{grid, theme};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(frame.area());
+    let main = rows[0];
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
-        .split(rows[0]);
+        .constraints([
+            Constraint::Length(grid::server_pane_width(main.width)),
+            Constraint::Min(0),
+        ])
+        .split(main);
 
     draw_servers(frame, app, panes[0]);
-    draw_terminals(frame, app, panes[1]);
+    if app.peek_visible() {
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(grid::peek_height(main.height)),
+            ])
+            .split(panes[1]);
+        draw_grid(frame, app, right[0]);
+        draw_peek(frame, app, right[1]);
+    } else {
+        draw_grid(frame, app, panes[1]);
+    }
     draw_statusbar(frame, app, rows[1]);
     if let Some(dialog) = &app.dialog {
         super::dialogs::render_dialog(frame, dialog);
     }
 }
 
+fn border_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(theme::BORDER_FOCUSED)
+    } else {
+        Style::default().fg(theme::BORDER_UNFOCUSED)
+    }
+}
+
+fn state_color(server: &ServerRow) -> ratatui::style::Color {
+    if server.ready {
+        theme::STATE_READY
+    } else if server.pending.is_some() {
+        theme::STATE_PENDING
+    } else {
+        theme::STATE_STOPPED
+    }
+}
+
 fn draw_servers(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
+    let focused = app.focus == Focus::Servers;
+    let mut block = Block::new()
+        .borders(Borders::ALL)
+        .title(" Servers ")
+        .border_style(border_style(focused));
+    if focused {
+        block = block.title_bottom(Line::from(" Enter: open  n: new  x: stop ").centered());
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let visible = usize::from(inner.height);
+    if visible == 0 {
+        return;
+    }
+    let offset = app.server_cursor.saturating_sub(visible.saturating_sub(1));
+    let lines: Vec<Line> = app
         .servers
         .iter()
         .enumerate()
-        .map(|(index, server)| {
-            let line = Line::from(server.display.clone());
-            if index == app.server_cursor {
-                ListItem::new(line.reversed())
-            } else {
-                ListItem::new(line)
-            }
-        })
+        .skip(offset)
+        .take(visible)
+        .map(|(index, server)| server_line(app, index, server, inner.width))
         .collect();
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .title(format!(" Servers @ {} ", app.hub_name));
-    frame.render_widget(List::new(items).block(block), area);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_terminals(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .displayed_terminals()
-        .iter()
-        .enumerate()
-        .map(|(index, terminal)| {
-            let line = Line::from(terminal.name.clone());
-            if index == app.grid_cursor && app.focus == Focus::Grid {
-                ListItem::new(line.reversed())
-            } else {
-                ListItem::new(line)
+fn server_line(app: &App, index: usize, server: &ServerRow, width: u16) -> Line<'static> {
+    let committed = app.committed_server.as_deref() == Some(server.display.as_str());
+    let marker = if committed { "> " } else { "  " };
+    let pad_len = usize::from(width)
+        .saturating_sub(marker.chars().count())
+        .saturating_sub(server.display.chars().count());
+    if index == app.server_cursor {
+        let selection = Style::default()
+            .fg(theme::SELECTION_FG)
+            .bg(theme::SELECTION_BG);
+        Line::from(Span::styled(
+            format!("{marker}{}{}", server.display, " ".repeat(pad_len)),
+            selection,
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled(
+                marker.to_string(),
+                Style::default().fg(theme::BORDER_FOCUSED),
+            ),
+            Span::styled(
+                server.display.clone(),
+                Style::default().fg(state_color(server)),
+            ),
+        ])
+    }
+}
+
+fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Grid;
+    let mut block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+    block = match app.committed_row() {
+        Some(server) => {
+            let mut titled = block.title(format!(
+                " Terminals on {} ({}) ",
+                server.display,
+                app.terminals.len()
+            ));
+            if !server.options.is_empty() {
+                let rendered: Vec<String> = server
+                    .options
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect();
+                titled = titled.title_top(
+                    Line::from(Span::styled(
+                        format!(" {} ", rendered.join(" ")),
+                        Style::default().fg(theme::DIMMED),
+                    ))
+                    .right_aligned(),
+                );
             }
-        })
-        .collect();
-    let title = match &app.committed_server {
-        Some(server) => format!(" Terminals on {server} "),
-        None => " Terminals ".to_string(),
+            titled
+        }
+        None => block.title(" Terminals "),
     };
-    let block = Block::new().borders(Borders::ALL).title(title);
-    frame.render_widget(List::new(items).block(block), area);
+    if focused {
+        block = block
+            .title_bottom(Line::from(" Enter: attach  n: new  x: kill  Esc: back ").centered());
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.committed_server.is_none() {
+        return;
+    }
+    let cards = app.displayed_terminals();
+    if cards.is_empty() {
+        let hint = Paragraph::new(
+            Line::from(Span::styled(
+                "no terminals; press n to create one",
+                Style::default().fg(theme::DIMMED),
+            ))
+            .centered(),
+        );
+        let y = inner.y + inner.height / 2;
+        if inner.height > 0 {
+            frame.render_widget(
+                hint,
+                Rect::new(inner.x, y.min(inner.bottom() - 1), inner.width, 1),
+            );
+        }
+        return;
+    }
+
+    let columns = grid::columns_for_width(inner.width);
+    let offsets = grid::row_offsets(inner.width, columns);
+    let visible_rows = grid::visible_card_rows(inner.height);
+    for (index, terminal) in cards.iter().enumerate() {
+        let row = index / columns;
+        if row < app.grid_scroll || row >= app.grid_scroll + visible_rows {
+            continue;
+        }
+        let col = index % columns;
+        let x = inner.x + offsets[col];
+        let y = inner.y + ((row - app.grid_scroll) as u16) * (grid::CARD_HEIGHT + grid::CARD_VGAP);
+        let rect = Rect::new(x, y, grid::CARD_WIDTH, grid::CARD_HEIGHT);
+        draw_card(
+            frame,
+            terminal,
+            focused && index == app.grid_cursor,
+            rect,
+            inner,
+        );
+    }
+
+    if app.terminals.len() > grid::DISPLAY_CAP && inner.height >= 2 {
+        let bottom = Rect::new(inner.x, inner.bottom() - 2, inner.width, 2);
+        let notice = Paragraph::new(vec![
+            Line::from("More terminals exist, but cannot be displayed.").centered(),
+            Line::from("Use the CLI to manage them instead.").centered(),
+        ])
+        .style(Style::default().fg(theme::DIMMED));
+        frame.render_widget(Clear, bottom);
+        frame.render_widget(notice, bottom);
+    }
+}
+
+fn draw_card(frame: &mut Frame, terminal: &TerminalRow, hovered: bool, rect: Rect, bounds: Rect) {
+    // Geometry comes from the same grid module App uses, but a resize between
+    // App math and this frame could overflow; skip rather than clip garbage.
+    if rect.right() > bounds.right() || rect.bottom() > bounds.bottom() {
+        return;
+    }
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(border_style(hovered));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let lines = vec![
+        Line::from(">_"),
+        Line::from(""),
+        Line::from(grid::card_label(&terminal.name)).centered(),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
+    let name = app
+        .peek
+        .as_ref()
+        .map(|p| p.terminal.clone())
+        .or_else(|| app.hover.as_ref().map(|h| h.terminal.clone()));
+    let title = match name {
+        Some(name) => format!(" Peek: {} ", grid::card_label(&name)),
+        None => " Peek ".to_string(),
+    };
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style(false));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(peek) = &app.peek else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "connecting...",
+                Style::default().fg(theme::DIMMED),
+            )),
+            inner,
+        );
+        return;
+    };
+    if let Some(error) = &peek.error {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                error.clone(),
+                Style::default().fg(theme::STATUS_ERROR_BG),
+            )),
+            inner,
+        );
+        return;
+    }
+    if !peek.connected {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "connecting...",
+                Style::default().fg(theme::DIMMED),
+            )),
+            inner,
+        );
+        return;
+    }
+    let visible = usize::from(inner.height);
+    let start = peek.lines.len().saturating_sub(visible);
+    let lines: Vec<Line> = peek
+        .lines
+        .iter()
+        .skip(start)
+        .map(|l| Line::from(l.chars().take(usize::from(inner.width)).collect::<String>()))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_statusbar(frame: &mut Frame, app: &App, area: Rect) {
+    // Transitional: Task 6 replaces this with the colored bar, spinner slot,
+    // and notification shifting.
     let version = concat!("JupyterCLI v", env!("CARGO_PKG_VERSION"));
     let line = match &app.status {
         Some(status) if status.error => {
@@ -79,7 +297,11 @@ fn draw_statusbar(frame: &mut Frame, app: &App, area: Rect) {
             return;
         }
         Some(status) => right_aligned(version, &status.text, area.width),
-        None => right_aligned(version, HINTS, area.width),
+        None => right_aligned(
+            version,
+            "Tab: switch focus | r: refresh | q: quit",
+            area.width,
+        ),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -112,15 +334,203 @@ pub(crate) fn buffer_text(terminal: &ratatui::Terminal<ratatui::backend::TestBac
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::{AppEvent, ServerRow, TerminalRow};
+    use std::time::Instant;
+
+    fn server_row(name: &str, ready: bool, options: &str) -> ServerRow {
+        ServerRow {
+            name: name.to_string(),
+            display: if name.is_empty() {
+                "default".to_string()
+            } else {
+                name.to_string()
+            },
+            ready,
+            pending: None,
+            options: serde_json::from_str(options).unwrap(),
+            url: ready.then(|| format!("/user/ww41/{name}/")),
+        }
+    }
+
+    fn terminal_rows(names: &[&str]) -> Vec<TerminalRow> {
+        names
+            .iter()
+            .map(|n| TerminalRow {
+                name: (*n).to_string(),
+            })
+            .collect()
+    }
+
+    /// App refreshed on a 100x30 frame with a ready default server carrying
+    /// spawn options, plus a stopped named server.
+    fn app_with_servers() -> (App, Instant) {
+        let now = Instant::now();
+        let mut app = App::new("icrn".to_string(), Default::default(), 999, (100, 30));
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::Refreshed {
+                op: 1,
+                username: "ww41".to_string(),
+                servers: vec![
+                    server_row("", true, r#"{"resource": "2_a100"}"#),
+                    server_row("backup", false, "{}"),
+                ],
+            },
+            now,
+        );
+        (app, now)
+    }
+
+    fn committed(names: &[&str]) -> (App, Instant) {
+        let (mut app, now) = app_with_servers();
+        app.on_key(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            now,
+        );
+        let effects = app.take_effects();
+        let op = match effects.as_slice() {
+            [crate::tui::app::Effect::FetchTerminals { op, .. }] => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        app.apply(
+            AppEvent::Terminals {
+                op,
+                server: "default".to_string(),
+                terminals: terminal_rows(names),
+            },
+            now,
+        );
+        (app, now)
+    }
+
+    fn rendered_sized(app: &App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        buffer_text(&terminal)
+    }
+
+    fn rendered(app: &App) -> String {
+        rendered_sized(app, 100, 30)
+    }
 
     #[test]
-    fn stub_renders_servers_and_statusbar() {
-        let app = App::new("icrn".to_string(), Default::default(), 999, (100, 14));
-        let backend = ratatui::backend::TestBackend::new(100, 14);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("Servers @ icrn"));
-        assert!(text.contains("JupyterCLI v"));
+    fn no_selection_leaves_the_grid_blank() {
+        let (app, _) = app_with_servers();
+        let text = rendered(&app);
+        assert!(text.contains(" Servers "));
+        assert!(text.contains(" Terminals "));
+        assert!(!text.contains("Terminal 0"));
+        assert!(!text.contains("no terminals"));
+    }
+
+    #[test]
+    fn committed_grid_shows_cards_titles_and_options() {
+        let (app, _) = committed(&["1", "2"]);
+        let text = rendered(&app);
+        assert!(text.contains("Terminals on default (2)"), "buffer:\n{text}");
+        assert!(text.contains("resource=\"2_a100\""), "buffer:\n{text}");
+        assert!(text.contains("Terminal 001"));
+        assert!(text.contains("Terminal 002"));
+        assert!(text.contains(">_"));
+    }
+
+    #[test]
+    fn empty_committed_grid_hints_at_n() {
+        let (app, _) = committed(&[]);
+        assert!(rendered(&app).contains("no terminals; press n to create one"));
+    }
+
+    #[test]
+    fn overflow_notice_pins_to_the_bottom() {
+        let names: Vec<String> = (1..=1005).map(|i| i.to_string()).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (app, _) = committed(&refs);
+        let text = rendered(&app);
+        assert!(text.contains("More terminals exist, but cannot be displayed."));
+        assert!(text.contains("Use the CLI to manage them instead."));
+    }
+
+    #[test]
+    fn hints_follow_focus() {
+        let (app, _) = app_with_servers();
+        let text = rendered(&app);
+        // The Servers pane is only 20 cols wide at this frame size (18 usable
+        // inside the border), so the 30-char hint cannot render in full;
+        // ratatui's centered title clips to its trailing slice. Assert the
+        // visible tail instead of the full string.
+        assert!(text.contains("x: stop"), "buffer:\n{text}");
+        assert!(!text.contains("Enter: attach"));
+
+        let (app, _) = committed(&["1"]);
+        let text = rendered(&app);
+        assert!(text.contains("Enter: attach  n: new  x: kill  Esc: back"));
+        assert!(!text.contains("Enter: open"));
+    }
+
+    #[test]
+    fn committed_marker_shows_when_cursor_moves_away() {
+        let (mut app, now) = committed(&["1"]);
+        app.on_key(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            now,
+        );
+        app.on_key(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            now,
+        );
+        let text = rendered(&app);
+        assert!(text.contains("> default"), "buffer:\n{text}");
+    }
+
+    #[test]
+    fn peek_pane_shows_connecting_then_lines() {
+        let (mut app, now) = committed(&["1"]);
+        let text = rendered(&app);
+        assert!(text.contains(" Peek: Terminal 001 "), "buffer:\n{text}");
+        assert!(text.contains("connecting..."));
+
+        app.tick(now + crate::tui::app::PEEK_DEBOUNCE);
+        let _ = app.take_effects();
+        let op = *app.ops.keys().next_back().unwrap();
+        app.apply(
+            AppEvent::PeekOpened {
+                op,
+                terminal: "1".to_string(),
+            },
+            now,
+        );
+        app.apply(
+            AppEvent::PeekChunk {
+                terminal: "1".to_string(),
+                text: "$ nvidia-smi\r\nGPU 0: A100\r\n".to_string(),
+            },
+            now,
+        );
+        let text = rendered(&app);
+        assert!(text.contains("GPU 0: A100"), "buffer:\n{text}");
+        assert!(!text.contains("connecting..."));
+    }
+
+    #[test]
+    fn peek_pane_absent_without_grid_focus() {
+        let (mut app, now) = committed(&["1"]);
+        app.on_key(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            now,
+        );
+        assert!(!rendered(&app).contains(" Peek"));
     }
 }
