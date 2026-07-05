@@ -122,7 +122,7 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog) {
             let block = Block::new()
                 .borders(Borders::ALL)
                 .title("Confirm")
-                .title_bottom("Enter/y confirm  Esc cancel");
+                .title_bottom("Enter/y confirm  Esc/n cancel");
             frame.render_widget(Paragraph::new(confirm.message.clone()).block(block), area);
         }
     }
@@ -222,5 +222,21 @@ mod tests {
             handle_key(&mut dialog, &press(KeyCode::Esc)),
             Outcome::Close
         ));
+    }
+
+    #[test]
+    fn confirm_footer_documents_the_y_and_n_synonyms() {
+        let dialog = Dialog::Confirm(ConfirmDialog {
+            message: "Stop default?".to_string(),
+            effect: Effect::Stop { server: None },
+        });
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dialog(frame, &dialog))
+            .unwrap();
+        let text = crate::tui::render::buffer_text(&terminal);
+        assert!(text.contains("Enter/y confirm"), "buffer was:\n{text}");
+        assert!(text.contains("Esc/n cancel"), "buffer was:\n{text}");
     }
 }
