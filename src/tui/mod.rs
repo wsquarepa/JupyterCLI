@@ -22,7 +22,12 @@ async fn placeholder_loop() -> Result<(), CliError> {
     let mut terminal = ratatui::init();
     let mut events = crossterm::event::EventStream::new();
     let result = loop {
-        if let Err(e) = terminal.draw(render::draw_placeholder) {
+        if let Err(e) = terminal.draw(|frame| {
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new("JupyterCLI: loading. Press q to quit."),
+                frame.area(),
+            );
+        }) {
             break Err(CliError::Io(e));
         }
         match events.next().await {
