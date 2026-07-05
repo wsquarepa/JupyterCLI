@@ -7,6 +7,7 @@ pub mod ws;
 use error::{ApiError, check};
 use types::{JsonMap, NewToken, ProgressEvent, TokenInfo, User};
 
+#[derive(Clone)]
 pub struct HubClient {
     http: reqwest::Client,
     base: reqwest::Url,

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod input;
+pub mod net;
 pub mod render;
 
 use crate::cli::CliError;
