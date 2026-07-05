@@ -46,6 +46,8 @@ pub struct Config {
 pub struct HubConfig {
     pub url: String,
     pub token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_limit: Option<u32>,
     #[serde(default)]
     pub presets: BTreeMap<String, JsonMap>,
 }
@@ -66,6 +68,14 @@ impl Config {
 impl HubConfig {
     pub fn effective_token(&self) -> String {
         std::env::var("JUPYTERHUB_API_TOKEN").unwrap_or_else(|_| self.token.clone())
+    }
+
+    /// Terminals allowed per server: the config's `terminal_limit` when set
+    /// (it may raise past or lower below the default), else 999.
+    pub fn effective_terminal_limit(&self) -> usize {
+        self.terminal_limit
+            .map(|v| v as usize)
+            .unwrap_or(crate::shellops::TERMINAL_LIMIT)
     }
 }
 
@@ -201,5 +211,22 @@ debug = true
             load_from(dir.path()),
             Err(ConfigError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn terminal_limit_parses_and_defaults() {
+        let cfg: Config = toml::from_str(sample()).unwrap();
+        assert_eq!(cfg.hubs["icrn"].effective_terminal_limit(), 999);
+
+        let with_limit = r#"
+default_hub = "icrn"
+
+[hubs.icrn]
+url = "https://jupyter.example.edu"
+token = "tok123"
+terminal_limit = 2000
+"#;
+        let cfg: Config = toml::from_str(with_limit).unwrap();
+        assert_eq!(cfg.hubs["icrn"].effective_terminal_limit(), 2000);
     }
 }

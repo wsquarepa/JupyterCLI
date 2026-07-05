@@ -44,6 +44,13 @@ pub async fn run(ctx: &Ctx, cmd: ShellCmd) -> Result<(), CliError> {
     match cmd {
         ShellCmd::New { server } => {
             let (client, display) = server_client_for(ctx, server.as_deref()).await?;
+            let limit = ctx.hub.effective_terminal_limit();
+            let count = client.terminals().await?.len();
+            if count >= limit {
+                return Err(CliError::Usage(format!(
+                    "terminal limit reached ({count} of {limit}); raise terminal_limit in the config to allow more"
+                )));
+            }
             let term = client.create_terminal().await?;
             println!("created shell {} on server {display}", term.name);
             Ok(())

@@ -5,6 +5,10 @@ use crate::api::ws::{TermFrame, TermSocket};
 
 pub const PEEK_IDLE: Duration = Duration::from_millis(250);
 
+/// Hard ceiling on terminals per server (user decision). The TUI always
+/// enforces it; the CLI honors `terminal_limit` from the config when set.
+pub const TERMINAL_LIMIT: usize = 999;
+
 enum StripState {
     Ground,
     Escape,

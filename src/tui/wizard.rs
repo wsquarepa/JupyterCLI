@@ -251,6 +251,7 @@ fn build_config(state: &WizardState) -> Config {
             HubConfig {
                 url: state.url.value().to_string(),
                 token: state.token.value().to_string(),
+                terminal_limit: None,
                 presets: Default::default(),
             },
         )]

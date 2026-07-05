@@ -56,6 +56,7 @@ pub async fn run(url: Option<String>, token: Option<String>, name: String) -> Re
         HubConfig {
             url: url.clone(),
             token,
+            terminal_limit: None,
             presets,
         },
     );
