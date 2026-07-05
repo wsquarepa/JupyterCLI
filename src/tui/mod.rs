@@ -1,9 +1,11 @@
 pub mod app;
 pub mod dialogs;
+pub mod grid;
 pub mod input;
 pub mod net;
 pub mod render;
 pub mod suspend;
+pub mod theme;
 pub mod wizard;
 
 use std::time::{Duration, Instant};
