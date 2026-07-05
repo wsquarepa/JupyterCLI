@@ -94,8 +94,7 @@ pub struct App {
     pub shells: Vec<ShellRow>,
     pub selected_shell: usize,
     pub focus: Focus,
-    // Task 6 replaces the unit type with dialogs::Dialog.
-    pub dialog: Option<()>,
+    pub dialog: Option<super::dialogs::Dialog>,
     pub status: Option<StatusMsg>,
     pub presets: BTreeMap<String, JsonMap>,
     pub loading: bool,
@@ -195,7 +194,17 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        // Task 6 routes keys to an open dialog here, before dashboard handling.
+        if let Some(dialog) = &mut self.dialog {
+            match super::dialogs::handle_key(dialog, key) {
+                super::dialogs::Outcome::Stay => {}
+                super::dialogs::Outcome::Close => self.dialog = None,
+                super::dialogs::Outcome::Commit(effect) => {
+                    self.dialog = None;
+                    self.effects.push(effect);
+                }
+            }
+            return;
+        }
         match key.code {
             KeyCode::Char('q') => self.effects.push(Effect::Quit),
             KeyCode::Char('r') => {
@@ -219,6 +228,39 @@ impl App {
                     now,
                 ),
             },
+            KeyCode::Char('s') => self.open_start_dialog(now),
+            KeyCode::Char('x') => match self.selected_server() {
+                Some(server) if server.ready || server.pending.is_some() => {
+                    let target = (!server.name.is_empty()).then(|| server.name.clone());
+                    self.dialog = Some(super::dialogs::Dialog::Confirm(
+                        super::dialogs::ConfirmDialog {
+                            message: format!("Stop {}? Running work will be lost.", server.display),
+                            effect: Effect::Stop { server: target },
+                        },
+                    ));
+                }
+                _ => self.set_status("the selected server is not running".to_string(), true, now),
+            },
+            KeyCode::Char('k') => {
+                if self.focus == Focus::Shells
+                    && let (Some(server), Some(shell)) = (
+                        self.servers.get(self.selected_server),
+                        self.shells.get(self.selected_shell),
+                    )
+                    && let Some(url) = &server.url
+                {
+                    self.dialog = Some(super::dialogs::Dialog::Confirm(
+                        super::dialogs::ConfirmDialog {
+                            message: format!("Kill shell {} on {}?", shell.name, server.display),
+                            effect: Effect::KillShell {
+                                server: server.display.clone(),
+                                url: url.clone(),
+                                shell: shell.name.clone(),
+                            },
+                        },
+                    ));
+                }
+            }
             KeyCode::Enter => self.on_enter(now),
             _ => {}
         }
@@ -257,12 +299,14 @@ impl App {
 
     fn on_enter(&mut self, _now: Instant) {
         match self.focus {
-            Focus::Servers => {
-                if self.selected_server().is_some_and(|s| s.ready) && !self.shells.is_empty() {
+            Focus::Servers => match self.selected_server() {
+                Some(server) if server.ready && !self.shells.is_empty() => {
                     self.focus = Focus::Shells;
                 }
-                // Task 6: Enter on a stopped default server opens the start dialog.
-            }
+                Some(server) if server.ready => {}
+                Some(_) => self.open_start_dialog(_now),
+                None => {}
+            },
             Focus::Shells => {
                 if let (Some(server), Some(shell)) = (
                     self.servers.get(self.selected_server),
@@ -273,6 +317,30 @@ impl App {
                     });
                 }
             }
+        }
+    }
+
+    fn open_start_dialog(&mut self, now: Instant) {
+        match self.selected_server() {
+            Some(server) if !server.ready && server.pending.is_none() => {
+                if !server.name.is_empty() {
+                    self.set_status(
+                        "named servers are started from the command line: jhc start NAME"
+                            .to_string(),
+                        true,
+                        now,
+                    );
+                    return;
+                }
+                self.dialog = Some(super::dialogs::Dialog::Start(
+                    super::dialogs::StartDialog::new(None, &self.presets),
+                ));
+            }
+            Some(server) if server.ready => {
+                self.set_status(format!("{} is already running", server.display), false, now)
+            }
+            Some(_) => self.set_status("a spawn is already in progress".to_string(), false, now),
+            None => {}
         }
     }
 }
@@ -441,5 +509,73 @@ mod tests {
         app.on_key(&press(KeyCode::Char('n')), now);
         assert!(app.take_effects().is_empty());
         assert!(app.status.as_ref().is_some_and(|s| s.error));
+    }
+
+    #[test]
+    fn s_on_stopped_default_opens_start_dialog_and_enter_commits() {
+        let now = Instant::now();
+        let mut app = App::new("icrn".to_string(), Default::default());
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::Refreshed {
+                username: "ww41".to_string(),
+                servers: vec![row("", false)],
+            },
+            now,
+        );
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Char('s')), now);
+        assert!(app.dialog.is_some());
+        app.on_key(&press(KeyCode::Enter), now);
+        assert!(app.dialog.is_none());
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::Start { server: None, .. }]
+        ));
+    }
+
+    #[test]
+    fn x_on_ready_server_opens_confirm_and_esc_cancels() {
+        let (mut app, now) = refreshed_app();
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Char('x')), now);
+        assert!(app.dialog.is_some());
+        app.on_key(&press(KeyCode::Esc), now);
+        assert!(app.dialog.is_none());
+        assert!(app.take_effects().is_empty());
+    }
+
+    #[test]
+    fn k_on_shell_opens_confirm_and_commits_kill() {
+        let (mut app, now) = refreshed_app();
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::Shells {
+                server: "default".to_string(),
+                shells: vec![ShellRow {
+                    name: "2".to_string(),
+                    last_activity: None,
+                }],
+            },
+            now,
+        );
+        app.on_key(&press(KeyCode::Right), now);
+        app.on_key(&press(KeyCode::Char('k')), now);
+        assert!(app.dialog.is_some());
+        app.on_key(&press(KeyCode::Enter), now);
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::KillShell { shell, .. }] if shell == "2"
+        ));
+    }
+
+    #[test]
+    fn q_inside_dialog_does_not_quit() {
+        let (mut app, now) = refreshed_app();
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Char('x')), now);
+        app.on_key(&press(KeyCode::Char('q')), now);
+        assert!(app.take_effects().is_empty());
+        assert!(app.dialog.is_some());
     }
 }

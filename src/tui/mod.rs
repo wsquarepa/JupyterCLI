@@ -1,4 +1,5 @@
 pub mod app;
+pub mod dialogs;
 pub mod input;
 pub mod net;
 pub mod render;

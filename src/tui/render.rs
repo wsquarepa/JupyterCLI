@@ -21,7 +21,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_servers(frame, app, panes[0]);
     draw_shells(frame, app, panes[1]);
     draw_statusbar(frame, app, rows[1]);
-    // Task 6 overlays an open dialog here.
+    if let Some(dialog) = &app.dialog {
+        super::dialogs::render_dialog(frame, dialog);
+    }
 }
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
