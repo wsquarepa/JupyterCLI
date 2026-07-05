@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
+#[derive(Debug)]
 pub struct LineInput {
     value: String,
     cursor: usize,

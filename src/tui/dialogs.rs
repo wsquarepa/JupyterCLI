@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -14,6 +15,37 @@ use super::app::Effect;
 pub enum Dialog {
     Start(StartDialog),
     Confirm(ConfirmDialog),
+    CreateNamed(CreateNamedDialog),
+}
+
+#[derive(Debug)]
+pub enum CreateStep {
+    Name,
+    Preset,
+    Starting,
+}
+
+#[derive(Debug)]
+pub struct CreateNamedDialog {
+    pub input: super::input::LineInput,
+    pub step: CreateStep,
+    pub picker: StartDialog,
+    pub op: Option<u64>,
+    pub error: Option<String>,
+    pub flash: Option<Instant>,
+}
+
+impl CreateNamedDialog {
+    pub fn new(presets: &BTreeMap<String, JsonMap>) -> Self {
+        Self {
+            input: super::input::LineInput::new(false),
+            step: CreateStep::Name,
+            picker: StartDialog::new(None, presets),
+            op: None,
+            error: None,
+            flash: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -46,9 +78,10 @@ pub enum Outcome {
     Stay,
     Close,
     Commit(Effect),
+    Spawn(Effect),
 }
 
-pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent) -> Outcome {
+pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent, now: Instant) -> Outcome {
     match dialog {
         Dialog::Start(start) => match key.code {
             KeyCode::Up => {
@@ -79,6 +112,51 @@ pub fn handle_key(dialog: &mut Dialog, key: &KeyEvent) -> Outcome {
             }
             KeyCode::Esc | KeyCode::Char('n') => Outcome::Close,
             _ => Outcome::Stay,
+        },
+        Dialog::CreateNamed(create) => match create.step {
+            CreateStep::Name => match key.code {
+                KeyCode::Enter => {
+                    let name = create.input.value().to_string();
+                    if name.trim().is_empty() || name.contains('/') {
+                        create.flash = Some(now);
+                        Outcome::Stay
+                    } else {
+                        create.picker.server = Some(name);
+                        create.error = None;
+                        create.step = CreateStep::Preset;
+                        Outcome::Stay
+                    }
+                }
+                KeyCode::Esc => Outcome::Close,
+                _ => {
+                    create.input.on_key(key);
+                    create.error = None;
+                    Outcome::Stay
+                }
+            },
+            CreateStep::Preset => match key.code {
+                KeyCode::Up => {
+                    create.picker.selected = create.picker.selected.saturating_sub(1);
+                    Outcome::Stay
+                }
+                KeyCode::Down => {
+                    create.picker.selected =
+                        (create.picker.selected + 1).min(create.picker.entries.len() - 1);
+                    Outcome::Stay
+                }
+                KeyCode::Enter => {
+                    let (_, options) = create.picker.entries[create.picker.selected].clone();
+                    let name = create.input.value().to_string();
+                    Outcome::Spawn(Effect::Start {
+                        op: 0,
+                        server: Some(name),
+                        options,
+                    })
+                }
+                KeyCode::Esc => Outcome::Close,
+                _ => Outcome::Stay,
+            },
+            CreateStep::Starting => Outcome::Stay,
         },
     }
 }
@@ -153,6 +231,9 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog) {
                 " Enter/y: confirm  Esc/n: cancel ",
             );
         }
+        // Rendering for CreateNamed is a later task; it draws nothing until
+        // that task adds its layout here.
+        Dialog::CreateNamed(_) => {}
     }
 }
 
@@ -160,6 +241,7 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog) {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Instant;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -174,6 +256,83 @@ mod tests {
         map
     }
 
+    fn create_dialog() -> Dialog {
+        Dialog::CreateNamed(CreateNamedDialog::new(&presets()))
+    }
+
+    #[test]
+    fn empty_and_slash_names_flash_and_do_not_advance() {
+        let now = Instant::now();
+        let mut dialog = create_dialog();
+        // empty name
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        if let Dialog::CreateNamed(d) = &dialog {
+            assert!(matches!(d.step, CreateStep::Name));
+            assert!(d.flash.is_some());
+        }
+        // type "a/b" then Enter -> still rejected (contains '/')
+        for c in ['a', '/', 'b'] {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        if let Dialog::CreateNamed(d) = &dialog {
+            assert!(matches!(d.step, CreateStep::Name));
+        }
+    }
+
+    #[test]
+    fn valid_name_advances_to_preset_then_spawns_with_name() {
+        let now = Instant::now();
+        let mut dialog = create_dialog();
+        for c in ['g', 'p', 'u'] {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Enter), now),
+            Outcome::Stay
+        ));
+        if let Dialog::CreateNamed(d) = &dialog {
+            assert!(matches!(d.step, CreateStep::Preset));
+            assert_eq!(d.picker.server.as_deref(), Some("gpu"));
+        }
+        // Down selects the "a100" preset, Enter spawns.
+        handle_key(&mut dialog, &press(KeyCode::Down), now);
+        match handle_key(&mut dialog, &press(KeyCode::Enter), now) {
+            Outcome::Spawn(Effect::Start {
+                server, options, ..
+            }) => {
+                assert_eq!(server.as_deref(), Some("gpu"));
+                assert_eq!(options["resource"], serde_json::json!("2_a100"));
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esc_closes_from_name_and_preset() {
+        let now = Instant::now();
+        let mut dialog = create_dialog();
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Esc), now),
+            Outcome::Close
+        ));
+        let mut dialog = create_dialog();
+        for c in ['x', 'y'] {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now); // -> Preset
+        assert!(matches!(
+            handle_key(&mut dialog, &press(KeyCode::Esc), now),
+            Outcome::Close
+        ));
+    }
+
     #[test]
     fn start_dialog_lists_hub_defaults_first() {
         let dialog = StartDialog::new(None, &presets());
@@ -186,10 +345,10 @@ mod tests {
     fn start_dialog_commits_selected_preset() {
         let mut dialog = Dialog::Start(StartDialog::new(None, &presets()));
         assert!(matches!(
-            handle_key(&mut dialog, &press(KeyCode::Down)),
+            handle_key(&mut dialog, &press(KeyCode::Down), Instant::now()),
             Outcome::Stay
         ));
-        match handle_key(&mut dialog, &press(KeyCode::Enter)) {
+        match handle_key(&mut dialog, &press(KeyCode::Enter), Instant::now()) {
             Outcome::Commit(Effect::Start {
                 server: None,
                 options,
@@ -205,14 +364,14 @@ mod tests {
     fn esc_closes_and_selection_clamps() {
         let mut dialog = Dialog::Start(StartDialog::new(None, &presets()));
         assert!(matches!(
-            handle_key(&mut dialog, &press(KeyCode::Up)),
+            handle_key(&mut dialog, &press(KeyCode::Up), Instant::now()),
             Outcome::Stay
         ));
         if let Dialog::Start(start) = &dialog {
             assert_eq!(start.selected, 0);
         }
         assert!(matches!(
-            handle_key(&mut dialog, &press(KeyCode::Esc)),
+            handle_key(&mut dialog, &press(KeyCode::Esc), Instant::now()),
             Outcome::Close
         ));
     }
@@ -230,17 +389,17 @@ mod tests {
         };
         let mut dialog = make();
         assert!(matches!(
-            handle_key(&mut dialog, &press(KeyCode::Enter)),
+            handle_key(&mut dialog, &press(KeyCode::Enter), Instant::now()),
             Outcome::Commit(Effect::Stop { server: None, .. })
         ));
         let mut dialog = make();
         assert!(matches!(
-            handle_key(&mut dialog, &press(KeyCode::Char('y'))),
+            handle_key(&mut dialog, &press(KeyCode::Char('y')), Instant::now()),
             Outcome::Commit(Effect::Stop { server: None, .. })
         ));
         let mut dialog = make();
         assert!(matches!(
-            handle_key(&mut dialog, &press(KeyCode::Esc)),
+            handle_key(&mut dialog, &press(KeyCode::Esc), Instant::now()),
             Outcome::Close
         ));
     }

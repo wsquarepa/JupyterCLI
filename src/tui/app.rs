@@ -10,6 +10,7 @@ use super::grid;
 pub const STATUS_TTL: Duration = Duration::from_secs(5);
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const PEEK_DEBOUNCE: Duration = Duration::from_millis(300);
+pub const REJECT_FLASH_DURATION: Duration = Duration::from_millis(150);
 
 #[derive(Debug)]
 pub struct HoverState {
@@ -291,6 +292,12 @@ impl App {
         }
         if !self.ops.is_empty() {
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        }
+        if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog
+            && let Some(since) = create.flash
+            && now.duration_since(since) > REJECT_FLASH_DURATION
+        {
+            create.flash = None;
         }
         let due = self
             .hover
@@ -581,12 +588,19 @@ impl App {
 
     fn handle_key(&mut self, key: &KeyEvent, now: Instant) {
         if let Some(dialog) = &mut self.dialog {
-            match super::dialogs::handle_key(dialog, key) {
+            match super::dialogs::handle_key(dialog, key, now) {
                 super::dialogs::Outcome::Stay => {}
                 super::dialogs::Outcome::Close => self.dialog = None,
                 super::dialogs::Outcome::Commit(effect) => {
                     self.dialog = None;
                     self.push_effect(effect);
+                }
+                super::dialogs::Outcome::Spawn(effect) => {
+                    let op = self.push_effect(effect);
+                    if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog {
+                        create.op = op;
+                        create.step = super::dialogs::CreateStep::Starting;
+                    }
                 }
             }
             return;
@@ -1568,6 +1582,24 @@ mod tests {
             app.peek.as_ref().and_then(|p| p.error.as_deref()),
             Some("connection refused")
         );
+    }
+
+    #[test]
+    fn reject_flash_clears_after_its_duration() {
+        let (mut app, now) = fresh_app();
+        app.dialog = Some(crate::tui::dialogs::Dialog::CreateNamed(
+            crate::tui::dialogs::CreateNamedDialog::new(&app.presets),
+        ));
+        app.on_key(&press(KeyCode::Enter), now); // empty name -> flash set
+        assert!(matches!(
+            &app.dialog,
+            Some(crate::tui::dialogs::Dialog::CreateNamed(d)) if d.flash.is_some()
+        ));
+        app.tick(now + REJECT_FLASH_DURATION + Duration::from_millis(1));
+        assert!(matches!(
+            &app.dialog,
+            Some(crate::tui::dialogs::Dialog::CreateNamed(d)) if d.flash.is_none()
+        ));
     }
 
     #[test]
