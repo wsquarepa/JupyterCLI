@@ -4,6 +4,7 @@ pub mod input;
 pub mod net;
 pub mod render;
 pub mod suspend;
+pub mod wizard;
 
 use std::time::{Duration, Instant};
 
@@ -19,8 +20,25 @@ const TICK_EVERY: Duration = Duration::from_millis(500);
 pub async fn run(hub_flag: Option<&str>) -> Result<(), CliError> {
     let cfg = match config::load() {
         Ok(cfg) => cfg,
-        // Task 9 routes NotFound into the wizard; until then the CLI guidance applies.
-        Err(e @ ConfigError::NotFound(_)) => return Err(e.into()),
+        Err(ConfigError::NotFound(_)) => {
+            let mut terminal = ratatui::init();
+            let outcome = wizard::run(&mut terminal).await;
+            match outcome {
+                Ok(Some(cfg)) => {
+                    let result = dashboard_loop(&mut terminal, cfg, hub_flag).await;
+                    ratatui::restore();
+                    return result;
+                }
+                Ok(None) => {
+                    ratatui::restore();
+                    return Ok(());
+                }
+                Err(e) => {
+                    ratatui::restore();
+                    return Err(e);
+                }
+            }
+        }
         Err(e) => return Err(e.into()),
     };
     let mut terminal = ratatui::init();
