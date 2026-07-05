@@ -139,6 +139,29 @@ fn save_to(cfg: &Config, dir: &Path) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
+pub fn add_preset(hub_name: &str, name: &str, options: JsonMap) -> Result<(), ConfigError> {
+    add_preset_in(&dir()?, hub_name, name, options)
+}
+
+fn add_preset_in(
+    dir: &Path,
+    hub_name: &str,
+    name: &str,
+    options: JsonMap,
+) -> Result<(), ConfigError> {
+    let mut cfg = load_from(dir)?;
+    if !cfg.hubs.contains_key(hub_name) {
+        return Err(ConfigError::UnknownHub {
+            name: hub_name.to_string(),
+            available: cfg.hubs.keys().cloned().collect::<Vec<_>>().join(", "),
+        });
+    }
+    let hub = cfg.hubs.get_mut(hub_name).expect("existence checked above");
+    hub.presets.insert(name.to_string(), options);
+    save_to(&cfg, dir)?;
+    Ok(())
+}
+
 pub fn permissions_are_loose(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
@@ -228,5 +251,34 @@ terminal_limit = 2000
 "#;
         let cfg: Config = toml::from_str(with_limit).unwrap();
         assert_eq!(cfg.hubs["icrn"].effective_terminal_limit(), 2000);
+    }
+
+    #[test]
+    fn add_preset_inserts_and_preserves_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(sample()).unwrap();
+        save_to(&cfg, dir.path()).unwrap();
+
+        let options: JsonMap = serde_json::from_str(r#"{"resource":"3_h200"}"#).unwrap();
+        add_preset_in(dir.path(), "icrn", "h200", options).unwrap();
+
+        let loaded = load_from(dir.path()).unwrap();
+        assert_eq!(
+            loaded.hubs["icrn"].presets["h200"]["resource"],
+            serde_json::json!("3_h200")
+        );
+        assert!(
+            loaded.hubs["icrn"].presets.contains_key("a100"),
+            "existing preset must survive"
+        );
+    }
+
+    #[test]
+    fn add_preset_unknown_hub_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(sample()).unwrap();
+        save_to(&cfg, dir.path()).unwrap();
+        let err = add_preset_in(dir.path(), "nope", "x", JsonMap::new()).unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownHub { .. }));
     }
 }
