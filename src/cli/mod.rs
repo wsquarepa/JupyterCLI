@@ -316,9 +316,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
     let ok = std::process::ExitCode::SUCCESS;
     match cli.command {
         None => {
-            println!(
-                "The JupyterCLI interactive interface arrives in a later milestone.\nRun jhc --help for the available commands."
-            );
+            crate::tui::run(cli.hub.as_deref()).await?;
             Ok(ok)
         }
         Some(Command::Init { url, token, name }) => {

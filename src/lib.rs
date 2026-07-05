@@ -3,3 +3,4 @@ pub mod attach;
 pub mod cli;
 pub mod config;
 pub mod shellops;
+pub mod tui;
