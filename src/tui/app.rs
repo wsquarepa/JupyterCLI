@@ -9,7 +9,7 @@ use super::grid;
 
 pub const STATUS_TTL: Duration = Duration::from_secs(5);
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-pub const PEEK_DEBOUNCE: Duration = Duration::from_millis(300);
+pub const HOVER_DEBOUNCE: Duration = Duration::from_millis(300);
 pub const REJECT_FLASH_DURATION: Duration = Duration::from_millis(150);
 
 #[derive(Debug)]
@@ -17,6 +17,14 @@ pub struct HoverState {
     pub terminal: String,
     pub since: Instant,
     pub started: bool,
+}
+
+/// The server row the cursor is resting on; `tick` commits it once the
+/// debounce elapses, so browsing the list never needs Enter.
+#[derive(Debug)]
+struct ServerHover {
+    server: String,
+    since: Instant,
 }
 
 // vt100::Parser has no Debug impl, so PeekState cannot derive it.
@@ -199,6 +207,7 @@ pub struct App {
     pub spinner_frame: usize,
     pub hover: Option<HoverState>,
     pub peek: Option<PeekState>,
+    server_hover: Option<ServerHover>,
     peek_op: Option<u64>,
     pending_select: Option<String>,
     pending_server_select: Option<String>,
@@ -232,6 +241,7 @@ impl App {
             spinner_frame: 0,
             hover: None,
             peek: None,
+            server_hover: None,
             peek_op: None,
             pending_select: None,
             pending_server_select: None,
@@ -308,10 +318,22 @@ impl App {
         {
             create.flash = None;
         }
+        let commit_due = self
+            .server_hover
+            .as_ref()
+            .is_some_and(|h| now.duration_since(h.since) >= HOVER_DEBOUNCE);
+        if commit_due
+            && let Some(server) = self.servers.get(self.server_cursor)
+            && self.committed_server.as_deref() != Some(server.display.as_str())
+            && server.ready
+            && server.url.is_some()
+        {
+            self.commit_cursor_server();
+        }
         let due = self
             .hover
             .as_ref()
-            .is_some_and(|h| !h.started && now.duration_since(h.since) >= PEEK_DEBOUNCE);
+            .is_some_and(|h| !h.started && now.duration_since(h.since) >= HOVER_DEBOUNCE);
         if due {
             let target = self.committed_row().and_then(|r| r.url.clone());
             if let Some(url) = target {
@@ -398,6 +420,23 @@ impl App {
                 started: false,
             });
         }
+    }
+
+    /// Reconcile the server-pane hover with the cursor. A dialog, focus loss,
+    /// or a cursor move resets the debounce clock; resting on a row starts it.
+    fn sync_server_hover(&mut self, now: Instant) {
+        let current = if self.dialog.is_none() && self.focus == Focus::Servers {
+            self.servers
+                .get(self.server_cursor)
+                .map(|s| s.display.clone())
+        } else {
+            None
+        };
+        let unchanged = self.server_hover.as_ref().map(|h| h.server.as_str()) == current.as_deref();
+        if unchanged {
+            return;
+        }
+        self.server_hover = current.map(|server| ServerHover { server, since: now });
     }
 
     fn teardown_peek(&mut self) {
@@ -572,6 +611,7 @@ impl App {
             }
         }
         self.sync_hover(now);
+        self.sync_server_hover(now);
     }
 
     /// After a server refresh: keep a still-ready committed server (and
@@ -633,6 +673,7 @@ impl App {
         }
         self.handle_key(key, now);
         self.sync_hover(now);
+        self.sync_server_hover(now);
     }
 
     fn handle_key(&mut self, key: &KeyEvent, now: Instant) {
@@ -1031,6 +1072,56 @@ mod tests {
             app.take_effects().as_slice(),
             [Effect::FetchTerminals { server, .. }] if server == "default"
         ));
+    }
+
+    #[test]
+    fn resting_on_a_server_commits_after_the_debounce_without_focus_change() {
+        let (mut app, now) = fresh_app();
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Down), now);
+        app.tick(now + Duration::from_millis(100));
+        assert!(app.take_effects().is_empty(), "before the debounce");
+        assert!(app.committed_server.is_none());
+        app.tick(now + HOVER_DEBOUNCE);
+        assert_eq!(app.committed_server.as_deref(), Some("backup"));
+        assert_eq!(app.focus, Focus::Servers, "auto-commit keeps focus");
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::FetchTerminals { server, .. }] if server == "backup"
+        ));
+        app.tick(now + HOVER_DEBOUNCE + Duration::from_millis(200));
+        assert!(app.take_effects().is_empty(), "never commits twice");
+    }
+
+    #[test]
+    fn skimming_across_servers_commits_nothing() {
+        let (mut app, now) = fresh_app();
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Down), now + Duration::from_millis(200));
+        // Hover on "backup" began at t=200ms; 400ms is before its debounce.
+        app.tick(now + Duration::from_millis(400));
+        assert!(app.take_effects().is_empty());
+        assert!(app.committed_server.is_none());
+    }
+
+    #[test]
+    fn hovering_a_stopped_server_commits_nothing() {
+        let (mut app, now) = fresh_app();
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Down), now);
+        app.on_key(&press(KeyCode::Down), now);
+        app.tick(now + HOVER_DEBOUNCE);
+        assert!(app.take_effects().is_empty());
+        assert!(app.committed_server.is_none());
+    }
+
+    #[test]
+    fn hovering_the_committed_server_does_not_refetch() {
+        let (mut app, now) = committed_app(&["1"]);
+        let _ = app.take_effects();
+        app.on_key(&press(KeyCode::Tab), now);
+        app.tick(now + HOVER_DEBOUNCE);
+        assert!(app.take_effects().is_empty());
     }
 
     #[test]
@@ -1530,7 +1621,7 @@ mod tests {
         assert!(app.peek_visible(), "grid focus + cursor on a card hovers");
         app.tick(now + Duration::from_millis(100));
         assert!(app.take_effects().is_empty(), "before the debounce");
-        app.tick(now + PEEK_DEBOUNCE);
+        app.tick(now + HOVER_DEBOUNCE);
         let effects = app.take_effects();
         // 100x30 frame: grid inner width 78, peek pane inner height 5.
         assert!(matches!(
@@ -1543,7 +1634,7 @@ mod tests {
             }] if terminal == "1"
         ));
         assert_eq!(app.ops.values().next_back(), Some(&"connecting"));
-        app.tick(now + PEEK_DEBOUNCE + Duration::from_millis(200));
+        app.tick(now + HOVER_DEBOUNCE + Duration::from_millis(200));
         assert!(app.take_effects().is_empty(), "never starts twice");
     }
 
@@ -1567,7 +1658,7 @@ mod tests {
     fn moving_off_a_live_peek_stops_it_and_closes_the_op() {
         let (mut app, now) = committed_app(&["1", "2"]);
         let _ = app.take_effects();
-        app.tick(now + PEEK_DEBOUNCE);
+        app.tick(now + HOVER_DEBOUNCE);
         let _ = app.take_effects();
         assert!(!app.ops.is_empty(), "connecting op open");
         app.on_key(&press(KeyCode::Right), now + Duration::from_millis(400));
@@ -1588,7 +1679,7 @@ mod tests {
 
         let (mut app, now) = committed_app(&["1"]);
         let _ = app.take_effects();
-        app.tick(now + PEEK_DEBOUNCE);
+        app.tick(now + HOVER_DEBOUNCE);
         let _ = app.take_effects();
         app.on_key(&press(KeyCode::Char('x')), now); // opens the kill confirm
         let effects = app.take_effects();
@@ -1600,7 +1691,7 @@ mod tests {
     fn peek_events_paint_the_screen_and_stale_chunks_drop() {
         let (mut app, now) = committed_app(&["1"]);
         let _ = app.take_effects();
-        app.tick(now + PEEK_DEBOUNCE);
+        app.tick(now + HOVER_DEBOUNCE);
         let _ = app.take_effects();
         let op = *app.ops.keys().next_back().expect("connecting op");
         app.apply(
@@ -1663,7 +1754,7 @@ mod tests {
             now,
         );
         let _ = app.take_effects();
-        app.tick(now + PEEK_DEBOUNCE);
+        app.tick(now + HOVER_DEBOUNCE);
         let cols = match app.take_effects().as_slice() {
             [Effect::PeekStart { cols, .. }] => *cols,
             other => panic!("unexpected effects: {other:?}"),
@@ -1695,7 +1786,7 @@ mod tests {
     fn peek_failure_sets_the_error_and_closes_the_op() {
         let (mut app, now) = committed_app(&["1"]);
         let _ = app.take_effects();
-        app.tick(now + PEEK_DEBOUNCE);
+        app.tick(now + HOVER_DEBOUNCE);
         let _ = app.take_effects();
         let op = *app.ops.keys().next_back().expect("connecting op");
         app.apply(
@@ -1735,7 +1826,7 @@ mod tests {
     fn attach_emits_peekstop_before_attach() {
         let (mut app, now) = committed_app(&["2"]);
         let _ = app.take_effects();
-        app.tick(now + PEEK_DEBOUNCE);
+        app.tick(now + HOVER_DEBOUNCE);
         let _ = app.take_effects();
         app.on_key(&press(KeyCode::Enter), now + Duration::from_millis(400));
         let effects = app.take_effects();

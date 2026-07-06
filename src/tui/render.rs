@@ -623,7 +623,7 @@ mod tests {
         assert!(text.contains(" Peek: Terminal 001 "), "buffer:\n{text}");
         assert!(text.contains("connecting..."));
 
-        app.tick(now + crate::tui::app::PEEK_DEBOUNCE);
+        app.tick(now + crate::tui::app::HOVER_DEBOUNCE);
         let _ = app.take_effects();
         let op = *app.ops.keys().next_back().unwrap();
         app.apply(
