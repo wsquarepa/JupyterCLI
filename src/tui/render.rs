@@ -166,8 +166,7 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
         None => block.title(" Terminals "),
     };
     if focused {
-        block = block
-            .title_bottom(Line::from(" Enter: attach  n: new  x: kill ").centered());
+        block = block.title_bottom(Line::from(" Enter: attach  n: new  x: kill ").centered());
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
