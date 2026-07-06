@@ -143,6 +143,19 @@ pub async fn peek(
 
 pub const JHC_FAILURE_EXIT: i32 = 125;
 
+// Quote each `jhc exec -- <argv>` element for the remote terminado bash so it re-parses
+// the line into the identical argv. Without quoting, argument boundaries and shell
+// metacharacters (spaces, quotes, `:`, `://`, newlines) are reinterpreted by that shell,
+// which drops/splits arguments and can leave a heredoc waiting on stdin forever. Single
+// quotes are literal for every byte except `'` itself, which is closed, escaped with a
+// backslash, and reopened (`'\''`).
+pub fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn build_exec_line(command: &str, nonce: &str, ephemeral: bool) -> String {
     // Ephemeral shells are single-use, so `exit` reaps the remote bash. A reused
     // persistent shell must survive; `stty echo` only undoes the `stty -echo` above,
@@ -444,6 +457,40 @@ mod tests {
         let (out2, code2) = p.push(&format!("\x1e{n}:S\x1eok\r\n\x1e{n}:0\x1e"));
         assert_eq!(out2, "ok\n");
         assert_eq!(code2, Some(0));
+    }
+
+    #[test]
+    fn shell_join_preserves_argument_boundaries_and_quoting() {
+        // The classic `jhc exec -- bash -c '<script with a quoted header and URL>'` case.
+        // The whole script must reach the remote shell as one argument to `bash -c`.
+        let args = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "curl -H \"Authorization: token X\" https://hub/api/users/me".to_string(),
+        ];
+        assert_eq!(
+            shell_join(&args),
+            "'bash' '-c' 'curl -H \"Authorization: token X\" https://hub/api/users/me'"
+        );
+    }
+
+    #[test]
+    fn shell_join_escapes_embedded_single_quotes() {
+        assert_eq!(shell_join(&["it's".to_string()]), "'it'\\''s'");
+        assert_eq!(shell_join(&[String::new()]), "''");
+    }
+
+    #[test]
+    fn shell_join_keeps_newlines_intact_for_heredocs() {
+        let args = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "python3 - <<PY\nprint(1)\nPY".to_string(),
+        ];
+        assert_eq!(
+            shell_join(&args),
+            "'bash' '-c' 'python3 - <<PY\nprint(1)\nPY'"
+        );
     }
 
     #[test]

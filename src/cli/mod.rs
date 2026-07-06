@@ -84,6 +84,11 @@ pub enum Command {
     #[command(subcommand)]
     Shell(ShellCmd),
     /// Run a command on a server and exit with its status
+    #[command(
+        after_help = "Arguments after -- are run as an argv, not a shell line: quoting and \
+argument boundaries are preserved exactly, so no top-level shell interpretation happens. For \
+pipes, redirection, or globbing, invoke a shell yourself:\n  jhc exec -- bash -c 'ls | grep foo'"
+    )]
     Exec {
         /// Server to run on; omit for the default server
         server: Option<String>,
@@ -376,7 +381,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
                 &Ctx::load(cli.hub.as_deref(), cli.verbose)?,
                 server.as_deref(),
                 shell.as_deref(),
-                &command.join(" "),
+                &crate::shellops::shell_join(&command),
             )
             .await?;
             Ok(std::process::ExitCode::from(code as u8))
