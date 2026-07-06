@@ -34,11 +34,17 @@ pub async fn attach_in_subprocess(hub: &str, target: &str) -> Result<String, Cli
     // page instead of over the user's local shell history. Scrollback is
     // deliberately kept (no ClearType::Purge): only the visible bleed-through
     // is the problem.
+    //
+    // ratatui's draw loop hides the cursor on every frame (no frame ever sets a
+    // cursor position), so the terminal reaches here with the cursor hidden.
+    // Show it before the attach subprocess takes over, or the remote shell's
+    // prompt renders without a visible cursor.
     crossterm::execute!(
         stdout,
         LeaveAlternateScreen,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        crossterm::cursor::MoveTo(0, 0)
+        crossterm::cursor::MoveTo(0, 0),
+        crossterm::cursor::Show
     )
     .map_err(CliError::Io)?;
     disable_raw_mode().map_err(CliError::Io)?;
