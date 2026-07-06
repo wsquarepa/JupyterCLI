@@ -28,7 +28,6 @@ Prebuilt release assets are published for:
 
 - Linux: `x86_64`, `aarch64`
 - macOS: `x86_64`, `aarch64`
-- Windows: `x86_64`, `aarch64`
 
 Download the matching `jhc-<target>` asset from [Releases](https://github.com/wsquarepa/JupyterCLI/releases), make it executable on Unix-like systems, and place it somewhere on your `PATH`.
 
