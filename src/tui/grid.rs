@@ -6,13 +6,19 @@ pub const CARD_WIDTH: u16 = 16;
 pub const CARD_HEIGHT: u16 = 6;
 /// Blank rows between consecutive card rows.
 pub const CARD_VGAP: u16 = 1;
+/// Blank columns between consecutive cards in a row, always exact.
+pub const CARD_HGAP: u16 = 2;
 /// The TUI never renders more than this many cards (user decision; the CLI
 /// manages terminals beyond it).
 pub const DISPLAY_CAP: usize = 999;
 
 /// Width of the server list pane (the 20% column) for a full frame width.
+/// Gives up one column when the grid's inner width would otherwise be odd:
+/// a row's leftover width has the same parity as the inner width, so an even
+/// inner width guarantees the edge padding splits equally left and right.
 pub fn server_pane_width(frame_width: u16) -> u16 {
-    (u32::from(frame_width) * 20 / 100) as u16
+    let pane = (u32::from(frame_width) * 20 / 100) as u16;
+    pane.saturating_sub(frame_width.saturating_sub(pane) % 2)
 }
 
 /// Inner width of the grid pane: the 80% column minus its two border columns.
@@ -22,30 +28,22 @@ pub fn grid_inner_width(frame_width: u16) -> u16 {
         .saturating_sub(2)
 }
 
-/// Cards per row: as many as fit leaving at least one gap column everywhere
-/// (n cards need 16n + (n+1) columns), never fewer than one.
+/// Cards per row: as many card slots of `CARD_WIDTH + CARD_HGAP` as fit
+/// (the trailing slot's gap doubles as edge padding), never fewer than one.
 pub fn columns_for_width(inner_width: u16) -> usize {
-    usize::max(1, usize::from(inner_width.saturating_sub(1)) / 17)
+    usize::max(1, usize::from(inner_width / (CARD_WIDTH + CARD_HGAP)))
 }
 
 /// X offsets (relative to the pane's inner left edge) for each card in a row
-/// of `columns` cards. There are `columns + 1` gaps including both edges;
-/// leftover width beyond the cards spreads as evenly as possible, the
-/// leftmost gaps taking one extra column each when it does not divide evenly.
+/// of `columns` cards. Consecutive cards sit exactly `CARD_HGAP` apart and
+/// the leftover width splits between the two edges; `server_pane_width`
+/// keeps the inner width even so that split is always equal.
 pub fn row_offsets(inner_width: u16, columns: usize) -> Vec<u16> {
     let columns_u16 = columns as u16;
-    let leftover = inner_width.saturating_sub(CARD_WIDTH * columns_u16);
-    let gaps = columns_u16 + 1;
-    let base = leftover / gaps;
-    let extra = leftover % gaps;
-    let mut offsets: Vec<u16> = Vec::with_capacity(columns);
-    let mut x = 0u16;
-    for i in 0..columns_u16 {
-        x += base + u16::from(i < extra);
-        offsets.push(x);
-        x += CARD_WIDTH;
-    }
-    offsets
+    let slot = CARD_WIDTH + CARD_HGAP;
+    let block = (slot * columns_u16).saturating_sub(CARD_HGAP);
+    let edge = inner_width.saturating_sub(block) / 2;
+    (0..columns_u16).map(|i| edge + i * slot).collect()
 }
 
 /// Whole card rows that fit an inner pane height. Each row is 6 tall with 1
@@ -83,26 +81,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn columns_fit_with_minimum_gaps() {
+    fn columns_fit_with_fixed_gaps() {
         assert_eq!(columns_for_width(0), 1);
         assert_eq!(columns_for_width(16), 1);
-        assert_eq!(columns_for_width(34), 1);
-        assert_eq!(columns_for_width(35), 2);
-        assert_eq!(columns_for_width(52), 3);
+        assert_eq!(columns_for_width(35), 1);
+        assert_eq!(columns_for_width(36), 2);
+        assert_eq!(columns_for_width(54), 3);
         assert_eq!(columns_for_width(80), 4);
         assert_eq!(columns_for_width(200), 11);
     }
 
     #[test]
-    fn row_offsets_spread_leftover_left_first() {
-        // width 40, 2 cards: leftover 8 over 3 gaps = 3, 3, 2
-        assert_eq!(row_offsets(40, 2), vec![3, 22]);
-        // width 35, 2 cards: leftover 3 over 3 gaps = 1, 1, 1
-        assert_eq!(row_offsets(35, 2), vec![1, 18]);
-        // exact fit leaves zero gaps
-        assert_eq!(row_offsets(32, 2), vec![0, 16]);
+    fn row_offsets_center_cards_with_fixed_gaps() {
+        // width 40, 2 cards: block 34, leftover 6 split as 3 per edge
+        assert_eq!(row_offsets(40, 2), vec![3, 21]);
+        // width 36, 2 cards: leftover 2 split as 1 per edge
+        assert_eq!(row_offsets(36, 2), vec![1, 19]);
+        // exact block fit leaves zero edge padding
+        assert_eq!(row_offsets(34, 2), vec![0, 18]);
         // degenerate: a card wider than the pane still renders at 0
         assert_eq!(row_offsets(10, 1), vec![0]);
+        assert_eq!(row_offsets(0, 0), Vec::<u16>::new());
     }
 
     #[test]
@@ -126,11 +125,22 @@ mod tests {
     }
 
     #[test]
-    fn pane_split_is_deterministic() {
+    fn pane_split_keeps_grid_inner_width_even() {
         assert_eq!(server_pane_width(100), 20);
         assert_eq!(grid_inner_width(100), 78);
         assert_eq!(server_pane_width(80), 16);
         assert_eq!(grid_inner_width(80), 62);
+        // 20% of 81 is 16, which would leave an odd inner width of 63; the
+        // server pane gives up one column so edge padding can split evenly
+        assert_eq!(server_pane_width(81), 15);
+        assert_eq!(grid_inner_width(81), 64);
         assert_eq!(grid_inner_width(0), 0);
+    }
+
+    #[test]
+    fn grid_inner_width_is_even_for_all_frame_widths() {
+        for frame in 5u16..500 {
+            assert_eq!(grid_inner_width(frame) % 2, 0, "frame width {frame}");
+        }
     }
 }
