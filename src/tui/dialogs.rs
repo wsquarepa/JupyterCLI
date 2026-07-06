@@ -363,11 +363,9 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
     let area = frame.area();
     match dialog {
         Dialog::Start(start) => {
-            let dialog_width = 60u16.min(area.width);
-            let width = usize::from(dialog_width.saturating_sub(2));
-            let body = render_picker(start, width);
+            let body = render_picker(start, super::wizard::CONTENT_WIDTH);
             let height = body.len() as u16 + 4;
-            let rect = super::render::centered_rect(60, height, area);
+            let rect = super::render::centered_rect(64, height, area);
             frame.render_widget(Clear, rect);
             let title = match &start.server {
                 Some(server) => format!(" Start {server} "),
@@ -378,7 +376,12 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
             frame.render_widget(block, rect);
             let mut content = vec![Line::from("")];
             content.extend(body);
-            frame.render_widget(Paragraph::new(content), inner);
+            let padded = ratatui::layout::Rect {
+                x: inner.x + 1,
+                width: inner.width.saturating_sub(2),
+                ..inner
+            };
+            frame.render_widget(Paragraph::new(content), padded);
             let hints = match &start.editor {
                 None => " Up/Down: navigate  Enter: start  Esc: cancel ",
                 Some(editor) => editor_hints(&editor.step),
@@ -904,6 +907,43 @@ mod tests {
         let text = render_to_text(&dialog);
         assert!(text.contains("paste spawn permalink"), "buffer:\n{text}");
         assert!(text.contains("Permalink"), "buffer:\n{text}");
+    }
+
+    #[test]
+    fn start_dialog_editor_windows_a_long_permalink_without_clipping() {
+        let now = Instant::now();
+        let mut dialog = Dialog::Start(StartDialog::new(None, &presets()));
+        // entries = [hub defaults, a100]; the "+ new preset" row is index 2.
+        for _ in 0..2 {
+            handle_key(&mut dialog, &press(KeyCode::Down), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now); // open editor
+        for c in "gpu".chars() {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+        handle_key(&mut dialog, &press(KeyCode::Enter), now); // -> Permalink step
+
+        let tail = "Z".repeat(20);
+        let permalink = format!(
+            "https://hub.example.edu/hub/spawn#fancy-forms-config={{\"resource\":\"3_h200\"}}{tail}"
+        );
+        for c in permalink.chars() {
+            handle_key(&mut dialog, &press(KeyCode::Char(c)), now);
+        }
+
+        let text = render_to_text(&dialog);
+        let row = text
+            .lines()
+            .find(|l| l.contains("Permalink:"))
+            .expect("permalink input row");
+        let marker_end = row
+            .find(&tail)
+            .map(|i| i + tail.len())
+            .unwrap_or_else(|| panic!("windowed tail must render inside the dialog row:\n{row}"));
+        assert!(
+            row[marker_end..].contains('│'),
+            "the permalink row must end inside the dialog, not clipped by ratatui:\n{row}"
+        );
     }
 
     #[test]
