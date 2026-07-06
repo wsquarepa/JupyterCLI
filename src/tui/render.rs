@@ -167,7 +167,7 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
     };
     if focused {
         block = block
-            .title_bottom(Line::from(" Enter: attach  n: new  x: kill  Esc: back ").centered());
+            .title_bottom(Line::from(" Enter: attach  n: new  x: kill ").centered());
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -591,7 +591,7 @@ mod tests {
 
         let (app, _) = committed(&["1"]);
         let text = rendered(&app);
-        assert!(text.contains("Enter: attach  n: new  x: kill  Esc: back"));
+        assert!(text.contains("Enter: attach  n: new  x: kill"));
         assert!(!text.contains("Enter: open"));
         assert!(!text.contains("n: new  x: stop"));
     }
@@ -665,7 +665,7 @@ mod tests {
         let (mut app, now) = committed(&["1"]);
         app.on_key(
             &crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyCode::Tab,
                 crossterm::event::KeyModifiers::NONE,
             ),
             now,

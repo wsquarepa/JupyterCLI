@@ -698,7 +698,6 @@ impl App {
 
     fn on_key_grid(&mut self, code: KeyCode, now: Instant) {
         match code {
-            KeyCode::Esc => self.focus = Focus::Servers,
             KeyCode::Left => self.move_grid_cursor(-1, 0),
             KeyCode::Right => self.move_grid_cursor(1, 0),
             KeyCode::Up => self.move_grid_cursor(0, -1),
@@ -1081,13 +1080,13 @@ mod tests {
     }
 
     #[test]
-    fn tab_needs_a_commitment_and_esc_returns() {
+    fn tab_needs_a_commitment_and_toggles_focus() {
         let (mut app, now) = fresh_app();
         app.on_key(&press(KeyCode::Tab), now);
         assert_eq!(app.focus, Focus::Servers);
         app.on_key(&press(KeyCode::Enter), now);
         assert_eq!(app.focus, Focus::Grid);
-        app.on_key(&press(KeyCode::Esc), now);
+        app.on_key(&press(KeyCode::Tab), now);
         assert_eq!(app.focus, Focus::Servers);
         app.on_key(&press(KeyCode::Tab), now);
         assert_eq!(app.focus, Focus::Grid);
@@ -1583,7 +1582,7 @@ mod tests {
     fn focus_change_and_dialogs_tear_the_hover_down() {
         let (mut app, now) = committed_app(&["1"]);
         let _ = app.take_effects();
-        app.on_key(&press(KeyCode::Esc), now);
+        app.on_key(&press(KeyCode::Tab), now);
         assert!(app.hover.is_none());
         assert!(!app.peek_visible());
 
