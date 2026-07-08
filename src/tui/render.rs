@@ -61,10 +61,15 @@ fn state_color(server: &ServerRow) -> ratatui::style::Color {
 
 fn draw_servers(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Servers;
+    let border = if app.servers_loading() {
+        Style::default().fg(super::anim::pulse_color(app.spinner_frame))
+    } else {
+        border_style(focused)
+    };
     let mut block = Block::new()
         .borders(Borders::ALL)
         .title(" Servers ")
-        .border_style(border_style(focused));
+        .border_style(border);
     if focused {
         block = block.title_bottom(Line::from(" n: new  x: stop ").centered());
     }
@@ -137,9 +142,12 @@ fn server_line(app: &App, index: usize, server: &ServerRow, width: u16) -> Line<
 
 fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Grid;
-    let mut block = Block::new()
-        .borders(Borders::ALL)
-        .border_style(border_style(focused));
+    let border = if app.grid_loading() {
+        Style::default().fg(super::anim::pulse_color(app.spinner_frame))
+    } else {
+        border_style(focused)
+    };
+    let mut block = Block::new().borders(Borders::ALL).border_style(border);
     block = match app.committed_row() {
         Some(server) => {
             let mut titled = block.title(format!(
@@ -176,6 +184,10 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     if app.committed_server.is_none() {
+        return;
+    }
+    if app.skeleton_visible() {
+        draw_skeleton(frame, app, inner);
         return;
     }
     let cards = app.displayed_terminals();
@@ -247,6 +259,42 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().fg(theme::DIMMED));
         frame.render_widget(Clear, bottom);
         frame.render_widget(notice, bottom);
+    }
+}
+
+/// Skeleton cards in the last-known shape of the committed server's grid,
+/// with a shimmer band sweeping the card interiors.
+fn draw_skeleton(frame: &mut Frame, app: &App, inner: Rect) {
+    let columns = grid::columns_for_width(inner.width);
+    let offsets = grid::row_offsets(inner.width, columns);
+    let visible_rows = grid::visible_card_rows(inner.height);
+    for slot in 0..app.skeleton_count().min(columns * visible_rows) {
+        let row = slot / columns;
+        let col = slot % columns;
+        let x = inner.x + offsets[col];
+        let y = inner.y + (row as u16) * (grid::CARD_HEIGHT + grid::CARD_VGAP);
+        let rect = Rect::new(x, y, grid::CARD_WIDTH, grid::CARD_HEIGHT);
+        if rect.right() > inner.right() || rect.bottom() > inner.bottom() {
+            break;
+        }
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::SHIM[1]));
+        let card_inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let lines: Vec<Line> = (0..card_inner.height)
+            .map(|j| {
+                Line::from(
+                    (0..card_inner.width)
+                        .map(|i| {
+                            let level = super::anim::shimmer_level(app.spinner_frame, i, j);
+                            Span::styled("░", Style::default().fg(theme::SHIM[level]))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), card_inner);
     }
 }
 
@@ -528,21 +576,25 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
         Some(name) => format!(" Peek: {} ", grid::card_label(&name)),
         None => " Peek ".to_string(),
     };
+    let connecting = app
+        .peek
+        .as_ref()
+        .map(|p| !p.connected && p.error.is_none())
+        .unwrap_or(true);
+    let border = if connecting && app.peek_visible() {
+        Style::default().fg(super::anim::pulse_color(app.spinner_frame))
+    } else {
+        border_style(false)
+    };
     let block = Block::new()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(border_style(false));
+        .border_style(border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let Some(peek) = &app.peek else {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                "connecting...",
-                Style::default().fg(theme::DIMMED),
-            )),
-            inner,
-        );
+        render_peek_connecting(frame, app, inner);
         return;
     };
     if let Some(error) = &peek.error {
@@ -556,13 +608,7 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     if !peek.connected {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                "connecting...",
-                Style::default().fg(theme::DIMMED),
-            )),
-            inner,
-        );
+        render_peek_connecting(frame, app, inner);
         return;
     }
     // Tail-anchor the emulated screen: show the window ending at the last
@@ -580,6 +626,27 @@ fn draw_peek(frame: &mut Frame, app: &App, area: Rect) {
         .map(|r| Line::from(r.chars().take(width).collect::<String>()))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_peek_connecting(frame: &mut Frame, app: &App, inner: Rect) {
+    let shimmer: Line = Line::from(
+        (0..inner.width)
+            .map(|i| {
+                let level = super::anim::shimmer_level(app.spinner_frame, i, 0);
+                Span::styled("░", Style::default().fg(theme::SHIM[level]))
+            })
+            .collect::<Vec<_>>(),
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "connecting...",
+                Style::default().fg(theme::DIMMED),
+            )),
+            shimmer,
+        ]),
+        inner,
+    );
 }
 
 const GLOBAL_HINTS: &str = "Tab: switch focus | r: refresh | q: quit ";
@@ -1062,6 +1129,34 @@ mod tests {
 
         app.ghost.as_mut().unwrap().phase = crate::tui::app::GhostPhase::Failed { ticks_left: 3 };
         assert!(rendered(&app).contains("failed"));
+    }
+
+    #[test]
+    fn loud_fetch_shows_skeleton_cards() {
+        let (mut app, _) = committed(&["1", "2", "3"]);
+        app.grid_fetch = Some(crate::tui::app::GridFetch {
+            op: 9,
+            age_ticks: crate::tui::app::SKELETON_SHOW_TICKS,
+            pending: None,
+        });
+        // Isolate the grid pane's skeleton from the peek pane, which keeps
+        // previewing the last-hovered terminal independent of the grid fetch.
+        app.hover = None;
+        let text = rendered(&app);
+        assert!(text.contains('░'), "skeleton shimmer glyphs:\n{text}");
+        assert!(
+            !text.contains("Terminal 001"),
+            "stale cards replaced by skeletons:\n{text}"
+        );
+    }
+
+    #[test]
+    fn peek_connecting_shows_shimmer() {
+        let (app, _) = committed(&["1"]);
+        // committed() leaves the hover pending; the peek pane shows the connect state.
+        let text = rendered(&app);
+        assert!(text.contains("connecting"), "buffer:\n{text}");
+        assert!(text.contains('░'), "connect shimmer:\n{text}");
     }
 
     #[test]
