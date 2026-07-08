@@ -2245,8 +2245,6 @@ mod tests {
     #[test]
     fn fast_fetch_skips_the_skeleton() {
         let (mut app, now) = committed_app(&[]); // committing pushed a loud fetch
-        // committed_app already applied Terminals; re-trigger a loud fetch via r + refresh round trip,
-        // or directly: press Esc to servers, move, Enter back. Simplest: call the helper.
         let op = app.fetch_committed_terminals(true).unwrap();
         let _ = app.take_effects();
         assert!(app.grid_loading());
