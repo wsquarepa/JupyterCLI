@@ -211,7 +211,7 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
         let rect = Rect::new(x, y, grid::CARD_WIDTH, grid::CARD_HEIGHT);
         match &app.dissolve {
             Some(dissolve) if dissolve.terminal == terminal.name => {
-                draw_dissolve_card(frame, dissolve, rect);
+                draw_dissolve_card(frame, dissolve, rect, inner);
             }
             _ => draw_card(
                 frame,
@@ -382,7 +382,15 @@ fn draw_card(frame: &mut Frame, terminal: &TerminalRow, hovered: bool, rect: Rec
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_dissolve_card(frame: &mut Frame, dissolve: &super::app::Dissolve, rect: Rect) {
+fn draw_dissolve_card(
+    frame: &mut Frame,
+    dissolve: &super::app::Dissolve,
+    rect: Rect,
+    bounds: Rect,
+) {
+    if rect.right() > bounds.right() || rect.bottom() > bounds.bottom() {
+        return;
+    }
     let progress = (dissolve.age_ticks as f32 / super::app::DISSOLVE_TICKS as f32).min(1.0);
     let border = if progress < 0.5 {
         theme::BORDER_UNFOCUSED
@@ -849,6 +857,20 @@ mod tests {
             !text.contains("Terminal 002"),
             "fully decayed label must be gone:\n{text}"
         );
+    }
+
+    #[test]
+    fn dissolving_card_skips_rects_beyond_a_tiny_frame() {
+        let (mut app, _) = committed(&["1", "2"]);
+        app.dissolve = Some(crate::tui::app::Dissolve {
+            op: 9,
+            terminal: "2".to_string(),
+            age_ticks: 3,
+            confirmed: false,
+            seed: 12345,
+        });
+        // Must not panic: the card rect overflows a 12-column frame.
+        let _ = rendered_sized(&app, 12, 30);
     }
 
     #[test]
