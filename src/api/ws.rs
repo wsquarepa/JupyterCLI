@@ -68,6 +68,7 @@ impl TermSocket {
                 url: url.to_string(),
                 source: Box::new(e),
             })?;
+        tracing::debug!(target: "jhc::ws", url = %url, "connect");
         Ok(Self {
             ws,
             url: url.to_string(),
@@ -83,6 +84,7 @@ impl TermSocket {
 
     pub async fn send_stdin(&mut self, text: &str) -> Result<(), ApiError> {
         let frame = encode_stdin(text);
+        tracing::trace!(target: "jhc::ws", direction = "send", bytes = frame.len(), "stdin");
         self.ws
             .send(Message::Text(frame.into()))
             .await
@@ -91,6 +93,7 @@ impl TermSocket {
 
     pub async fn send_size(&mut self, rows: u16, cols: u16) -> Result<(), ApiError> {
         let frame = encode_set_size(rows, cols);
+        tracing::trace!(target: "jhc::ws", direction = "send", bytes = frame.len(), "set_size");
         self.ws
             .send(Message::Text(frame.into()))
             .await
@@ -98,6 +101,7 @@ impl TermSocket {
     }
 
     pub async fn ping(&mut self) -> Result<(), ApiError> {
+        tracing::trace!(target: "jhc::ws", direction = "send", bytes = 0, "ping");
         self.ws
             .send(Message::Ping(Vec::new().into()))
             .await
@@ -110,6 +114,7 @@ impl TermSocket {
                 None => return Ok(None),
                 Some(Err(e)) => return Err(self.ws_err(e)),
                 Some(Ok(Message::Text(text))) => {
+                    tracing::trace!(target: "jhc::ws", direction = "recv", bytes = text.len(), "frame");
                     let frame = decode_frame(&text).map_err(|reason| ApiError::Protocol {
                         url: self.url.clone(),
                         reason,
@@ -127,6 +132,7 @@ impl TermSocket {
             url: self.url.clone(),
             source: Box::new(e),
         })?;
+        tracing::debug!(target: "jhc::ws", url = %self.url, "close");
         self.ws.close(None).await.map_err(|e| ApiError::Ws {
             url: self.url.clone(),
             source: Box::new(e),

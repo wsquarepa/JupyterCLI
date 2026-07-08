@@ -7,7 +7,6 @@ pub struct ServerClient {
     http: reqwest::Client,
     base: reqwest::Url,
     token: String,
-    verbose: bool,
 }
 
 impl ServerClient {
@@ -25,7 +24,6 @@ impl ServerClient {
             http: reqwest::Client::new(),
             base,
             token: hub.token().to_string(),
-            verbose: false,
         })
     }
 
@@ -40,22 +38,17 @@ impl ServerClient {
         rb.header("Authorization", format!("token {}", self.token))
     }
 
-    fn log(&self, method: &str, url: &str, outcome: &str) {
-        if self.verbose {
-            eprintln!("jhc: {method} {url} -> {outcome}");
-        }
-    }
-
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn terminals(&self) -> Result<Vec<Terminal>, ApiError> {
         let url = self.url("api/terminals")?;
         let result = self.auth(self.http.get(url.clone())).send().await;
         let resp = match result {
             Ok(resp) => {
-                self.log("GET", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "GET", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("GET", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "GET", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "GET",
                     url: url.to_string(),
@@ -76,16 +69,17 @@ impl ServerClient {
         })
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn create_terminal(&self) -> Result<Terminal, ApiError> {
         let url = self.url("api/terminals")?;
         let result = self.auth(self.http.post(url.clone())).send().await;
         let resp = match result {
             Ok(resp) => {
-                self.log("POST", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "POST", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("POST", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "POST", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "POST",
                     url: url.to_string(),
@@ -106,16 +100,17 @@ impl ServerClient {
         })
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(name = name))]
     pub async fn delete_terminal(&self, name: &str) -> Result<(), ApiError> {
         let url = self.url(&format!("api/terminals/{name}"))?;
         let result = self.auth(self.http.delete(url.clone())).send().await;
         let resp = match result {
             Ok(resp) => {
-                self.log("DELETE", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "DELETE", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("DELETE", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "DELETE", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "DELETE",
                     url: url.to_string(),
@@ -129,6 +124,7 @@ impl ServerClient {
         check("DELETE", url.as_str(), resp).await.map(|_| ())
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(path = path))]
     pub async fn list_dir(&self, path: &str) -> Result<Vec<ContentEntry>, ApiError> {
         let url = self.url(&format!("api/contents/{}", path.trim_start_matches('/')))?;
         let result = self
@@ -138,11 +134,11 @@ impl ServerClient {
             .await;
         let resp = match result {
             Ok(resp) => {
-                self.log("GET", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "GET", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("GET", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "GET", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "GET",
                     url: url.to_string(),
@@ -179,6 +175,7 @@ impl ServerClient {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(path = path))]
     pub async fn download(&self, path: &str) -> Result<Vec<u8>, ApiError> {
         let url = self.url(&format!("api/contents/{}", path.trim_start_matches('/')))?;
         let result = self
@@ -188,11 +185,11 @@ impl ServerClient {
             .await;
         let resp = match result {
             Ok(resp) => {
-                self.log("GET", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "GET", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("GET", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "GET", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "GET",
                     url: url.to_string(),
@@ -229,6 +226,7 @@ impl ServerClient {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(path = path))]
     pub async fn upload(&self, path: &str, bytes: &[u8]) -> Result<(), ApiError> {
         let clean = path.trim_start_matches('/');
         let url = self.url(&format!("api/contents/{clean}"))?;
@@ -244,11 +242,11 @@ impl ServerClient {
             .await;
         let resp = match result {
             Ok(resp) => {
-                self.log("PUT", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "PUT", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("PUT", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "PUT", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "PUT",
                     url: url.to_string(),
@@ -259,6 +257,7 @@ impl ServerClient {
         check("PUT", url.as_str(), resp).await.map(|_| ())
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(path = path))]
     pub async fn mkdir(&self, path: &str) -> Result<(), ApiError> {
         let clean = path.trim_start_matches('/');
         let url = self.url(&format!("api/contents/{clean}"))?;
@@ -269,11 +268,11 @@ impl ServerClient {
             .await;
         let resp = match result {
             Ok(resp) => {
-                self.log("PUT", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "PUT", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("PUT", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "PUT", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "PUT",
                     url: url.to_string(),
@@ -284,17 +283,18 @@ impl ServerClient {
         check("PUT", url.as_str(), resp).await.map(|_| ())
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(path = path))]
     pub async fn delete_path(&self, path: &str) -> Result<(), ApiError> {
         let clean = path.trim_start_matches('/');
         let url = self.url(&format!("api/contents/{clean}"))?;
         let result = self.auth(self.http.delete(url.clone())).send().await;
         let resp = match result {
             Ok(resp) => {
-                self.log("DELETE", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "DELETE", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("DELETE", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "DELETE", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "DELETE",
                     url: url.to_string(),
