@@ -12,6 +12,14 @@ pub enum ApiError {
         url: String,
         body: String,
     },
+    #[error(
+        "the hub rejected this token: it may be expired or revoked, or the hub may require a fresh browser login; sign in to the hub web UI and retry ({method} {url} returned 403: {body})"
+    )]
+    AuthRejected {
+        method: &'static str,
+        url: String,
+        body: String,
+    },
     #[error("this server does not expose the terminals API ({url} returned 404)")]
     TerminalsUnsupported { url: String },
     #[error("{method} {url} returned {status}: {body}")]
@@ -88,7 +96,17 @@ pub async fn check(
             method,
             url: url.to_string(),
         }),
-        403 => Err(ApiError::Forbidden {
+        // JupyterHub returns 403 for two distinct causes: a valid token missing
+        // a scope (body names the missing scope, e.g. "requires any of
+        // [admin:users]") and a token that fails to resolve to an authorized
+        // user at all (expired, revoked, or the authenticator needs a fresh
+        // browser login), which comes back as a bare {"message": "Forbidden"}.
+        403 if body.to_lowercase().contains("scope") => Err(ApiError::Forbidden {
+            method,
+            url: url.to_string(),
+            body,
+        }),
+        403 => Err(ApiError::AuthRejected {
             method,
             url: url.to_string(),
             body,

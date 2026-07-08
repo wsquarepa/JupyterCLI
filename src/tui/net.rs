@@ -468,7 +468,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         dispatch(Effect::Refresh { op: 0, loud: true }, client, tx);
         match rx.recv().await.unwrap() {
-            AppEvent::OpFailed { message, .. } => assert!(message.contains("scope")),
+            AppEvent::OpFailed { message, .. } => assert!(message.contains("browser login")),
             other => panic!("unexpected event: {other:?}"),
         }
     }

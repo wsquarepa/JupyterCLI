@@ -434,6 +434,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forbidden_with_scope_body_keeps_scope_copy() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/hub/api/user"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"status": 403, "message": "Action is not authorized with current scopes; requires any of [admin:users]"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let err = client(&server).await.whoami().await.unwrap_err();
+        assert!(err.to_string().contains("scope"));
+    }
+
+    #[tokio::test]
+    async fn forbidden_with_bare_body_maps_to_auth_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/hub/api/user"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string(r#"{"status": 403, "message": "Forbidden"}"#),
+            )
+            .mount(&server)
+            .await;
+        let err = client(&server).await.whoami().await.unwrap_err();
+        assert!(err.to_string().contains("browser login"));
+    }
+
+    #[tokio::test]
     async fn get_retries_on_5xx_then_raises() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
