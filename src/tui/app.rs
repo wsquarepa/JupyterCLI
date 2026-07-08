@@ -12,6 +12,7 @@ pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"
 pub const HOVER_DEBOUNCE: Duration = Duration::from_millis(300);
 pub const REJECT_FLASH_DURATION: Duration = Duration::from_millis(150);
 pub const SPAWN_FLASH_TICKS: u8 = 9;
+pub const GHOST_FLASH_TICKS: u8 = 4;
 const SPAWN_CREEP_CAP: f32 = 96.0;
 const SPAWN_CREEP_LEAD: f32 = 12.0;
 
@@ -94,6 +95,24 @@ impl SpawnView {
         let step = ((cap - self.shown) * 0.04).max(0.12);
         self.shown = (self.shown + step).max(self.reported as f32).min(cap);
     }
+}
+
+/// Placeholder card shown the instant `n` is pressed, before the hub
+/// confirms the new terminal. `Creating` persists until `TerminalCreated`
+/// or `OpFailed` resolves it; the resolved phases flash for
+/// `GHOST_FLASH_TICKS` ticks and then clear themselves even without a
+/// follow-up fetch.
+#[derive(Debug)]
+pub enum GhostPhase {
+    Creating,
+    Confirmed { ticks_left: u8 },
+    Failed { ticks_left: u8 },
+}
+
+#[derive(Debug)]
+pub struct Ghost {
+    pub op: u64,
+    pub phase: GhostPhase,
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +284,7 @@ pub struct App {
     pub hover: Option<HoverState>,
     pub peek: Option<PeekState>,
     pub spawn: Option<SpawnView>,
+    pub ghost: Option<Ghost>,
     server_hover: Option<ServerHover>,
     peek_op: Option<u64>,
     pending_select: Option<String>,
@@ -301,6 +321,7 @@ impl App {
             hover: None,
             peek: None,
             spawn: None,
+            ghost: None,
             server_hover: None,
             peek_op: None,
             pending_select: None,
@@ -414,6 +435,18 @@ impl App {
             // The hub may report the server stopped or still pending; refresh
             // the rows quietly so the list does not lie after a failed spawn.
             self.request_reconcile();
+        }
+        if let Some(ghost) = &mut self.ghost {
+            let expired = match &mut ghost.phase {
+                GhostPhase::Creating => false,
+                GhostPhase::Confirmed { ticks_left } | GhostPhase::Failed { ticks_left } => {
+                    *ticks_left = ticks_left.saturating_sub(1);
+                    *ticks_left == 0
+                }
+            };
+            if expired {
+                self.ghost = None;
+            }
         }
         if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog
             && let Some(since) = create.flash
@@ -635,6 +668,12 @@ impl App {
                         self.grid_cursor = index;
                         self.ensure_grid_cursor_visible();
                     }
+                    if matches!(
+                        self.ghost.as_ref().map(|g| &g.phase),
+                        Some(GhostPhase::Confirmed { .. })
+                    ) {
+                        self.ghost = None;
+                    }
                 }
             }
             AppEvent::Progress { op, message, pct } => {
@@ -694,6 +733,13 @@ impl App {
                     create.error = Some(message.clone());
                     create.step = super::dialogs::CreateStep::Name;
                 }
+                if let Some(ghost) = &mut self.ghost
+                    && ghost.op == op
+                {
+                    ghost.phase = GhostPhase::Failed {
+                        ticks_left: GHOST_FLASH_TICKS,
+                    };
+                }
                 self.set_status(message, true, now);
             }
             AppEvent::TerminalCreated {
@@ -702,6 +748,13 @@ impl App {
                 terminal,
             } => {
                 self.finish_op(op);
+                if let Some(ghost) = &mut self.ghost
+                    && ghost.op == op
+                {
+                    ghost.phase = GhostPhase::Confirmed {
+                        ticks_left: GHOST_FLASH_TICKS,
+                    };
+                }
                 self.set_status(
                     format!("created terminal {terminal} on {server}"),
                     false,
@@ -1033,7 +1086,12 @@ impl App {
         else {
             return;
         };
-        self.push_effect(Effect::NewTerminal { op: 0, server, url });
+        if let Some(op) = self.push_effect(Effect::NewTerminal { op: 0, server, url }) {
+            self.ghost = Some(Ghost {
+                op,
+                phase: GhostPhase::Creating,
+            });
+        }
     }
 
     fn confirm_stop_server(&mut self, now: Instant) {
@@ -1459,6 +1517,104 @@ mod tests {
         assert!(app.take_effects().is_empty());
         let status = app.status.as_ref().expect("cap must set a status");
         assert_eq!(status.text, "terminal limit reached (999)");
+    }
+
+    #[test]
+    fn create_terminal_shows_a_ghost_until_confirmed() {
+        let (mut app, now) = committed_app(&["1"]);
+        app.on_key(&press(KeyCode::Char('n')), now);
+        let effects = app.take_effects();
+        let op = match effects.as_slice() {
+            [Effect::NewTerminal { op, .. }] => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        assert!(matches!(
+            app.ghost,
+            Some(Ghost {
+                phase: GhostPhase::Creating,
+                ..
+            })
+        ));
+        app.apply(
+            AppEvent::TerminalCreated {
+                op,
+                server: "default".to_string(),
+                terminal: "2".to_string(),
+            },
+            now,
+        );
+        assert!(matches!(
+            app.ghost.as_ref().unwrap().phase,
+            GhostPhase::Confirmed { .. }
+        ));
+        // The reconcile fetch it pushes is silent.
+        let effects = app.take_effects();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::FetchTerminals { loud: false, .. }]
+        ));
+        // The refreshed list drops the ghost: the real card replaced it.
+        app.apply(
+            AppEvent::Terminals {
+                op: 0,
+                server: "default".to_string(),
+                terminals: vec![
+                    TerminalRow {
+                        name: "1".to_string(),
+                    },
+                    TerminalRow {
+                        name: "2".to_string(),
+                    },
+                ],
+            },
+            now,
+        );
+        assert!(app.ghost.is_none());
+    }
+
+    #[test]
+    fn ghost_flash_expires_by_ticks() {
+        let (mut app, now) = committed_app(&["1"]);
+        app.on_key(&press(KeyCode::Char('n')), now);
+        let op = app.ghost.as_ref().unwrap().op;
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::TerminalCreated {
+                op,
+                server: "default".to_string(),
+                terminal: "2".to_string(),
+            },
+            now,
+        );
+        for _ in 0..usize::from(GHOST_FLASH_TICKS) {
+            app.tick(now);
+        }
+        assert!(app.ghost.is_none(), "confirm flash expires without a fetch");
+    }
+
+    #[test]
+    fn failed_create_flashes_red_then_clears() {
+        let (mut app, now) = committed_app(&["1"]);
+        app.on_key(&press(KeyCode::Char('n')), now);
+        let op = app.ghost.as_ref().unwrap().op;
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::OpFailed {
+                op,
+                message: "server rejected the request".to_string(),
+            },
+            now,
+        );
+        assert!(matches!(
+            app.ghost.as_ref().unwrap().phase,
+            GhostPhase::Failed { .. }
+        ));
+        assert!(app.status.as_ref().is_some_and(|s| s.error));
+        for _ in 0..usize::from(GHOST_FLASH_TICKS) {
+            app.tick(now);
+        }
+        assert!(app.ghost.is_none());
+        assert_eq!(app.terminals.len(), 1, "no terminal was added");
     }
 
     #[test]
