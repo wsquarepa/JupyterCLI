@@ -20,6 +20,12 @@ use crate::config::{self, Config, ConfigError};
 const TICK_EVERY: Duration = Duration::from_millis(100);
 
 pub async fn run(hub_flag: Option<&str>) -> Result<(), CliError> {
+    let log_path = crate::logging::init_tui().ok();
+    let print_log_path = || {
+        if let Some(path) = log_path.as_deref() {
+            eprintln!("log: {}", path.display());
+        }
+    };
     let cfg = match config::load() {
         Ok(cfg) => cfg,
         Err(ConfigError::NotFound(_)) => {
@@ -29,14 +35,17 @@ pub async fn run(hub_flag: Option<&str>) -> Result<(), CliError> {
                 Ok(Some(cfg)) => {
                     let result = dashboard_loop(&mut terminal, cfg, hub_flag).await;
                     ratatui::restore();
+                    print_log_path();
                     return result;
                 }
                 Ok(None) => {
                     ratatui::restore();
+                    print_log_path();
                     return Ok(());
                 }
                 Err(e) => {
                     ratatui::restore();
+                    print_log_path();
                     return Err(e);
                 }
             }
@@ -46,6 +55,7 @@ pub async fn run(hub_flag: Option<&str>) -> Result<(), CliError> {
     let mut terminal = ratatui::init();
     let result = dashboard_loop(&mut terminal, cfg, hub_flag).await;
     ratatui::restore();
+    print_log_path();
     result
 }
 

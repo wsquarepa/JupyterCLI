@@ -282,6 +282,10 @@ pub fn main() -> std::process::ExitCode {
             err.exit();
         }
     };
+    match &cli.command {
+        None => {}
+        Some(_) => crate::logging::init_cli(cli.verbose),
+    }
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {

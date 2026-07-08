@@ -3,8 +3,12 @@
 //! corrupt the alternate screen. Token material and terminal payload bytes are
 //! never recorded; a token appears only as a fingerprint.
 
+use std::path::PathBuf;
+
 use time::OffsetDateTime;
 use time::macros::format_description;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::time::UtcTime;
 
 pub const BODY_SNIPPET_CHARS: usize = 2000;
 
@@ -44,6 +48,47 @@ pub fn fingerprint(secret: &str) -> String {
 /// Truncate on a char boundary so multibyte responses cannot panic the logger.
 pub fn snippet(body: &str, max_chars: usize) -> String {
     body.chars().take(max_chars).collect()
+}
+
+/// Install the global stderr subscriber for CLI runs. `RUST_LOG` wins when set;
+/// otherwise `cli_directive(verbose)`.
+pub fn init_cli(verbose: bool) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(cli_directive(verbose)));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_timer(UtcTime::rfc_3339())
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// Install the global file subscriber for the TUI and return the log path.
+/// Any I/O failure returns Err WITHOUT installing a subscriber: the diagnostics
+/// channel must never prevent the TUI from launching, and under the alternate
+/// screen there is nowhere to surface the error. With no subscriber installed,
+/// tracing events become no-ops.
+pub fn init_tui() -> std::io::Result<PathBuf> {
+    let dir = dirs::state_dir()
+        .or_else(dirs::cache_dir)
+        .ok_or_else(|| std::io::Error::other("no state or cache directory"))?
+        .join("jhc")
+        .join("logs");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(log_file_name(OffsetDateTime::now_utc(), std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(TUI_DIRECTIVE));
+    // Mutex<File> serializes concurrent task writes so events never interleave.
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_timer(UtcTime::rfc_3339())
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(file))
+        .init();
+    Ok(path)
 }
 
 #[cfg(test)]
