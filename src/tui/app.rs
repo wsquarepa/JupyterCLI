@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -14,8 +14,20 @@ pub const REJECT_FLASH_DURATION: Duration = Duration::from_millis(150);
 pub const SPAWN_FLASH_TICKS: u8 = 9;
 pub const GHOST_FLASH_TICKS: u8 = 4;
 pub const DISSOLVE_TICKS: u32 = 7;
+pub const SKELETON_SHOW_TICKS: u32 = 3;
+pub const SKELETON_MIN_TICKS: u32 = 3;
 const SPAWN_CREEP_CAP: f32 = 96.0;
 const SPAWN_CREEP_LEAD: f32 = 12.0;
+
+/// Tracks a loud terminal fetch so the grid can show a stale-shaped skeleton
+/// instead of flickering blank, and hold a response that lands mid-skeleton
+/// for a minimum display window rather than swapping the list out instantly.
+#[derive(Debug)]
+pub struct GridFetch {
+    pub op: u64,
+    pub age_ticks: u32,
+    pub pending: Option<(String, Vec<TerminalRow>)>,
+}
 
 #[derive(Debug)]
 pub struct HoverState {
@@ -299,6 +311,8 @@ pub struct App {
     pub spawn: Option<SpawnView>,
     pub ghost: Option<Ghost>,
     pub dissolve: Option<Dissolve>,
+    pub grid_fetch: Option<GridFetch>,
+    pub last_known_counts: HashMap<String, usize>,
     server_hover: Option<ServerHover>,
     peek_op: Option<u64>,
     pending_select: Option<String>,
@@ -337,6 +351,8 @@ impl App {
             spawn: None,
             ghost: None,
             dissolve: None,
+            grid_fetch: None,
+            last_known_counts: HashMap::new(),
             server_hover: None,
             peek_op: None,
             pending_select: None,
@@ -364,12 +380,46 @@ impl App {
             .committed_row()
             .and_then(|r| r.url.clone().map(|u| (r.display.clone(), u)));
         let (server, url) = target?;
-        self.push_effect(Effect::FetchTerminals {
+        let op = self.push_effect(Effect::FetchTerminals {
             op: 0,
             server,
             url,
             loud,
-        })
+        });
+        if loud && let Some(op) = op {
+            self.grid_fetch = Some(GridFetch {
+                op,
+                age_ticks: 0,
+                pending: None,
+            });
+        }
+        op
+    }
+
+    /// Whether a loud terminal fetch is currently in flight; drives the grid
+    /// border pulse from tick zero, before the skeleton itself appears.
+    pub fn grid_loading(&self) -> bool {
+        self.grid_fetch.is_some()
+    }
+
+    /// Whether the skeleton placeholder should be drawn: a loud fetch is in
+    /// flight and has outlasted the show threshold, so a fast response never
+    /// flickers a skeleton in and back out.
+    pub fn skeleton_visible(&self) -> bool {
+        self.grid_fetch
+            .as_ref()
+            .is_some_and(|f| f.age_ticks >= SKELETON_SHOW_TICKS)
+    }
+
+    /// Card count for the skeleton, taken from the committed server's last
+    /// known terminal count so the placeholder keeps the stale list's shape.
+    pub fn skeleton_count(&self) -> usize {
+        self.committed_server
+            .as_deref()
+            .and_then(|s| self.last_known_counts.get(s))
+            .copied()
+            .unwrap_or(0)
+            .max(1)
     }
 
     /// Op ids are stamped here; construction sites use a 0 placeholder.
@@ -477,6 +527,19 @@ impl App {
             self.grid_cursor = self.grid_cursor.min(count.saturating_sub(1));
             self.ensure_grid_cursor_visible();
             self.fetch_committed_terminals(false);
+        }
+        let mut matured: Option<(String, Vec<TerminalRow>)> = None;
+        if let Some(fetch) = &mut self.grid_fetch {
+            fetch.age_ticks += 1;
+            if fetch.age_ticks >= SKELETON_SHOW_TICKS + SKELETON_MIN_TICKS
+                && fetch.pending.is_some()
+            {
+                matured = fetch.pending.take();
+            }
+        }
+        if let Some((server, terminals)) = matured {
+            self.grid_fetch = None;
+            self.apply_terminals(server, terminals);
         }
         if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog
             && let Some(since) = create.flash
@@ -678,32 +741,22 @@ impl App {
                 terminals,
             } => {
                 self.finish_op(op);
-                let valid = self.committed_server.as_deref() == Some(server.as_str())
-                    && self.committed_row().is_some_and(|s| s.ready);
-                if valid {
-                    self.terminals = sorted_terminals(terminals);
-                    let count = self.displayed_terminals().len();
-                    self.grid_cursor = self.grid_cursor.min(count.saturating_sub(1));
-                    self.ensure_grid_cursor_visible();
-                    // A pending create points the cursor at its new terminal
-                    // once the list refresh shows it; a missing name clears the
-                    // request so it cannot hijack a later refresh of the same
-                    // server (switching servers clears it in commit_cursor_server).
-                    if let Some(name) = self.pending_select.take()
-                        && let Some(index) = self
-                            .displayed_terminals()
-                            .iter()
-                            .position(|t| t.name == name)
-                    {
-                        self.grid_cursor = index;
-                        self.ensure_grid_cursor_visible();
+                let hold = self.grid_fetch.as_ref().is_some_and(|f| {
+                    f.op == op
+                        && f.age_ticks >= SKELETON_SHOW_TICKS
+                        && f.age_ticks < SKELETON_SHOW_TICKS + SKELETON_MIN_TICKS
+                });
+                if hold {
+                    // Flicker guard: the skeleton is on screen; hold the
+                    // response until it has shown for the minimum window.
+                    if let Some(fetch) = &mut self.grid_fetch {
+                        fetch.pending = Some((server, terminals));
                     }
-                    if matches!(
-                        self.ghost.as_ref().map(|g| &g.phase),
-                        Some(GhostPhase::Confirmed { .. })
-                    ) {
-                        self.ghost = None;
+                } else {
+                    if self.grid_fetch.as_ref().is_some_and(|f| f.op == op) {
+                        self.grid_fetch = None;
                     }
+                    self.apply_terminals(server, terminals);
                 }
             }
             AppEvent::Progress { op, message, pct } => {
@@ -781,6 +834,9 @@ impl App {
                 if self.dissolve.as_ref().is_some_and(|d| d.op == op) {
                     self.dissolve = None;
                 }
+                if self.grid_fetch.as_ref().is_some_and(|f| f.op == op) {
+                    self.grid_fetch = None;
+                }
                 self.set_status(message, true, now);
             }
             AppEvent::TerminalCreated {
@@ -842,6 +898,41 @@ impl App {
         self.sync_server_hover(now);
     }
 
+    /// Applies a terminal list fetched for `server` to the grid, ignoring it
+    /// if the commitment has since moved on. Shared by the fast path in the
+    /// `Terminals` handler and the matured-skeleton path in `tick`.
+    fn apply_terminals(&mut self, server: String, terminals: Vec<TerminalRow>) {
+        let valid = self.committed_server.as_deref() == Some(server.as_str())
+            && self.committed_row().is_some_and(|s| s.ready);
+        if valid {
+            self.last_known_counts
+                .insert(server.clone(), terminals.len());
+            self.terminals = sorted_terminals(terminals);
+            let count = self.displayed_terminals().len();
+            self.grid_cursor = self.grid_cursor.min(count.saturating_sub(1));
+            self.ensure_grid_cursor_visible();
+            // A pending create points the cursor at its new terminal
+            // once the list refresh shows it; a missing name clears the
+            // request so it cannot hijack a later refresh of the same
+            // server (switching servers clears it in commit_cursor_server).
+            if let Some(name) = self.pending_select.take()
+                && let Some(index) = self
+                    .displayed_terminals()
+                    .iter()
+                    .position(|t| t.name == name)
+            {
+                self.grid_cursor = index;
+                self.ensure_grid_cursor_visible();
+            }
+            if matches!(
+                self.ghost.as_ref().map(|g| &g.phase),
+                Some(GhostPhase::Confirmed { .. })
+            ) {
+                self.ghost = None;
+            }
+        }
+    }
+
     /// After a server refresh: keep a still-ready committed server (and
     /// refetch its terminals so the grid stays fresh), or drop a commitment
     /// whose server vanished or stopped.
@@ -867,6 +958,7 @@ impl App {
         self.terminals.clear();
         self.grid_cursor = 0;
         self.grid_scroll = 0;
+        self.grid_fetch = None;
         if self.focus == Focus::Grid {
             self.focus = Focus::Servers;
         }
@@ -2063,6 +2155,80 @@ mod tests {
             ),
             "unexpected effects: {effects:?}"
         );
+    }
+
+    #[test]
+    fn fast_fetch_skips_the_skeleton() {
+        let (mut app, now) = committed_app(&[]); // committing pushed a loud fetch
+        // committed_app already applied Terminals; re-trigger a loud fetch via r + refresh round trip,
+        // or directly: press Esc to servers, move, Enter back. Simplest: call the helper.
+        let op = app.fetch_committed_terminals(true).unwrap();
+        let _ = app.take_effects();
+        assert!(app.grid_loading());
+        app.tick(now);
+        assert!(!app.skeleton_visible(), "below the show threshold");
+        app.apply(
+            AppEvent::Terminals {
+                op,
+                server: "default".to_string(),
+                terminals: vec![TerminalRow {
+                    name: "1".to_string(),
+                }],
+            },
+            now,
+        );
+        assert_eq!(app.terminals.len(), 1, "fast responses apply immediately");
+        assert!(app.grid_fetch.is_none());
+    }
+
+    #[test]
+    fn slow_fetch_shows_skeleton_and_holds_it_briefly() {
+        let (mut app, now) = committed_app(&["1", "2", "3"]);
+        let op = app.fetch_committed_terminals(true).unwrap();
+        let _ = app.take_effects();
+        for _ in 0..SKELETON_SHOW_TICKS {
+            app.tick(now);
+        }
+        assert!(app.skeleton_visible());
+        assert_eq!(
+            app.skeleton_count(),
+            3,
+            "stale shape from last_known_counts"
+        );
+        // Response lands during the minimum-display window: stash it.
+        app.apply(
+            AppEvent::Terminals {
+                op,
+                server: "default".to_string(),
+                terminals: vec![TerminalRow {
+                    name: "9".to_string(),
+                }],
+            },
+            now,
+        );
+        assert_eq!(
+            app.terminals.len(),
+            3,
+            "list not applied during min display"
+        );
+        for _ in 0..SKELETON_MIN_TICKS {
+            app.tick(now);
+        }
+        assert!(app.grid_fetch.is_none());
+        assert_eq!(app.terminals.len(), 1);
+        assert_eq!(app.terminals[0].name, "9");
+    }
+
+    #[test]
+    fn silent_fetch_never_shows_a_skeleton() {
+        let (mut app, now) = committed_app(&["1"]);
+        app.fetch_committed_terminals(false);
+        let _ = app.take_effects();
+        for _ in 0..20 {
+            app.tick(now);
+        }
+        assert!(!app.skeleton_visible());
+        assert!(!app.grid_loading());
     }
 
     #[test]
