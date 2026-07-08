@@ -375,11 +375,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
             Ok(ok)
         }
         Some(Command::Stop { server }) => {
-            server::stop(
-                &Ctx::load(cli.hub.as_deref())?,
-                server.as_deref(),
-            )
-            .await?;
+            server::stop(&Ctx::load(cli.hub.as_deref())?, server.as_deref()).await?;
             Ok(ok)
         }
         Some(Command::Preset(cmd)) => {
@@ -418,22 +414,11 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
             dst,
             recursive,
         }) => {
-            fs::cp(
-                &Ctx::load(cli.hub.as_deref())?,
-                &src,
-                &dst,
-                recursive,
-            )
-            .await?;
+            fs::cp(&Ctx::load(cli.hub.as_deref())?, &src, &dst, recursive).await?;
             Ok(ok)
         }
         Some(Command::Rm { path, recursive }) => {
-            fs::rm(
-                &Ctx::load(cli.hub.as_deref())?,
-                &path,
-                recursive,
-            )
-            .await?;
+            fs::rm(&Ctx::load(cli.hub.as_deref())?, &path, recursive).await?;
             Ok(ok)
         }
         Some(Command::Token(cmd)) => {
