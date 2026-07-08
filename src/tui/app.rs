@@ -11,6 +11,9 @@ pub const STATUS_TTL: Duration = Duration::from_secs(5);
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub const HOVER_DEBOUNCE: Duration = Duration::from_millis(300);
 pub const REJECT_FLASH_DURATION: Duration = Duration::from_millis(150);
+pub const SPAWN_FLASH_TICKS: u8 = 9;
+const SPAWN_CREEP_CAP: f32 = 96.0;
+const SPAWN_CREEP_LEAD: f32 = 12.0;
 
 #[derive(Debug)]
 pub struct HoverState {
@@ -41,6 +44,56 @@ pub struct PeekState {
 pub enum Focus {
     Servers,
     Grid,
+}
+
+#[derive(Debug)]
+pub enum SpawnOutcome {
+    Ready { ticks_left: u8 },
+    Failed { message: String, ticks_left: u8 },
+}
+
+#[derive(Debug)]
+pub struct SpawnLogLine {
+    pub at_ticks: u32,
+    pub message: String,
+}
+
+#[derive(Debug)]
+pub struct SpawnView {
+    pub op: u64,
+    pub server: String, // display name for the takeover title
+    pub reported: u64,
+    pub shown: f32,
+    pub elapsed_ticks: u32,
+    pub log: Vec<SpawnLogLine>,
+    pub outcome: Option<SpawnOutcome>,
+}
+
+impl SpawnView {
+    fn new(op: u64, server: String) -> Self {
+        SpawnView {
+            op,
+            server,
+            reported: 0,
+            shown: 0.0,
+            elapsed_ticks: 0,
+            log: Vec::new(),
+            outcome: None,
+        }
+    }
+
+    /// Creep rule: the bar always moves between SSE events, snaps forward on
+    /// every real event, and reaches 100 only once the spawn reports ready.
+    fn advance(&mut self) {
+        self.elapsed_ticks += 1;
+        let cap = if self.reported >= 100 {
+            100.0
+        } else {
+            (self.reported as f32 + SPAWN_CREEP_LEAD).min(SPAWN_CREEP_CAP)
+        };
+        let step = ((cap - self.shown) * 0.04).max(0.12);
+        self.shown = (self.shown + step).max(self.reported as f32).min(cap);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +264,7 @@ pub struct App {
     pub spinner_frame: usize,
     pub hover: Option<HoverState>,
     pub peek: Option<PeekState>,
+    pub spawn: Option<SpawnView>,
     server_hover: Option<ServerHover>,
     peek_op: Option<u64>,
     pending_select: Option<String>,
@@ -246,6 +300,7 @@ impl App {
             spinner_frame: 0,
             hover: None,
             peek: None,
+            spawn: None,
             server_hover: None,
             peek_op: None,
             pending_select: None,
@@ -339,6 +394,27 @@ impl App {
             self.status = None;
         }
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        let mut spawn_failed_cleared = false;
+        if let Some(spawn) = &mut self.spawn {
+            spawn.advance();
+            let cleared = match &mut spawn.outcome {
+                Some(SpawnOutcome::Ready { ticks_left })
+                | Some(SpawnOutcome::Failed { ticks_left, .. }) => {
+                    *ticks_left = ticks_left.saturating_sub(1);
+                    *ticks_left == 0
+                }
+                None => false,
+            };
+            if cleared {
+                spawn_failed_cleared = matches!(spawn.outcome, Some(SpawnOutcome::Failed { .. }));
+                self.spawn = None;
+            }
+        }
+        if spawn_failed_cleared {
+            // The hub may report the server stopped or still pending; refresh
+            // the rows quietly so the list does not lie after a failed spawn.
+            self.request_reconcile();
+        }
         if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog
             && let Some(since) = create.flash
             && now.duration_since(since) > REJECT_FLASH_DURATION
@@ -561,9 +637,17 @@ impl App {
                     }
                 }
             }
-            AppEvent::Progress { message, .. } => {
-                if !message.is_empty() {
-                    self.set_status(message, false, now);
+            AppEvent::Progress { op, message, pct } => {
+                if let Some(spawn) = &mut self.spawn
+                    && spawn.op == op
+                {
+                    if let Some(pct) = pct {
+                        spawn.reported = spawn.reported.max(pct);
+                    }
+                    if !message.is_empty() {
+                        let at_ticks = spawn.elapsed_ticks;
+                        spawn.log.push(SpawnLogLine { at_ticks, message });
+                    }
                 }
             }
             AppEvent::OpDone { op, message } => {
@@ -578,6 +662,15 @@ impl App {
                     self.dialog = None;
                     self.pending_server_select = Some(name);
                 }
+                if let Some(spawn) = &mut self.spawn
+                    && spawn.op == op
+                {
+                    spawn.reported = 100;
+                    spawn.shown = 100.0;
+                    spawn.outcome = Some(SpawnOutcome::Ready {
+                        ticks_left: SPAWN_FLASH_TICKS,
+                    });
+                }
                 self.set_status(message, false, now);
                 self.request_reconcile();
             }
@@ -585,6 +678,14 @@ impl App {
                 self.finish_op(op);
                 if self.loud_refresh_op == Some(op) {
                     self.loud_refresh_op = None;
+                }
+                if let Some(spawn) = &mut self.spawn
+                    && spawn.op == op
+                {
+                    spawn.outcome = Some(SpawnOutcome::Failed {
+                        message: message.clone(),
+                        ticks_left: SPAWN_FLASH_TICKS,
+                    });
                 }
                 if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog
                     && create.op == Some(op)
@@ -704,26 +805,47 @@ impl App {
         self.sync_server_hover(now);
     }
 
-    fn handle_key(&mut self, key: &KeyEvent, now: Instant) {
-        if let Some(dialog) = &mut self.dialog {
-            match super::dialogs::handle_key(dialog, key, now) {
-                super::dialogs::Outcome::Stay => {}
-                super::dialogs::Outcome::Close => self.dialog = None,
-                super::dialogs::Outcome::Commit(effect) => {
-                    self.dialog = None;
-                    self.push_effect(effect);
-                }
-                super::dialogs::Outcome::Spawn(effect) => {
-                    let op = self.push_effect(effect);
-                    if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog {
-                        create.op = op;
-                        create.step = super::dialogs::CreateStep::Starting;
-                    }
-                }
-                super::dialogs::Outcome::SavePreset { name, options } => {
-                    self.push_effect(Effect::SavePreset { name, options });
+    fn on_dialog_outcome(&mut self, outcome: super::dialogs::Outcome) {
+        match outcome {
+            super::dialogs::Outcome::Stay => {}
+            super::dialogs::Outcome::Close => self.dialog = None,
+            super::dialogs::Outcome::Commit(effect) => {
+                self.dialog = None;
+                self.push_tracked(effect);
+            }
+            super::dialogs::Outcome::Spawn(effect) => {
+                let op = self.push_tracked(effect);
+                if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog {
+                    create.op = op;
+                    create.step = super::dialogs::CreateStep::Starting;
                 }
             }
+            super::dialogs::Outcome::SavePreset { name, options } => {
+                self.push_effect(Effect::SavePreset { name, options });
+            }
+        }
+    }
+
+    /// push_effect plus client-side expectation state for effects that get
+    /// region-scale feedback (spawn takeover now; dissolve joins in later).
+    fn push_tracked(&mut self, effect: Effect) -> Option<u64> {
+        let spawn_server = match &effect {
+            Effect::Start { server, .. } => {
+                Some(server.clone().unwrap_or_else(|| "default".to_string()))
+            }
+            _ => None,
+        };
+        let op = self.push_effect(effect);
+        if let (Some(server), Some(op)) = (spawn_server, op) {
+            self.spawn = Some(SpawnView::new(op, server));
+        }
+        op
+    }
+
+    fn handle_key(&mut self, key: &KeyEvent, now: Instant) {
+        if let Some(dialog) = &mut self.dialog {
+            let outcome = super::dialogs::handle_key(dialog, key, now);
+            self.on_dialog_outcome(outcome);
             return;
         }
         match key.code {
@@ -2103,5 +2225,144 @@ mod tests {
             now,
         );
         assert_eq!(app.servers[app.server_cursor].display, "default");
+    }
+
+    #[test]
+    fn spawn_creep_always_moves_snaps_and_caps() {
+        let mut view = SpawnView::new(3, "gpu".to_string());
+        view.reported = 10;
+        let mut last = view.shown;
+        for _ in 0..300 {
+            view.advance();
+            assert!(view.shown >= last, "creep must be monotonic");
+            assert!(view.shown <= 22.0, "cap is reported + 12");
+            last = view.shown;
+        }
+        assert!(view.shown > 21.0, "creep must approach the cap");
+        view.reported = 90;
+        view.advance();
+        assert!(view.shown >= 90.0, "snap to the reported percent");
+        view.reported = 100;
+        for _ in 0..300 {
+            view.advance();
+        }
+        assert!(view.shown > 99.0, "only ready reaches 100");
+    }
+
+    #[test]
+    fn start_dialog_commit_creates_spawn_view_and_progress_feeds_it() {
+        let now = Instant::now();
+        let mut app = App::new("hub".to_string(), Default::default(), 999, (100, 30));
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::Refreshed {
+                op: 1,
+                username: "u".to_string(),
+                servers: vec![row("gpu", false)],
+            },
+            now,
+        );
+        let _ = app.take_effects();
+        app.on_dialog_outcome(super::super::dialogs::Outcome::Commit(Effect::Start {
+            op: 0,
+            server: Some("gpu".to_string()),
+            options: Default::default(),
+        }));
+        let effects = app.take_effects();
+        let op = match effects.as_slice() {
+            [Effect::Start { op, .. }] => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        let spawn = app.spawn.as_ref().expect("spawn view created");
+        assert_eq!(spawn.op, op);
+        assert_eq!(spawn.server, "gpu");
+
+        app.apply(
+            AppEvent::Progress {
+                op,
+                message: "Pod scheduled".to_string(),
+                pct: Some(35),
+            },
+            now,
+        );
+        let spawn = app.spawn.as_ref().unwrap();
+        assert_eq!(spawn.reported, 35);
+        assert_eq!(spawn.log.len(), 1);
+        assert_eq!(spawn.log[0].message, "Pod scheduled");
+        // A stray progress for another op is ignored.
+        app.apply(
+            AppEvent::Progress {
+                op: op + 100,
+                message: "noise".to_string(),
+                pct: Some(99),
+            },
+            now,
+        );
+        assert_eq!(app.spawn.as_ref().unwrap().reported, 35);
+    }
+
+    #[test]
+    fn spawn_ready_flashes_then_clears() {
+        let now = Instant::now();
+        let mut app = App::new("hub".to_string(), Default::default(), 999, (100, 30));
+        let _ = app.take_effects();
+        app.on_dialog_outcome(super::super::dialogs::Outcome::Commit(Effect::Start {
+            op: 0,
+            server: None,
+            options: Default::default(),
+        }));
+        let op = app.spawn.as_ref().unwrap().op;
+        assert_eq!(app.spawn.as_ref().unwrap().server, "default");
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::OpDone {
+                op,
+                message: "server ready".to_string(),
+            },
+            now,
+        );
+        let spawn = app.spawn.as_ref().unwrap();
+        assert!(matches!(spawn.outcome, Some(SpawnOutcome::Ready { .. })));
+        assert!(spawn.shown >= 100.0);
+        for _ in 0..usize::from(SPAWN_FLASH_TICKS) {
+            app.tick(now);
+        }
+        assert!(app.spawn.is_none(), "takeover ends after the flash");
+    }
+
+    #[test]
+    fn spawn_failure_flashes_then_reconciles() {
+        let now = Instant::now();
+        let mut app = App::new("hub".to_string(), Default::default(), 999, (100, 30));
+        let _ = app.take_effects();
+        app.on_dialog_outcome(super::super::dialogs::Outcome::Commit(Effect::Start {
+            op: 0,
+            server: Some("gpu".to_string()),
+            options: Default::default(),
+        }));
+        let op = app.spawn.as_ref().unwrap().op;
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::OpFailed {
+                op,
+                message: "quota exceeded".to_string(),
+            },
+            now,
+        );
+        assert!(matches!(
+            app.spawn.as_ref().unwrap().outcome,
+            Some(SpawnOutcome::Failed { .. })
+        ));
+        for _ in 0..usize::from(SPAWN_FLASH_TICKS) {
+            app.tick(now);
+        }
+        assert!(app.spawn.is_none());
+        let effects = app.take_effects();
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Refresh { loud: false, .. })),
+            "failed spawn reconciles the server rows silently: {effects:?}"
+        );
     }
 }
