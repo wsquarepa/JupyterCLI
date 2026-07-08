@@ -71,7 +71,9 @@ pub enum AppEvent {
         terminals: Vec<TerminalRow>,
     },
     Progress {
+        op: u64,
         message: String,
+        pct: Option<u64>,
     },
     OpDone {
         op: u64,
@@ -559,7 +561,11 @@ impl App {
                     }
                 }
             }
-            AppEvent::Progress { message } => self.set_status(message, false, now),
+            AppEvent::Progress { message, .. } => {
+                if !message.is_empty() {
+                    self.set_status(message, false, now);
+                }
+            }
             AppEvent::OpDone { op, message } => {
                 self.finish_op(op);
                 let created = match &self.dialog {

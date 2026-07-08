@@ -215,9 +215,11 @@ async fn start(
     let progress_tx = tx.clone();
     client
         .wait_ready(&user.name, server, |event| {
-            if let Some(message) = &event.message {
+            if event.message.is_some() || event.progress.is_some() {
                 let _ = progress_tx.send(AppEvent::Progress {
-                    message: message.clone(),
+                    op,
+                    message: event.message.clone().unwrap_or_default(),
+                    pct: event.progress,
                 });
             }
         })
@@ -382,12 +384,22 @@ mod tests {
         );
 
         match rx.recv().await.unwrap() {
-            AppEvent::Progress { message } => assert!(message.contains("pod pending")),
+            AppEvent::Progress { op, message, pct } => {
+                assert_eq!(op, 0);
+                assert!(message.contains("pod pending"));
+                assert_eq!(pct, Some(50));
+            }
             other => panic!("unexpected event: {other:?}"),
         }
-        match rx.recv().await.unwrap() {
-            AppEvent::OpDone { message, .. } => assert!(message.contains("ready")),
-            other => panic!("unexpected event: {other:?}"),
+        loop {
+            match rx.recv().await.unwrap() {
+                AppEvent::OpDone { message, .. } => {
+                    assert!(message.contains("ready"));
+                    break;
+                }
+                AppEvent::Progress { .. } => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
         }
     }
 
