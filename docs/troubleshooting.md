@@ -29,6 +29,16 @@ JUPYTERHUB_API_TOKEN=abc123... jhc status
 
 A `403` means the token authenticates but lacks the scope for that operation. JupyterHub tokens carry scopes; a read-only token cannot start servers or manage other users' tokens. Create a token with the scopes you need, or ask your hub administrator.
 
+## Intermittent 403 On A Previously Working Token
+
+A `403` whose body does not name a scope (JupyterHub replies with a bare `Forbidden`) means the token itself failed to resolve to an authorized user, not that it lacks a scope. This usually happens when the hub's authenticator requires a fresh browser login on some interval (for example a CILogon hub with `auth_refresh_age`), even though the token is otherwise valid. Sign in to the hub web UI at `<hub url>/hub/home` and retry.
+
+Set `JHC_DEBUG_LOG=<path>` (works for both the CLI and the TUI) to capture structured request diagnostics, including response bodies, for further investigation:
+
+```sh
+JHC_DEBUG_LOG=~/jhc-debug.log jhc status
+```
+
 ## Config File Permissions Warning
 
 If `jhc` warns that `config.toml` is readable by other users, tighten it:
