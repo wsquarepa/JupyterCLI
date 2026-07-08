@@ -51,7 +51,7 @@ pub fn rows_from_user(user: &User) -> Vec<ServerRow> {
 pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let op = match &effect {
-            Effect::Refresh { op }
+            Effect::Refresh { op, .. }
             | Effect::FetchTerminals { op, .. }
             | Effect::Start { op, .. }
             | Effect::Stop { op, .. }
@@ -66,10 +66,10 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
             }
         };
         let event = match effect {
-            Effect::Refresh { op } => refresh(&client, op).await,
-            Effect::FetchTerminals { op, server, url } => {
-                fetch_terminals(&client, op, server, &url).await
-            }
+            Effect::Refresh { op, .. } => refresh(&client, op).await,
+            Effect::FetchTerminals {
+                op, server, url, ..
+            } => fetch_terminals(&client, op, server, &url).await,
             Effect::Start {
                 op,
                 server,
@@ -328,7 +328,7 @@ mod tests {
             .await;
         let client = HubClient::new(&server.uri(), "tok").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        dispatch(Effect::Refresh { op: 0 }, client, tx);
+        dispatch(Effect::Refresh { op: 0, loud: true }, client, tx);
         match rx.recv().await.unwrap() {
             AppEvent::Refreshed {
                 username, servers, ..
@@ -454,7 +454,7 @@ mod tests {
             .await;
         let client = HubClient::new(&server.uri(), "tok").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        dispatch(Effect::Refresh { op: 0 }, client, tx);
+        dispatch(Effect::Refresh { op: 0, loud: true }, client, tx);
         match rx.recv().await.unwrap() {
             AppEvent::OpFailed { message, .. } => assert!(message.contains("scope")),
             other => panic!("unexpected event: {other:?}"),

@@ -105,11 +105,13 @@ pub enum AppEvent {
 pub enum Effect {
     Refresh {
         op: u64,
+        loud: bool,
     },
     FetchTerminals {
         op: u64,
         server: String,
         url: String,
+        loud: bool,
     },
     Start {
         op: u64,
@@ -153,8 +155,8 @@ impl Effect {
     /// Spinner label for network effects; None for loop-handled effects.
     fn label(&self) -> Option<&'static str> {
         match self {
-            Effect::Refresh { .. } => Some("refreshing"),
-            Effect::FetchTerminals { .. } => Some("loading terminals"),
+            Effect::Refresh { loud, .. } => loud.then_some("refreshing"),
+            Effect::FetchTerminals { loud, .. } => loud.then_some("loading terminals"),
             Effect::Start { .. } => Some("starting"),
             Effect::Stop { .. } => Some("stopping"),
             Effect::NewTerminal { .. } => Some("creating"),
@@ -168,7 +170,7 @@ impl Effect {
 
     fn set_op(&mut self, id: u64) {
         match self {
-            Effect::Refresh { op }
+            Effect::Refresh { op, .. }
             | Effect::FetchTerminals { op, .. }
             | Effect::Start { op, .. }
             | Effect::Stop { op, .. }
@@ -211,6 +213,7 @@ pub struct App {
     peek_op: Option<u64>,
     pending_select: Option<String>,
     pending_server_select: Option<String>,
+    loud_refresh_op: Option<u64>,
     next_op: u64,
     effects: Vec<Effect>,
 }
@@ -245,6 +248,7 @@ impl App {
             peek_op: None,
             pending_select: None,
             pending_server_select: None,
+            loud_refresh_op: None,
             next_op: 1,
             effects: Vec::new(),
         };
@@ -253,7 +257,26 @@ impl App {
     }
 
     fn request_refresh(&mut self) {
-        self.push_effect(Effect::Refresh { op: 0 });
+        self.loud_refresh_op = self.push_effect(Effect::Refresh { op: 0, loud: true });
+    }
+
+    fn request_reconcile(&mut self) {
+        self.push_effect(Effect::Refresh { op: 0, loud: false });
+    }
+
+    /// Refetch the committed server's terminals. Loud fetches carry a spinner
+    /// label and feed the loading visuals; silent ones reconcile in place.
+    fn fetch_committed_terminals(&mut self, loud: bool) -> Option<u64> {
+        let target = self
+            .committed_row()
+            .and_then(|r| r.url.clone().map(|u| (r.display.clone(), u)));
+        let (server, url) = target?;
+        self.push_effect(Effect::FetchTerminals {
+            op: 0,
+            server,
+            url,
+            loud,
+        })
     }
 
     /// Op ids are stamped here; construction sites use a 0 placeholder.
@@ -284,6 +307,10 @@ impl App {
                 *label,
             )
         })
+    }
+
+    pub fn servers_loading(&self) -> bool {
+        self.loud_refresh_op.is_some()
     }
 
     pub fn set_size(&mut self, cols: u16, rows: u16) {
@@ -479,6 +506,10 @@ impl App {
                 servers,
             } => {
                 self.finish_op(op);
+                let loud = op != 0 && self.loud_refresh_op == Some(op);
+                if loud {
+                    self.loud_refresh_op = None;
+                }
                 let was_synthetic =
                     !self.servers.is_empty() && self.server_cursor == self.servers.len();
                 let cursor_name = self
@@ -493,7 +524,7 @@ impl App {
                 if was_synthetic {
                     self.server_cursor = self.servers.len();
                 }
-                self.revalidate_commitment();
+                self.revalidate_commitment(loud);
                 if let Some(name) = self.pending_server_select.take()
                     && let Some(index) = self.servers.iter().position(|s| s.display == name)
                 {
@@ -542,10 +573,13 @@ impl App {
                     self.pending_server_select = Some(name);
                 }
                 self.set_status(message, false, now);
-                self.request_refresh();
+                self.request_reconcile();
             }
             AppEvent::OpFailed { op, message } => {
                 self.finish_op(op);
+                if self.loud_refresh_op == Some(op) {
+                    self.loud_refresh_op = None;
+                }
                 if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog
                     && create.op == Some(op)
                 {
@@ -567,12 +601,7 @@ impl App {
                     now,
                 );
                 self.pending_select = Some(terminal);
-                let target = self
-                    .committed_row()
-                    .and_then(|r| r.url.clone().map(|u| (r.display.clone(), u)));
-                if let Some((server, url)) = target {
-                    self.push_effect(Effect::FetchTerminals { op: 0, server, url });
-                }
+                self.fetch_committed_terminals(false);
             }
             AppEvent::PeekOpened { op, terminal } => {
                 self.finish_op(op);
@@ -615,13 +644,13 @@ impl App {
     /// After a server refresh: keep a still-ready committed server (and
     /// refetch its terminals so the grid stays fresh), or drop a commitment
     /// whose server vanished or stopped.
-    fn revalidate_commitment(&mut self) {
+    fn revalidate_commitment(&mut self, loud: bool) {
         let target = self
             .committed_row()
             .map(|r| (r.display.clone(), r.ready, r.url.clone()));
         match target {
-            Some((server, true, Some(url))) => {
-                self.push_effect(Effect::FetchTerminals { op: 0, server, url });
+            Some((_, true, Some(_))) => {
+                self.fetch_committed_terminals(loud);
             }
             None => {
                 if self.committed_server.is_some() {
@@ -644,12 +673,7 @@ impl App {
 
     pub fn after_attach(&mut self, message: String, now: Instant) {
         self.set_status(message, false, now);
-        let target = self
-            .committed_row()
-            .map(|r| (r.display.clone(), r.url.clone()));
-        if let Some((server, Some(url))) = target {
-            self.push_effect(Effect::FetchTerminals { op: 0, server, url });
-        }
+        self.fetch_committed_terminals(false);
     }
 
     pub fn on_preset_saved(&mut self, name: String, options: JsonMap, now: Instant) {
@@ -844,13 +868,9 @@ impl App {
             // same-named terminal on this one.
             self.pending_select = None;
         }
-        self.committed_server = Some(display.clone());
-        if let Some(url) = url {
-            self.push_effect(Effect::FetchTerminals {
-                op: 0,
-                server: display,
-                url,
-            });
+        self.committed_server = Some(display);
+        if url.is_some() {
+            self.fetch_committed_terminals(true);
         }
     }
 
@@ -999,7 +1019,10 @@ mod tests {
         let now = Instant::now();
         let mut app = App::new("icrn".to_string(), Default::default(), 999, (100, 30));
         let effects = app.take_effects();
-        assert!(matches!(effects.as_slice(), [Effect::Refresh { op: 1 }]));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Refresh { op: 1, loud: true }]
+        ));
         app.apply(
             AppEvent::Refreshed {
                 op: 1,
@@ -1516,6 +1539,96 @@ mod tests {
         assert!(app.status.is_some());
         app.tick(now + STATUS_TTL + Duration::from_millis(1));
         assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn op_done_reconciles_silently() {
+        let now = Instant::now();
+        let mut app = App::new("hub".to_string(), Default::default(), 999, (100, 30));
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::Refreshed {
+                op: 1,
+                username: "u".to_string(),
+                servers: vec![row("", false)],
+            },
+            now,
+        );
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::OpDone {
+                op: 9,
+                message: "done".to_string(),
+            },
+            now,
+        );
+        let effects = app.take_effects();
+        assert!(
+            matches!(effects.as_slice(), [Effect::Refresh { loud: false, .. }]),
+            "unexpected effects: {effects:?}"
+        );
+        assert!(
+            app.ops.is_empty(),
+            "silent refresh must not register a spinner op"
+        );
+    }
+
+    #[test]
+    fn loud_refresh_produces_loud_terminal_fetch() {
+        let now = Instant::now();
+        let mut app = App::new("hub".to_string(), Default::default(), 999, (100, 30));
+        let _ = app.take_effects();
+        // Commit a ready server so revalidate_commitment refetches its terminals.
+        app.apply(
+            AppEvent::Refreshed {
+                op: 1,
+                username: "u".to_string(),
+                servers: vec![row("", true)],
+            },
+            now,
+        );
+        app.on_key(&press(KeyCode::Enter), now);
+        let _ = app.take_effects();
+        // User presses r: loud refresh, and the follow-up fetch is loud too.
+        app.on_key(&press(KeyCode::Char('r')), now);
+        let effects = app.take_effects();
+        let op = match effects.as_slice() {
+            [Effect::Refresh { op, loud: true }] => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        app.apply(
+            AppEvent::Refreshed {
+                op,
+                username: "u".to_string(),
+                servers: vec![row("", true)],
+            },
+            now,
+        );
+        let effects = app.take_effects();
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::FetchTerminals { loud: true, .. }]
+            ),
+            "unexpected effects: {effects:?}"
+        );
+        // A silent refresh's follow-up fetch is silent.
+        app.apply(
+            AppEvent::Refreshed {
+                op: 0,
+                username: "u".to_string(),
+                servers: vec![row("", true)],
+            },
+            now,
+        );
+        let effects = app.take_effects();
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::FetchTerminals { loud: false, .. }]
+            ),
+            "unexpected effects: {effects:?}"
+        );
     }
 
     #[test]
