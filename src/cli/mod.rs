@@ -35,7 +35,7 @@ pub struct Cli {
     /// Hub profile from the config to use for this invocation
     #[arg(long, global = true)]
     pub hub: Option<String>,
-    /// Print one request summary line per API call to stderr
+    /// Raise log verbosity to stderr (RUST_LOG=jhc=debug)
     #[arg(long, global = true)]
     pub verbose: bool,
     #[command(subcommand)]

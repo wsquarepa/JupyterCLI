@@ -12,7 +12,7 @@ These apply to every subcommand.
 |---|---|
 | `-V`, `--version` | Print version and exit |
 | `--hub <NAME>` | Hub profile from the config to use for this invocation; defaults to `default_hub` |
-| `--verbose` | Print one request summary line per API call to stderr |
+| `--verbose` | Raise log verbosity to stderr (equivalent to RUST_LOG=jhc=debug) |
 
 ## Address Syntax
 

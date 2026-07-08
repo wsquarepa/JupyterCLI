@@ -49,6 +49,10 @@ The TUI is a pure state machine driven by an async event loop, deliberately kept
 
 `config.rs`: TOML at `$JHC_CONFIG_DIR` or `dirs::config_dir()/jhc/config.toml`, written `0o600` (loose perms trigger a warning). `#[serde(deny_unknown_fields)]` — unknown keys are hard errors. A config has multiple named hubs (each with `url`, `token`, optional `terminal_limit`, and named spawn `presets`) plus a `default_hub`; `--hub` overrides per-invocation. `JUPYTERHUB_API_TOKEN` env var overrides the stored token (`effective_token`).
 
+### Logging
+
+`logging.rs` owns `tracing` subscriber setup via `tracing-subscriber`'s `EnvFilter`, so `RUST_LOG` controls filtering everywhere. CLI runs log to stderr (default `warn`; `--verbose` raises jhc targets to `warn,jhc=debug`); the TUI auto-writes a file under the XDG state dir (`dirs::state_dir()` falling back to `dirs::cache_dir()`, `jhc/logs/jhc-<UTC-timestamp>-<pid>.log`, printed on exit) because stderr writes would corrupt the alternate screen. Spans (`#[tracing::instrument]`) wrap the public async api methods and `exec`; events use `key=value` fields, never string-interpolated dynamic values. Redaction is mandatory: a token appears only as `fingerprint(token)` plus its length, and terminal/WS payload bytes are never logged (only direction and byte length, at `trace`).
+
 ## Testing conventions
 
 - Logic is unit-tested inline (`#[cfg(test)] mod tests`) right next to the code — `shellops.rs`, `app.rs`, and the `api` modules all follow this. Prefer adding a unit test over an integration test when the logic doesn't need a real binary or socket.
