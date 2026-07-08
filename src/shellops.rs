@@ -212,6 +212,7 @@ impl ExecParser {
                     if let Some(pos) = self.buf.find(&self.start_marker) {
                         self.buf.drain(..pos + self.start_marker.len());
                         self.state = ExecState::Streaming;
+                        tracing::debug!(target: "jhc::shell", "start sentinel");
                     } else {
                         // Retain only the buffer suffix that could be the start of a split
                         // start sentinel. The marker is pure ASCII, so any overlapping suffix
@@ -230,7 +231,11 @@ impl ExecParser {
                             // A malformed number between two valid sentinel delimiters can only be
                             // produced by the shell itself misbehaving; 125 is the defined
                             // "JupyterCLI could not determine the outcome" code, not a silent fallback.
-                            let code: i32 = self.buf[..end].parse().unwrap_or(JHC_FAILURE_EXIT);
+                            let digits = &self.buf[..end];
+                            let code: i32 = digits.parse().unwrap_or_else(|_| {
+                                tracing::warn!(target: "jhc::shell", digits = %digits, "malformed exit code; using jhc failure exit");
+                                JHC_FAILURE_EXIT
+                            });
                             self.state = ExecState::Done;
                             return (out, Some(code));
                         }
@@ -278,6 +283,7 @@ pub struct ExecOutcome {
     pub exit_code: i32,
 }
 
+#[tracing::instrument(level = "debug", skip_all, fields(cmd_len = command.len()))]
 pub async fn exec(
     mut sock: TermSocket,
     command: &str,
@@ -294,6 +300,7 @@ pub async fn exec(
             .map(|_| format!("{:x}", rng.random_range(0..16u8)))
             .collect()
     };
+    tracing::debug!(target: "jhc::shell", command = %command, nonce = %nonce, "exec start");
     let mut parser = ExecParser::new(&nonce);
     sock.send_stdin(&build_exec_line(command, &nonce, ephemeral))
         .await?;
@@ -318,6 +325,7 @@ pub async fn exec(
                         })?;
                         out.flush().ok();
                         if let Some(code) = code {
+                            tracing::debug!(target: "jhc::shell", command = %command, exit_code = code, "exec complete");
                             sock.finish().await?;
                             return Ok(ExecOutcome { exit_code: code });
                         }
