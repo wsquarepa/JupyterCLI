@@ -233,7 +233,7 @@ impl ExecParser {
                             // "JupyterCLI could not determine the outcome" code, not a silent fallback.
                             let digits = &self.buf[..end];
                             let code: i32 = digits.parse().unwrap_or_else(|_| {
-                                tracing::warn!(target: "jhc::shell", digits = %digits, "malformed exit code; using jhc failure exit");
+                                tracing::warn!(target: "jhc::shell", bytes = digits.len(), "malformed exit code; using jhc failure exit");
                                 JHC_FAILURE_EXIT
                             });
                             self.state = ExecState::Done;
