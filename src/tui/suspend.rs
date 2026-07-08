@@ -50,6 +50,7 @@ pub async fn attach_in_subprocess(hub: &str, target: &str) -> Result<String, Cli
     disable_raw_mode().map_err(CliError::Io)?;
     stdout.flush().map_err(CliError::Io)?;
 
+    tracing::debug!(target: "jhc::tui", hub = %hub, attach_target = %target, "attach subprocess enter");
     let status = tokio::process::Command::new(exe)
         .args(attach_args(hub, target))
         .status()
@@ -70,6 +71,7 @@ pub async fn attach_in_subprocess(hub: &str, target: &str) -> Result<String, Cli
     crossterm::execute!(std::io::stdout(), EnterAlternateScreen).map_err(CliError::Io)?;
 
     let status = status.map_err(CliError::Io)?;
+    tracing::debug!(target: "jhc::tui", hub = %hub, attach_target = %target, success = status.success(), "attach subprocess exit");
     Ok(if status.success() {
         "attach ended".to_string()
     } else {

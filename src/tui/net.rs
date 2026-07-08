@@ -65,6 +65,22 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
                 unreachable!("local effects are handled by the event loop, not net::dispatch")
             }
         };
+        let kind: &'static str = match &effect {
+            Effect::Refresh { .. } => "refresh",
+            Effect::FetchTerminals { .. } => "fetch_terminals",
+            Effect::Start { .. } => "start",
+            Effect::Stop { .. } => "stop",
+            Effect::NewTerminal { .. } => "new_terminal",
+            Effect::KillTerminal { .. } => "kill_terminal",
+            Effect::PeekStart { .. }
+            | Effect::PeekStop
+            | Effect::Attach { .. }
+            | Effect::Quit
+            | Effect::SavePreset { .. } => {
+                unreachable!("local effects are handled by the event loop, not net::dispatch")
+            }
+        };
+        tracing::debug!(target: "jhc::tui", op, effect = kind, "dispatch effect");
         let event = match effect {
             Effect::Refresh { op, .. } => refresh(&client, op).await,
             Effect::FetchTerminals {
@@ -97,6 +113,12 @@ pub fn dispatch(effect: Effect, client: HubClient, tx: UnboundedSender<AppEvent>
             op,
             message: e.to_string(),
         });
+        match &event {
+            AppEvent::OpFailed { message, .. } => {
+                tracing::warn!(target: "jhc::tui", op, effect = kind, message = %message, "effect failed");
+            }
+            _ => tracing::debug!(target: "jhc::tui", op, effect = kind, "effect completed"),
+        }
         // A send failure means the UI is shutting down; nothing left to report to.
         let _ = tx.send(event);
     });

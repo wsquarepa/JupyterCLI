@@ -703,6 +703,22 @@ impl App {
     }
 
     pub fn apply(&mut self, event: AppEvent, now: Instant) {
+        // PeekChunk carries no op and arrives once per output chunk; logging it
+        // would be per-frame volume, so only op-bearing events are traced here.
+        let (kind, op): (&'static str, Option<u64>) = match &event {
+            AppEvent::Refreshed { op, .. } => ("refreshed", Some(*op)),
+            AppEvent::Terminals { op, .. } => ("terminals", Some(*op)),
+            AppEvent::Progress { op, .. } => ("progress", Some(*op)),
+            AppEvent::OpDone { op, .. } => ("op_done", Some(*op)),
+            AppEvent::OpFailed { op, .. } => ("op_failed", Some(*op)),
+            AppEvent::TerminalCreated { op, .. } => ("terminal_created", Some(*op)),
+            AppEvent::PeekOpened { op, .. } => ("peek_opened", Some(*op)),
+            AppEvent::PeekChunk { .. } => ("peek_chunk", None),
+            AppEvent::PeekFailed { op, .. } => ("peek_failed", Some(*op)),
+        };
+        if let Some(op) = op {
+            tracing::debug!(target: "jhc::tui", event = kind, op, "apply event");
+        }
         match event {
             AppEvent::Refreshed {
                 op,
@@ -741,6 +757,11 @@ impl App {
                 terminals,
             } => {
                 self.finish_op(op);
+                if let Some(f) = self.grid_fetch.as_ref()
+                    && f.op != op
+                {
+                    tracing::trace!(target: "jhc::tui", slot = "grid_fetch", incoming_op = op, current_op = f.op, "drop stale event");
+                }
                 let hold = self.grid_fetch.as_ref().is_some_and(|f| {
                     f.op == op
                         && f.age_ticks >= SKELETON_SHOW_TICKS

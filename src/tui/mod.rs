@@ -75,6 +75,12 @@ async fn dashboard_loop(
         hub.effective_terminal_limit(),
         size,
     );
+    tracing::info!(
+        target: "jhc::tui",
+        hub = hub_name,
+        terminal_limit = hub.effective_terminal_limit(),
+        "dashboard start"
+    );
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut events = crossterm::event::EventStream::new();
@@ -105,12 +111,14 @@ async fn dashboard_loop(
         for effect in app.take_effects() {
             match effect {
                 app::Effect::Quit => {
+                    tracing::debug!(target: "jhc::tui", "quit");
                     if let Some(handle) = peek.take() {
                         handle.abort();
                     }
                     return Ok(());
                 }
                 app::Effect::PeekStop => {
+                    tracing::debug!(target: "jhc::tui", "peek stop");
                     if let Some(handle) = peek.take() {
                         handle.abort();
                     }
@@ -122,6 +130,7 @@ async fn dashboard_loop(
                     rows,
                     cols,
                 } => {
+                    tracing::debug!(target: "jhc::tui", op, terminal = %terminal, "peek start");
                     if let Some(handle) = peek.take() {
                         handle.abort();
                     }
@@ -136,6 +145,7 @@ async fn dashboard_loop(
                     ));
                 }
                 app::Effect::Attach { target } => {
+                    tracing::debug!(target: "jhc::tui", attach_target = %target, "attach");
                     if let Some(handle) = peek.take() {
                         handle.abort();
                     }
