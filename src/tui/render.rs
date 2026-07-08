@@ -209,13 +209,18 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
         let x = inner.x + offsets[col];
         let y = inner.y + ((row - app.grid_scroll) as u16) * (grid::CARD_HEIGHT + grid::CARD_VGAP);
         let rect = Rect::new(x, y, grid::CARD_WIDTH, grid::CARD_HEIGHT);
-        draw_card(
-            frame,
-            terminal,
-            focused && index == app.grid_cursor,
-            rect,
-            inner,
-        );
+        match &app.dissolve {
+            Some(dissolve) if dissolve.terminal == terminal.name => {
+                draw_dissolve_card(frame, dissolve, rect);
+            }
+            _ => draw_card(
+                frame,
+                terminal,
+                focused && index == app.grid_cursor,
+                rect,
+                inner,
+            ),
+        }
     }
 
     if let Some(ghost) = &app.ghost {
@@ -375,6 +380,44 @@ fn draw_card(frame: &mut Frame, terminal: &TerminalRow, hovered: bool, rect: Rec
         Line::from(grid::card_label(&terminal.name)).centered(),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_dissolve_card(frame: &mut Frame, dissolve: &super::app::Dissolve, rect: Rect) {
+    let progress = (dissolve.age_ticks as f32 / super::app::DISSOLVE_TICKS as f32).min(1.0);
+    let border = if progress < 0.5 {
+        theme::BORDER_UNFOCUSED
+    } else {
+        theme::SHIM[0]
+    };
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let label = grid::card_label(&dissolve.terminal);
+    let label_x = inner.x + inner.width.saturating_sub(label.chars().count() as u16) / 2;
+    let mut cells: Vec<(u16, u16, char)> =
+        vec![(inner.x, inner.y, '>'), (inner.x + 1, inner.y, '_')];
+    for (i, ch) in label.chars().enumerate() {
+        cells.push((label_x + i as u16, inner.y + 2, ch));
+    }
+    let buf = frame.buffer_mut();
+    for (x, y, ch) in cells {
+        if x >= inner.right() || y >= inner.bottom() {
+            continue;
+        }
+        let noise = super::anim::cell_noise(dissolve.seed, x, y);
+        // Two decaying thresholds: cells pass through a dim middle dot before
+        // going blank, so the card scatters instead of wiping.
+        if noise < progress * 0.9 {
+            buf[(x, y)].set_symbol(" ");
+        } else if noise < progress * 1.4 {
+            buf[(x, y)].set_symbol("·").set_fg(theme::SHIM[0]);
+        } else {
+            buf[(x, y)].set_char(ch);
+        }
+    }
 }
 
 /// Border drawn cell by cell so the marching gradient can color each segment
@@ -785,6 +828,27 @@ mod tests {
         assert!(text.contains("Terminal 001"));
         assert!(text.contains("Terminal 002"));
         assert!(text.contains(">_"));
+    }
+
+    #[test]
+    fn dissolving_card_decays_its_label() {
+        let (mut app, _) = committed(&["1", "2"]);
+        app.dissolve = Some(crate::tui::app::Dissolve {
+            op: 9,
+            terminal: "2".to_string(),
+            age_ticks: crate::tui::app::DISSOLVE_TICKS,
+            confirmed: false,
+            seed: 12345,
+        });
+        let text = rendered(&app);
+        assert!(
+            text.contains("Terminal 001"),
+            "untouched card intact:\n{text}"
+        );
+        assert!(
+            !text.contains("Terminal 002"),
+            "fully decayed label must be gone:\n{text}"
+        );
     }
 
     #[test]
