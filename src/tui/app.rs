@@ -959,6 +959,8 @@ impl App {
         self.grid_cursor = 0;
         self.grid_scroll = 0;
         self.grid_fetch = None;
+        self.ghost = None;
+        self.dissolve = None;
         if self.focus == Focus::Grid {
             self.focus = Focus::Servers;
         }
@@ -1196,6 +1198,11 @@ impl App {
             // A create pending on the previous server must not select a
             // same-named terminal on this one.
             self.pending_select = None;
+            // A ghost or dissolve keyed to the old server's op/terminal name
+            // would otherwise be matched against the new server's cards,
+            // since terminal names are per-server ordinals.
+            self.ghost = None;
+            self.dissolve = None;
         }
         self.committed_server = Some(display);
         if url.is_some() {
@@ -1857,6 +1864,84 @@ mod tests {
             "an unconfirmed kill must not remove the entry"
         );
         assert_eq!(app.terminals.len(), 1);
+    }
+
+    #[test]
+    fn dissolve_clears_on_committed_server_switch() {
+        let (mut app, now) = committed_app(&["1", "2"]);
+        app.on_dialog_outcome(crate::tui::dialogs::Outcome::Commit(Effect::KillTerminal {
+            op: 0,
+            server: "default".to_string(),
+            url: "/user/u/".to_string(),
+            terminal: "2".to_string(),
+        }));
+        let effects = app.take_effects();
+        let kill_op = match effects.as_slice() {
+            [Effect::KillTerminal { op, .. }] => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        assert!(app.dissolve.is_some());
+
+        // Switch commitment to "backup" before the kill resolves.
+        app.on_key(&press(KeyCode::Tab), now);
+        app.on_key(&press(KeyCode::Down), now);
+        app.on_key(&press(KeyCode::Enter), now);
+        assert_eq!(app.committed_server.as_deref(), Some("backup"));
+        assert!(
+            app.dissolve.is_none(),
+            "dissolve must not leak across a server switch"
+        );
+
+        let effects = app.take_effects();
+        let fetch_op = match effects.as_slice() {
+            [Effect::FetchTerminals { op, server, .. }] if server == "backup" => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        app.apply(
+            AppEvent::Terminals {
+                op: fetch_op,
+                server: "backup".to_string(),
+                terminals: terminals(&["2"]),
+            },
+            now,
+        );
+
+        // The stale kill op resolves after the switch; it must not touch
+        // backup's own terminal "2", which is a different terminal that
+        // happens to share the same per-server ordinal name.
+        app.apply(
+            AppEvent::OpDone {
+                op: kill_op,
+                message: "killed terminal 2 on default".to_string(),
+            },
+            now,
+        );
+        for _ in 0..DISSOLVE_TICKS {
+            app.tick(now);
+        }
+        assert_eq!(
+            app.terminals.len(),
+            1,
+            "backup's terminal 2 must survive the stale kill from the old server"
+        );
+    }
+
+    #[test]
+    fn ghost_clears_on_committed_server_switch() {
+        let (mut app, now) = committed_app(&["1"]);
+        app.on_key(&press(KeyCode::Char('n')), now);
+        let effects = app.take_effects();
+        assert!(matches!(effects.as_slice(), [Effect::NewTerminal { .. }]));
+        assert!(app.ghost.is_some());
+
+        app.on_key(&press(KeyCode::Tab), now);
+        app.on_key(&press(KeyCode::Down), now);
+        app.on_key(&press(KeyCode::Enter), now);
+        assert_eq!(app.committed_server.as_deref(), Some("backup"));
+        assert!(
+            app.ghost.is_none(),
+            "ghost must not leak across a server switch"
+        );
     }
 
     #[test]
