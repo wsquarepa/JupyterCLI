@@ -16,7 +16,6 @@ use crate::api::HubClient;
 use crate::cli::CliError;
 use crate::config::{self, Config, ConfigError};
 
-const REFRESH_EVERY: Duration = Duration::from_secs(15);
 const TICK_EVERY: Duration = Duration::from_millis(100);
 
 pub async fn run(hub_flag: Option<&str>) -> Result<(), CliError> {
@@ -67,8 +66,6 @@ async fn dashboard_loop(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut events = crossterm::event::EventStream::new();
-    let mut refresh = tokio::time::interval(REFRESH_EVERY);
-    refresh.tick().await; // consume the immediate first tick; App::new queued a Refresh already
     let mut tick = tokio::time::interval(TICK_EVERY);
     let mut peek: Option<tokio::task::AbortHandle> = None;
 
@@ -90,7 +87,6 @@ async fn dashboard_loop(
                     app.apply(message, Instant::now());
                 }
             }
-            _ = refresh.tick() => app.request_refresh(),
             _ = tick.tick() => app.tick(Instant::now()),
         }
 

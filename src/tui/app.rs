@@ -252,7 +252,7 @@ impl App {
         app
     }
 
-    pub fn request_refresh(&mut self) {
+    fn request_refresh(&mut self) {
         self.push_effect(Effect::Refresh { op: 0 });
     }
 
@@ -309,9 +309,7 @@ impl App {
         {
             self.status = None;
         }
-        if !self.ops.is_empty() {
-            self.spinner_frame = self.spinner_frame.wrapping_add(1);
-        }
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
         if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog
             && let Some(since) = create.flash
             && now.duration_since(since) > REJECT_FLASH_DURATION
@@ -1603,15 +1601,31 @@ mod tests {
     }
 
     #[test]
-    fn q_quits_and_spinner_advances_only_while_busy() {
+    fn q_quits_and_spinner_advances_every_tick() {
         let (mut app, now) = fresh_app();
-        app.tick(now);
-        assert_eq!(app.spinner_frame, 0, "no ops in flight");
-        app.request_refresh();
         app.tick(now);
         assert_eq!(app.spinner_frame, 1);
         app.on_key(&press(KeyCode::Char('q')), now);
         assert!(matches!(app.take_effects().last(), Some(Effect::Quit)));
+    }
+
+    #[test]
+    fn animation_frame_advances_without_ops() {
+        let now = Instant::now();
+        let mut app = App::new("hub".to_string(), Default::default(), 999, (100, 30));
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::Refreshed {
+                op: 1,
+                username: "u".to_string(),
+                servers: vec![],
+            },
+            now,
+        );
+        assert!(app.ops.is_empty(), "initial refresh op must be finished");
+        let before = app.spinner_frame;
+        app.tick(now);
+        assert_eq!(app.spinner_frame, before + 1);
     }
 
     #[test]
