@@ -109,7 +109,12 @@ fn load_from(dir: &Path) -> Result<Config, ConfigError> {
         }
         Err(e) => return Err(ConfigError::Read { path, source: e }),
     };
-    toml::from_str(&text).map_err(|e| ConfigError::Parse { path, source: e })
+    let cfg = toml::from_str(&text).map_err(|e| ConfigError::Parse {
+        path: path.clone(),
+        source: e,
+    })?;
+    tracing::debug!(target: "jhc::config", path = %path.display(), "config loaded");
+    Ok(cfg)
 }
 
 fn save_to(cfg: &Config, dir: &Path) -> Result<PathBuf, ConfigError> {
@@ -136,6 +141,7 @@ fn save_to(cfg: &Config, dir: &Path) -> Result<PathBuf, ConfigError> {
             path: path.clone(),
             source: e,
         })?;
+    tracing::debug!(target: "jhc::config", path = %path.display(), "config saved");
     Ok(path)
 }
 

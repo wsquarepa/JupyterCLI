@@ -229,6 +229,7 @@ impl Ctx {
         let token = hub.effective_token();
         crate::api::log_client_init(name, &hub.url, &token);
         let client = HubClient::new(&hub.url, &token)?;
+        tracing::debug!(target: "jhc::cli", hub = name, "context loaded");
         Ok(Self {
             hub_name: name.to_string(),
             hub: hub.clone(),
@@ -328,6 +329,21 @@ fn exit_code_for_failure(is_exec: bool) -> std::process::ExitCode {
 }
 
 async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
+    let verb = match &cli.command {
+        None => "tui",
+        Some(Command::Init { .. }) => "init",
+        Some(Command::Status) => "status",
+        Some(Command::Start { .. }) => "start",
+        Some(Command::Stop { .. }) => "stop",
+        Some(Command::Preset(_)) => "preset",
+        Some(Command::Shell(_)) => "shell",
+        Some(Command::Exec { .. }) => "exec",
+        Some(Command::Ls { .. }) => "ls",
+        Some(Command::Cp { .. }) => "cp",
+        Some(Command::Rm { .. }) => "rm",
+        Some(Command::Token(_)) => "token",
+    };
+    let _span = tracing::info_span!("command", name = verb, hub = ?cli.hub).entered();
     let ok = std::process::ExitCode::SUCCESS;
     match cli.command {
         None => {
