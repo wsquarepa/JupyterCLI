@@ -40,6 +40,17 @@ pub enum ApiError {
     Protocol { url: String, reason: String },
 }
 
+/// Response headers worth capturing on failures: they distinguish the hub
+/// itself (server/x-jupyterhub-version) from a proxy in front of it, and
+/// carry auth hints (www-authenticate) and timing (date).
+const DIAGNOSTIC_HEADERS: [&str; 5] = [
+    "server",
+    "x-jupyterhub-version",
+    "www-authenticate",
+    "content-type",
+    "date",
+];
+
 pub async fn check(
     method: &'static str,
     url: &str,
@@ -47,9 +58,31 @@ pub async fn check(
 ) -> Result<reqwest::Response, ApiError> {
     let status = resp.status();
     if status.is_success() {
+        super::debuglog::log(&[
+            ("event", "response".to_string()),
+            ("method", method.to_string()),
+            ("url", url.to_string()),
+            ("status", status.as_u16().to_string()),
+        ]);
         return Ok(resp);
     }
+    let mut fields = vec![
+        ("event", "response".to_string()),
+        ("method", method.to_string()),
+        ("url", url.to_string()),
+        ("status", status.as_u16().to_string()),
+    ];
+    for name in DIAGNOSTIC_HEADERS {
+        if let Some(value) = resp.headers().get(name) {
+            fields.push((name, String::from_utf8_lossy(value.as_bytes()).to_string()));
+        }
+    }
     let body = resp.text().await.unwrap_or_default();
+    fields.push((
+        "body",
+        super::debuglog::snippet(&body, super::debuglog::BODY_SNIPPET_CHARS),
+    ));
+    super::debuglog::log(&fields);
     match status.as_u16() {
         401 => Err(ApiError::Unauthorized {
             method,

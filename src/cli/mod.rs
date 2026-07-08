@@ -225,7 +225,9 @@ impl Ctx {
             );
         }
         let (name, hub) = cfg.resolve_hub(hub_flag)?;
-        let client = HubClient::new(&hub.url, &hub.effective_token())?.with_verbose(verbose);
+        let token = hub.effective_token();
+        crate::api::log_client_init(name, &hub.url, &token);
+        let client = HubClient::new(&hub.url, &token)?.with_verbose(verbose);
         Ok(Self {
             hub_name: name.to_string(),
             hub: hub.clone(),

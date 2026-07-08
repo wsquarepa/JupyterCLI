@@ -1,3 +1,4 @@
+pub mod debuglog;
 pub mod error;
 pub mod server;
 pub mod sse;
@@ -8,6 +9,26 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use error::{ApiError, check};
 use types::{JsonMap, NewToken, ProgressEvent, TokenInfo, User};
+
+/// One `client_init` debug-log line naming which hub and which token a client
+/// was built with. The env/config distinction plus the fingerprint is what
+/// lets an intermittent auth failure be correlated with the credential in use
+/// without recording token material.
+pub fn log_client_init(hub_name: &str, base_url: &str, token: &str) {
+    let source = if std::env::var_os("JUPYTERHUB_API_TOKEN").is_some() {
+        "env:JUPYTERHUB_API_TOKEN"
+    } else {
+        "config"
+    };
+    debuglog::log(&[
+        ("event", "client_init".to_string()),
+        ("hub", hub_name.to_string()),
+        ("url", base_url.to_string()),
+        ("token_source", source.to_string()),
+        ("token_fp", debuglog::fingerprint(token)),
+        ("token_len", token.chars().count().to_string()),
+    ]);
+}
 
 /// Percent-encode a server name for use as a single URL path segment. Encodes
 /// everything outside the unreserved set so a name like `a b` or `a?b` reaches
@@ -59,6 +80,12 @@ impl HubClient {
     }
 
     fn log(&self, method: &str, url: &str, outcome: &str) {
+        debuglog::log(&[
+            ("event", "request".to_string()),
+            ("method", method.to_string()),
+            ("url", url.to_string()),
+            ("outcome", outcome.to_string()),
+        ]);
         if self.verbose {
             eprintln!("jhc: {method} {url} -> {outcome}");
         }
