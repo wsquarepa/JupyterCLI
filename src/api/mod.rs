@@ -1,4 +1,3 @@
-pub mod debuglog;
 pub mod error;
 pub mod server;
 pub mod sse;
@@ -10,24 +9,25 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use error::{ApiError, check};
 use types::{JsonMap, NewToken, ProgressEvent, TokenInfo, User};
 
-/// One `client_init` debug-log line naming which hub and which token a client
-/// was built with. The env/config distinction plus the fingerprint is what
-/// lets an intermittent auth failure be correlated with the credential in use
-/// without recording token material.
+/// One `client init` event naming which hub and which token a client was built
+/// with. The env/config distinction plus the fingerprint is what lets an
+/// intermittent auth failure be correlated with the credential in use without
+/// recording token material.
 pub fn log_client_init(hub_name: &str, base_url: &str, token: &str) {
     let source = if std::env::var_os("JUPYTERHUB_API_TOKEN").is_some() {
         "env:JUPYTERHUB_API_TOKEN"
     } else {
         "config"
     };
-    debuglog::log(&[
-        ("event", "client_init".to_string()),
-        ("hub", hub_name.to_string()),
-        ("url", base_url.to_string()),
-        ("token_source", source.to_string()),
-        ("token_fp", debuglog::fingerprint(token)),
-        ("token_len", token.chars().count().to_string()),
-    ]);
+    tracing::info!(
+        target: "jhc::api",
+        hub = hub_name,
+        url = base_url,
+        token_source = source,
+        token_fp = %crate::logging::fingerprint(token),
+        token_len = token.chars().count(),
+        "client init"
+    );
 }
 
 /// Percent-encode a server name for use as a single URL path segment. Encodes
@@ -45,8 +45,6 @@ pub struct HubClient {
     http: reqwest::Client,
     base: reqwest::Url,
     token: String,
-    verbose: bool,
-    retry_warnings: bool,
 }
 
 impl HubClient {
@@ -60,35 +58,7 @@ impl HubClient {
             http: reqwest::Client::new(),
             base,
             token: token.to_string(),
-            verbose: false,
-            retry_warnings: true,
         })
-    }
-
-    pub fn with_verbose(mut self, verbose: bool) -> Self {
-        self.verbose = verbose;
-        self
-    }
-
-    pub fn with_retry_warnings(mut self, enabled: bool) -> Self {
-        self.retry_warnings = enabled;
-        self
-    }
-
-    pub fn verbose(&self) -> bool {
-        self.verbose
-    }
-
-    fn log(&self, method: &str, url: &str, outcome: &str) {
-        debuglog::log(&[
-            ("event", "request".to_string()),
-            ("method", method.to_string()),
-            ("url", url.to_string()),
-            ("outcome", outcome.to_string()),
-        ]);
-        if self.verbose {
-            eprintln!("jhc: {method} {url} -> {outcome}");
-        }
     }
 
     pub fn base(&self) -> &reqwest::Url {
@@ -118,12 +88,8 @@ impl HubClient {
             match result {
                 Ok(resp) if resp.status().is_server_error() && attempt < 3 => {
                     let status = resp.status();
-                    self.log("GET", url.as_str(), &status.to_string());
-                    if self.retry_warnings {
-                        eprintln!(
-                            "warning: GET {url} attempt {attempt} returned {status}; retrying"
-                        );
-                    }
+                    tracing::debug!(target: "jhc::api", method = "GET", url = %url, outcome = %status, "request");
+                    tracing::warn!(target: "jhc::api", method = "GET", url = %url, attempt, status = %status, "retrying");
                     last = Some(ApiError::Status {
                         method: "GET",
                         url: url.to_string(),
@@ -132,14 +98,12 @@ impl HubClient {
                     });
                 }
                 Ok(resp) => {
-                    self.log("GET", url.as_str(), &resp.status().to_string());
+                    tracing::debug!(target: "jhc::api", method = "GET", url = %url, outcome = %resp.status(), "request");
                     return check("GET", url.as_str(), resp).await;
                 }
                 Err(e) if attempt < 3 => {
-                    self.log("GET", url.as_str(), &format!("transport error: {e}"));
-                    if self.retry_warnings {
-                        eprintln!("warning: GET {url} attempt {attempt} failed: {e}; retrying");
-                    }
+                    tracing::debug!(target: "jhc::api", method = "GET", url = %url, outcome = %format!("transport error: {e}"), "request");
+                    tracing::warn!(target: "jhc::api", method = "GET", url = %url, attempt, error = %e, "retrying");
                     last = Some(ApiError::Transport {
                         method: "GET",
                         url: url.to_string(),
@@ -147,7 +111,7 @@ impl HubClient {
                     });
                 }
                 Err(e) => {
-                    self.log("GET", url.as_str(), &format!("transport error: {e}"));
+                    tracing::debug!(target: "jhc::api", method = "GET", url = %url, outcome = %format!("transport error: {e}"), "request");
                     return Err(ApiError::Transport {
                         method: "GET",
                         url: url.to_string(),
@@ -159,6 +123,7 @@ impl HubClient {
         Err(last.expect("retry loop records an error before exhausting attempts"))
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn whoami(&self) -> Result<User, ApiError> {
         let url = self.url("hub/api/user")?;
         let resp = self.get("hub/api/user").await?;
@@ -169,6 +134,7 @@ impl HubClient {
         })
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(user = name))]
     pub async fn user(&self, name: &str) -> Result<User, ApiError> {
         let path = format!("hub/api/users/{name}");
         let url = self.url(&path)?;
@@ -180,6 +146,7 @@ impl HubClient {
         })
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(user = name))]
     pub async fn user_including_stopped(&self, name: &str) -> Result<User, ApiError> {
         let path = format!("hub/api/users/{name}?include_stopped_servers=true");
         let url = self.url(&path)?;
@@ -201,6 +168,7 @@ impl HubClient {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(user = user, server = server))]
     pub async fn spawn(
         &self,
         user: &str,
@@ -215,11 +183,11 @@ impl HubClient {
             .await;
         let resp = match result {
             Ok(resp) => {
-                self.log("POST", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "POST", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("POST", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "POST", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "POST",
                     url: url.to_string(),
@@ -230,16 +198,17 @@ impl HubClient {
         check("POST", url.as_str(), resp).await.map(|_| ())
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(user = user, server = server))]
     pub async fn stop(&self, user: &str, server: Option<&str>) -> Result<(), ApiError> {
         let url = self.url(&Self::server_path(user, server))?;
         let result = self.auth(self.http.delete(url.clone())).send().await;
         let resp = match result {
             Ok(resp) => {
-                self.log("DELETE", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "DELETE", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("DELETE", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "DELETE", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "DELETE",
                     url: url.to_string(),
@@ -250,6 +219,7 @@ impl HubClient {
         check("DELETE", url.as_str(), resp).await.map(|_| ())
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(user = user, server = server))]
     pub async fn wait_ready(
         &self,
         user: &str,
@@ -275,6 +245,7 @@ impl HubClient {
                         reason: format!("bad progress event {payload:?}: {e}"),
                     })?;
                 on_event(&event);
+                tracing::debug!(target: "jhc::api", message = ?event.message, progress = ?event.progress, ready = event.ready, failed = event.failed, "spawn progress");
                 if event.failed {
                     return Err(ApiError::Protocol {
                         url: url.to_string(),
@@ -295,6 +266,7 @@ impl HubClient {
         })
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(user = user))]
     pub async fn tokens(&self, user: &str) -> Result<Vec<TokenInfo>, ApiError> {
         let path = format!("hub/api/users/{user}/tokens");
         let url = self.url(&path)?;
@@ -306,6 +278,7 @@ impl HubClient {
         })
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(user = user))]
     pub async fn create_token(&self, user: &str, note: &str) -> Result<NewToken, ApiError> {
         let url = self.url(&format!("hub/api/users/{user}/tokens"))?;
         let result = self
@@ -315,11 +288,11 @@ impl HubClient {
             .await;
         let resp = match result {
             Ok(resp) => {
-                self.log("POST", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "POST", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("POST", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "POST", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "POST",
                     url: url.to_string(),
@@ -335,16 +308,17 @@ impl HubClient {
         })
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(user = user, token_id = id))]
     pub async fn revoke_token(&self, user: &str, id: &str) -> Result<(), ApiError> {
         let url = self.url(&format!("hub/api/users/{user}/tokens/{id}"))?;
         let result = self.auth(self.http.delete(url.clone())).send().await;
         let resp = match result {
             Ok(resp) => {
-                self.log("DELETE", url.as_str(), &resp.status().to_string());
+                tracing::debug!(target: "jhc::api", method = "DELETE", url = %url, outcome = %resp.status(), "request");
                 resp
             }
             Err(e) => {
-                self.log("DELETE", url.as_str(), &format!("transport error: {e}"));
+                tracing::debug!(target: "jhc::api", method = "DELETE", url = %url, outcome = %format!("transport error: {e}"), "request");
                 return Err(ApiError::Transport {
                     method: "DELETE",
                     url: url.to_string(),
@@ -472,22 +446,6 @@ mod tests {
             .mount(&server)
             .await;
         let err = client(&server).await.whoami().await.unwrap_err();
-        assert!(err.to_string().contains("502"));
-    }
-
-    #[tokio::test]
-    async fn retry_still_raises_with_warnings_suppressed() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/hub/api/user"))
-            .respond_with(ResponseTemplate::new(502))
-            .expect(3)
-            .mount(&server)
-            .await;
-        let client = HubClient::new(&server.uri(), "tok")
-            .unwrap()
-            .with_retry_warnings(false);
-        let err = client.whoami().await.unwrap_err();
         assert!(err.to_string().contains("502"));
     }
 

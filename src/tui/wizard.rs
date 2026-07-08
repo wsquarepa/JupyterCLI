@@ -488,7 +488,7 @@ fn build_config(state: &WizardState) -> Config {
 }
 
 async fn fetch_identity(url: &str, token: &str) -> Result<(String, Option<JsonMap>), CliError> {
-    let client = HubClient::new(url, token)?.with_retry_warnings(false);
+    let client = HubClient::new(url, token)?;
     let user = client.whoami().await?;
     let options = user
         .servers

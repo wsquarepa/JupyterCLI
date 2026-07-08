@@ -213,21 +213,22 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    pub fn load(hub_flag: Option<&str>, verbose: bool) -> Result<Self, CliError> {
+    pub fn load(hub_flag: Option<&str>) -> Result<Self, CliError> {
         let cfg = config::load()?;
         if let Ok(path) = config::path()
             && config::permissions_are_loose(&path)
         {
-            eprintln!(
-                "warning: {} is readable by other users; run: chmod 600 {}",
-                path.display(),
+            tracing::warn!(
+                target: "jhc::config",
+                path = %path.display(),
+                "config file is readable by other users; run: chmod 600 {}",
                 path.display()
             );
         }
         let (name, hub) = cfg.resolve_hub(hub_flag)?;
         let token = hub.effective_token();
         crate::api::log_client_init(name, &hub.url, &token);
-        let client = HubClient::new(&hub.url, &token)?.with_verbose(verbose);
+        let client = HubClient::new(&hub.url, &token)?;
         Ok(Self {
             hub_name: name.to_string(),
             hub: hub.clone(),
@@ -338,7 +339,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
             Ok(ok)
         }
         Some(Command::Status) => {
-            server::status(&Ctx::load(cli.hub.as_deref(), cli.verbose)?).await?;
+            server::status(&Ctx::load(cli.hub.as_deref())?).await?;
             Ok(ok)
         }
         Some(Command::Start {
@@ -348,7 +349,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
             no_wait,
         }) => {
             server::start(
-                &Ctx::load(cli.hub.as_deref(), cli.verbose)?,
+                &Ctx::load(cli.hub.as_deref())?,
                 server.as_deref(),
                 preset.as_deref(),
                 &options,
@@ -359,18 +360,18 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
         }
         Some(Command::Stop { server }) => {
             server::stop(
-                &Ctx::load(cli.hub.as_deref(), cli.verbose)?,
+                &Ctx::load(cli.hub.as_deref())?,
                 server.as_deref(),
             )
             .await?;
             Ok(ok)
         }
         Some(Command::Preset(cmd)) => {
-            preset::run(&Ctx::load(cli.hub.as_deref(), cli.verbose)?, cmd).await?;
+            preset::run(&Ctx::load(cli.hub.as_deref())?, cmd).await?;
             Ok(ok)
         }
         Some(Command::Shell(cmd)) => {
-            shell::run(&Ctx::load(cli.hub.as_deref(), cli.verbose)?, cmd).await?;
+            shell::run(&Ctx::load(cli.hub.as_deref())?, cmd).await?;
             Ok(ok)
         }
         Some(Command::Exec {
@@ -384,7 +385,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
                 ));
             }
             let code = shell::exec_cmd(
-                &Ctx::load(cli.hub.as_deref(), cli.verbose)?,
+                &Ctx::load(cli.hub.as_deref())?,
                 server.as_deref(),
                 shell.as_deref(),
                 &crate::shellops::shell_join(&command),
@@ -393,7 +394,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
             Ok(std::process::ExitCode::from(code as u8))
         }
         Some(Command::Ls { path }) => {
-            fs::ls(&Ctx::load(cli.hub.as_deref(), cli.verbose)?, &path).await?;
+            fs::ls(&Ctx::load(cli.hub.as_deref())?, &path).await?;
             Ok(ok)
         }
         Some(Command::Cp {
@@ -402,7 +403,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
             recursive,
         }) => {
             fs::cp(
-                &Ctx::load(cli.hub.as_deref(), cli.verbose)?,
+                &Ctx::load(cli.hub.as_deref())?,
                 &src,
                 &dst,
                 recursive,
@@ -412,7 +413,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
         }
         Some(Command::Rm { path, recursive }) => {
             fs::rm(
-                &Ctx::load(cli.hub.as_deref(), cli.verbose)?,
+                &Ctx::load(cli.hub.as_deref())?,
                 &path,
                 recursive,
             )
@@ -420,7 +421,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
             Ok(ok)
         }
         Some(Command::Token(cmd)) => {
-            token::run(&Ctx::load(cli.hub.as_deref(), cli.verbose)?, cmd).await?;
+            token::run(&Ctx::load(cli.hub.as_deref())?, cmd).await?;
             Ok(ok)
         }
     }

@@ -48,17 +48,6 @@ pub enum ApiError {
     Protocol { url: String, reason: String },
 }
 
-/// Response headers worth capturing on failures: they distinguish the hub
-/// itself (server/x-jupyterhub-version) from a proxy in front of it, and
-/// carry auth hints (www-authenticate) and timing (date).
-const DIAGNOSTIC_HEADERS: [&str; 5] = [
-    "server",
-    "x-jupyterhub-version",
-    "www-authenticate",
-    "content-type",
-    "date",
-];
-
 pub async fn check(
     method: &'static str,
     url: &str,
@@ -66,31 +55,36 @@ pub async fn check(
 ) -> Result<reqwest::Response, ApiError> {
     let status = resp.status();
     if status.is_success() {
-        super::debuglog::log(&[
-            ("event", "response".to_string()),
-            ("method", method.to_string()),
-            ("url", url.to_string()),
-            ("status", status.as_u16().to_string()),
-        ]);
+        tracing::debug!(target: "jhc::api", method, url, status = status.as_u16(), "response");
         return Ok(resp);
     }
-    let mut fields = vec![
-        ("event", "response".to_string()),
-        ("method", method.to_string()),
-        ("url", url.to_string()),
-        ("status", status.as_u16().to_string()),
-    ];
-    for name in DIAGNOSTIC_HEADERS {
-        if let Some(value) = resp.headers().get(name) {
-            fields.push((name, String::from_utf8_lossy(value.as_bytes()).to_string()));
-        }
-    }
+    // These headers distinguish the hub itself (server/x-jupyterhub-version)
+    // from a proxy in front of it, and carry auth hints (www-authenticate) and
+    // timing (date). Captured before consuming the body below.
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).to_string())
+    };
+    let server_h = header("server");
+    let jh_version = header("x-jupyterhub-version");
+    let www_auth = header("www-authenticate");
+    let content_type = header("content-type");
+    let date_h = header("date");
     let body = resp.text().await.unwrap_or_default();
-    fields.push((
-        "body",
-        super::debuglog::snippet(&body, super::debuglog::BODY_SNIPPET_CHARS),
-    ));
-    super::debuglog::log(&fields);
+    tracing::warn!(
+        target: "jhc::api",
+        method,
+        url,
+        status = status.as_u16(),
+        server = ?server_h,
+        x_jupyterhub_version = ?jh_version,
+        www_authenticate = ?www_auth,
+        content_type = ?content_type,
+        date = ?date_h,
+        body = %crate::logging::snippet(&body, crate::logging::BODY_SNIPPET_CHARS),
+        "response error"
+    );
     match status.as_u16() {
         401 => Err(ApiError::Unauthorized {
             method,

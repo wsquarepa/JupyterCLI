@@ -65,11 +65,9 @@ async fn dashboard_loop(
     hub_flag: Option<&str>,
 ) -> Result<(), CliError> {
     let (hub_name, hub) = cfg.resolve_hub(hub_flag)?;
-    // Verbose logging and retry warnings stay off in the TUI: stderr writes would
-    // corrupt the alternate screen. JHC_DEBUG_LOG still works here (file-backed).
     let token = hub.effective_token();
     crate::api::log_client_init(hub_name, &hub.url, &token);
-    let client = HubClient::new(&hub.url, &token)?.with_retry_warnings(false);
+    let client = HubClient::new(&hub.url, &token)?;
     let size = crossterm::terminal::size().unwrap_or((80, 24));
     let mut app = app::App::new(
         hub_name.to_string(),

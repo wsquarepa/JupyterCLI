@@ -25,7 +25,7 @@ impl ServerClient {
             http: reqwest::Client::new(),
             base,
             token: hub.token().to_string(),
-            verbose: hub.verbose(),
+            verbose: false,
         })
     }
 

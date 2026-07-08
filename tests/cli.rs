@@ -244,8 +244,9 @@ async fn verbose_prints_request_summaries_without_the_token() {
         .unwrap();
     assert!(status.status.success());
     let stderr = String::from_utf8(status.stderr).unwrap();
-    assert!(stderr.contains("jhc: GET"), "stderr was: {stderr}");
-    assert!(stderr.contains("-> 200"));
+    assert!(stderr.contains("jhc::api"), "stderr was: {stderr}");
+    assert!(stderr.contains("request"), "stderr was: {stderr}");
+    assert!(stderr.contains("GET"), "stderr was: {stderr}");
     assert!(
         !stderr.contains("supersecrettok"),
         "token must never appear in verbose output"
@@ -260,6 +261,6 @@ async fn verbose_prints_request_summaries_without_the_token() {
     assert!(
         !String::from_utf8(quiet.stderr)
             .unwrap()
-            .contains("jhc: GET")
+            .contains("jhc::api")
     );
 }
