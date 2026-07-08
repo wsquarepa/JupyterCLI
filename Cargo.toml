@@ -17,9 +17,12 @@ rpassword = "7.5.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
+time = { version = "0.3.53", features = ["formatting", "macros"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-std", "io-util", "process"] }
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
 toml = "1.1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 vt100 = "0.16.2"
 
 [dev-dependencies]
