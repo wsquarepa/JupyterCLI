@@ -165,12 +165,16 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
         }
         None => block.title(" Terminals "),
     };
-    if focused {
+    if focused && app.spawn.is_none() {
         block = block.title_bottom(Line::from(" Enter: attach  n: new  x: kill ").centered());
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if let Some(spawn) = &app.spawn {
+        draw_spawn(frame, app, spawn, inner);
+        return;
+    }
     if app.committed_server.is_none() {
         return;
     }
@@ -223,6 +227,119 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().fg(theme::DIMMED));
         frame.render_widget(Clear, bottom);
         frame.render_widget(notice, bottom);
+    }
+}
+
+const SPAWN_BAR_WIDTH: u16 = 44;
+const SPAWN_LOG_LINES: usize = 6;
+
+fn render_centered_line(frame: &mut Frame, inner: Rect, y: u16, line: Line<'static>) {
+    if y >= inner.bottom() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(line.centered()),
+        Rect::new(inner.x, y, inner.width, 1),
+    );
+}
+
+fn draw_spawn(frame: &mut Frame, app: &App, spawn: &super::app::SpawnView, inner: Rect) {
+    use super::app::SpawnOutcome;
+
+    let (title, accent) = match &spawn.outcome {
+        Some(SpawnOutcome::Ready { .. }) => {
+            (format!("{} is ready", spawn.server), theme::STATE_READY)
+        }
+        Some(SpawnOutcome::Failed { .. }) => ("spawn failed".to_string(), theme::STATUS_ERROR_BG),
+        None => (format!("Starting {}", spawn.server), theme::STATE_PENDING),
+    };
+    let y0 = inner.y + inner.height / 5;
+    render_centered_line(
+        frame,
+        inner,
+        y0,
+        Line::from(Span::styled(title, Style::default().fg(accent))),
+    );
+
+    let current = match &spawn.outcome {
+        Some(SpawnOutcome::Failed { message, .. }) => message.clone(),
+        _ => spawn
+            .log
+            .last()
+            .map(|l| l.message.clone())
+            .unwrap_or_else(|| "waiting for the hub".to_string()),
+    };
+    let message_line = if spawn.outcome.is_none() {
+        let glyph =
+            super::app::SPINNER_FRAMES[app.spinner_frame % super::app::SPINNER_FRAMES.len()];
+        Line::from(vec![
+            Span::styled(glyph.to_string(), Style::default().fg(theme::SPINNER)),
+            Span::raw(format!("  {current}")),
+        ])
+    } else {
+        Line::from(Span::styled(current, Style::default().fg(accent)))
+    };
+    render_centered_line(frame, inner, y0 + 2, message_line);
+
+    let bar_width = SPAWN_BAR_WIDTH.min(inner.width.saturating_sub(8));
+    let pct = spawn.shown as u16;
+    let fill = usize::from(pct * bar_width / 100);
+    let bar = Line::from(vec![
+        Span::styled("[", Style::default().fg(theme::DIMMED)),
+        Span::styled("█".repeat(fill), Style::default().fg(accent)),
+        Span::styled(
+            "░".repeat(usize::from(bar_width) - fill),
+            Style::default().fg(theme::SHIM[0]),
+        ),
+        Span::styled("]", Style::default().fg(theme::DIMMED)),
+        Span::raw(format!(" {pct:>3}%")),
+    ]);
+    render_centered_line(frame, inner, y0 + 4, bar);
+    render_centered_line(
+        frame,
+        inner,
+        y0 + 6,
+        Line::from(Span::styled(
+            format!("elapsed {:.1}s", f64::from(spawn.elapsed_ticks) / 10.0),
+            Style::default().fg(theme::DIMMED),
+        )),
+    );
+
+    let log_y = y0 + 9;
+    let start = spawn.log.len().saturating_sub(SPAWN_LOG_LINES);
+    let recent = &spawn.log[start..];
+    let log_x = inner.x + inner.width.saturating_sub(bar_width + 7) / 2;
+    let lines: Vec<Line> = recent
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let newest = i + 1 == recent.len();
+            let style = if newest {
+                Style::default()
+            } else {
+                Style::default().fg(theme::DIMMED)
+            };
+            Line::from(Span::styled(
+                format!(
+                    "{:>6.1}s  {}",
+                    f64::from(entry.at_ticks) / 10.0,
+                    entry.message
+                ),
+                style,
+            ))
+        })
+        .collect();
+    let height = (inner.bottom().saturating_sub(log_y)).min(lines.len() as u16);
+    if height > 0 && log_y < inner.bottom() {
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect::new(
+                log_x,
+                log_y,
+                inner.width.saturating_sub(log_x - inner.x),
+                height,
+            ),
+        );
     }
 }
 
@@ -736,5 +853,55 @@ mod tests {
         let (app, _) = app_with_servers();
         let text = rendered_sized(&app, 150, 30);
         assert!(text.contains("+ new named server"), "buffer:\n{text}");
+    }
+
+    #[test]
+    fn spawn_takeover_replaces_the_grid() {
+        let (mut app, _) = app_with_servers();
+        app.spawn = Some(crate::tui::app::SpawnView {
+            op: 5,
+            server: "gpu-a100".to_string(),
+            reported: 35,
+            shown: 38.0,
+            elapsed_ticks: 42,
+            log: vec![
+                crate::tui::app::SpawnLogLine {
+                    at_ticks: 0,
+                    message: "Server requested".to_string(),
+                },
+                crate::tui::app::SpawnLogLine {
+                    at_ticks: 30,
+                    message: "Pod scheduled on node gpu-07".to_string(),
+                },
+            ],
+            outcome: None,
+        });
+        let text = rendered(&app);
+        assert!(text.contains("Starting gpu-a100"), "buffer:\n{text}");
+        assert!(text.contains("38%"), "buffer:\n{text}");
+        assert!(text.contains("elapsed 4.2s"), "buffer:\n{text}");
+        assert!(
+            text.contains("Pod scheduled on node gpu-07"),
+            "buffer:\n{text}"
+        );
+        assert!(text.contains('█'), "bar fill glyph:\n{text}");
+        assert!(
+            !text.contains("Enter: attach"),
+            "hints hidden during takeover"
+        );
+
+        app.spawn.as_mut().unwrap().outcome =
+            Some(crate::tui::app::SpawnOutcome::Ready { ticks_left: 5 });
+        app.spawn.as_mut().unwrap().shown = 100.0;
+        let text = rendered(&app);
+        assert!(text.contains("gpu-a100 is ready"), "buffer:\n{text}");
+
+        app.spawn.as_mut().unwrap().outcome = Some(crate::tui::app::SpawnOutcome::Failed {
+            message: "quota exceeded".to_string(),
+            ticks_left: 5,
+        });
+        let text = rendered(&app);
+        assert!(text.contains("spawn failed"), "buffer:\n{text}");
+        assert!(text.contains("quota exceeded"), "buffer:\n{text}");
     }
 }
