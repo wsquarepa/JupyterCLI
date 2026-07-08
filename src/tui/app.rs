@@ -13,6 +13,7 @@ pub const HOVER_DEBOUNCE: Duration = Duration::from_millis(300);
 pub const REJECT_FLASH_DURATION: Duration = Duration::from_millis(150);
 pub const SPAWN_FLASH_TICKS: u8 = 9;
 pub const GHOST_FLASH_TICKS: u8 = 4;
+pub const DISSOLVE_TICKS: u32 = 7;
 const SPAWN_CREEP_CAP: f32 = 96.0;
 const SPAWN_CREEP_LEAD: f32 = 12.0;
 
@@ -113,6 +114,18 @@ pub enum GhostPhase {
 pub struct Ghost {
     pub op: u64,
     pub phase: GhostPhase,
+}
+
+/// Optimistic kill state: the entry stays in `terminals` while dissolving
+/// and is removed only once both the animation window has elapsed and the
+/// op confirmed, so a failed kill can restore the card untouched.
+#[derive(Debug)]
+pub struct Dissolve {
+    pub op: u64,
+    pub terminal: String,
+    pub age_ticks: u32,
+    pub confirmed: bool,
+    pub seed: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +298,7 @@ pub struct App {
     pub peek: Option<PeekState>,
     pub spawn: Option<SpawnView>,
     pub ghost: Option<Ghost>,
+    pub dissolve: Option<Dissolve>,
     server_hover: Option<ServerHover>,
     peek_op: Option<u64>,
     pending_select: Option<String>,
@@ -322,6 +336,7 @@ impl App {
             peek: None,
             spawn: None,
             ghost: None,
+            dissolve: None,
             server_hover: None,
             peek_op: None,
             pending_select: None,
@@ -447,6 +462,21 @@ impl App {
             if expired {
                 self.ghost = None;
             }
+        }
+        let mut dissolved: Option<String> = None;
+        if let Some(dissolve) = &mut self.dissolve {
+            dissolve.age_ticks += 1;
+            if dissolve.age_ticks >= DISSOLVE_TICKS && dissolve.confirmed {
+                dissolved = Some(dissolve.terminal.clone());
+            }
+        }
+        if let Some(name) = dissolved {
+            self.dissolve = None;
+            self.terminals.retain(|t| t.name != name);
+            let count = self.displayed_terminals().len();
+            self.grid_cursor = self.grid_cursor.min(count.saturating_sub(1));
+            self.ensure_grid_cursor_visible();
+            self.fetch_committed_terminals(false);
         }
         if let Some(super::dialogs::Dialog::CreateNamed(create)) = &mut self.dialog
             && let Some(since) = create.flash
@@ -710,8 +740,16 @@ impl App {
                         ticks_left: SPAWN_FLASH_TICKS,
                     });
                 }
+                let dissolving = self.dissolve.as_ref().is_some_and(|d| d.op == op);
+                if let Some(dissolve) = &mut self.dissolve
+                    && dissolve.op == op
+                {
+                    dissolve.confirmed = true;
+                }
                 self.set_status(message, false, now);
-                self.request_reconcile();
+                if !dissolving {
+                    self.request_reconcile();
+                }
             }
             AppEvent::OpFailed { op, message } => {
                 self.finish_op(op);
@@ -739,6 +777,9 @@ impl App {
                     ghost.phase = GhostPhase::Failed {
                         ticks_left: GHOST_FLASH_TICKS,
                     };
+                }
+                if self.dissolve.as_ref().is_some_and(|d| d.op == op) {
+                    self.dissolve = None;
                 }
                 self.set_status(message, true, now);
             }
@@ -880,7 +921,7 @@ impl App {
     }
 
     /// push_effect plus client-side expectation state for effects that get
-    /// region-scale feedback (spawn takeover now; dissolve joins in later).
+    /// region-scale feedback: spawn takeover and kill dissolve.
     fn push_tracked(&mut self, effect: Effect) -> Option<u64> {
         let spawn_server = match &effect {
             Effect::Start { server, .. } => {
@@ -888,9 +929,24 @@ impl App {
             }
             _ => None,
         };
+        let kill_target = match &effect {
+            Effect::KillTerminal { terminal, .. } => Some(terminal.clone()),
+            _ => None,
+        };
         let op = self.push_effect(effect);
         if let (Some(server), Some(op)) = (spawn_server, op) {
             self.spawn = Some(SpawnView::new(op, server));
+        }
+        if let (Some(terminal), Some(op)) = (kill_target, op) {
+            self.dissolve = Some(Dissolve {
+                op,
+                terminal,
+                age_ticks: 0,
+                confirmed: false,
+                // Op-derived seed keeps the decay pattern stable across
+                // repaints and distinct across kills.
+                seed: (op as u32) ^ 0x9e37_79b9,
+            });
         }
         op
     }
@@ -1615,6 +1671,100 @@ mod tests {
         }
         assert!(app.ghost.is_none());
         assert_eq!(app.terminals.len(), 1, "no terminal was added");
+    }
+
+    #[test]
+    fn kill_dissolves_then_removes_after_confirm() {
+        let (mut app, now) = committed_app(&["1", "2"]);
+        app.on_dialog_outcome(crate::tui::dialogs::Outcome::Commit(Effect::KillTerminal {
+            op: 0,
+            server: "default".to_string(),
+            url: "/user/u/".to_string(),
+            terminal: "2".to_string(),
+        }));
+        let effects = app.take_effects();
+        let op = match effects.as_slice() {
+            [Effect::KillTerminal { op, .. }] => *op,
+            other => panic!("unexpected effects: {other:?}"),
+        };
+        let dissolve = app.dissolve.as_ref().expect("dissolve created");
+        assert_eq!(dissolve.terminal, "2");
+        assert_eq!(dissolve.op, op);
+        assert_eq!(
+            app.terminals.len(),
+            2,
+            "optimistic remove waits for the animation"
+        );
+
+        app.apply(
+            AppEvent::OpDone {
+                op,
+                message: "killed terminal 2 on default".to_string(),
+            },
+            now,
+        );
+        assert!(app.dissolve.as_ref().unwrap().confirmed);
+        assert!(
+            app.take_effects().is_empty(),
+            "reconcile is deferred until the animation finishes"
+        );
+
+        for _ in 0..DISSOLVE_TICKS {
+            app.tick(now);
+        }
+        assert!(app.dissolve.is_none());
+        assert_eq!(app.terminals.len(), 1);
+        let effects = app.take_effects();
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::FetchTerminals { loud: false, .. }]
+            ),
+            "unexpected effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn kill_failure_restores_the_card() {
+        let (mut app, now) = committed_app(&["1", "2"]);
+        app.on_dialog_outcome(crate::tui::dialogs::Outcome::Commit(Effect::KillTerminal {
+            op: 0,
+            server: "default".to_string(),
+            url: "/user/u/".to_string(),
+            terminal: "2".to_string(),
+        }));
+        let op = app.dissolve.as_ref().unwrap().op;
+        let _ = app.take_effects();
+        app.apply(
+            AppEvent::OpFailed {
+                op,
+                message: "terminal is busy".to_string(),
+            },
+            now,
+        );
+        assert!(app.dissolve.is_none());
+        assert_eq!(app.terminals.len(), 2);
+        assert!(app.status.as_ref().is_some_and(|s| s.error));
+    }
+
+    #[test]
+    fn dissolve_animation_waits_for_confirmation() {
+        let (mut app, now) = committed_app(&["1"]);
+        app.on_dialog_outcome(crate::tui::dialogs::Outcome::Commit(Effect::KillTerminal {
+            op: 0,
+            server: "default".to_string(),
+            url: "/user/u/".to_string(),
+            terminal: "1".to_string(),
+        }));
+        let _ = app.take_effects();
+        for _ in 0..(DISSOLVE_TICKS * 3) {
+            app.tick(now);
+        }
+        assert!(
+            app.dissolve.is_some(),
+            "an unconfirmed kill must not remove the entry"
+        );
+        assert_eq!(app.terminals.len(), 1);
     }
 
     #[test]
