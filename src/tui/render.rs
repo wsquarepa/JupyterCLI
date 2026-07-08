@@ -179,7 +179,7 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let cards = app.displayed_terminals();
-    if cards.is_empty() {
+    if cards.is_empty() && app.ghost.is_none() {
         let hint = Paragraph::new(
             Line::from(Span::styled(
                 "no terminals; press n to create one",
@@ -216,6 +216,21 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect) {
             rect,
             inner,
         );
+    }
+
+    if let Some(ghost) = &app.ghost {
+        let slot = cards.len();
+        let row = slot / columns;
+        if row >= app.grid_scroll && row < app.grid_scroll + visible_rows {
+            let col = slot % columns;
+            let x = inner.x + offsets[col];
+            let y =
+                inner.y + ((row - app.grid_scroll) as u16) * (grid::CARD_HEIGHT + grid::CARD_VGAP);
+            let rect = Rect::new(x, y, grid::CARD_WIDTH, grid::CARD_HEIGHT);
+            if rect.right() <= inner.right() && rect.bottom() <= inner.bottom() {
+                draw_ghost_card(frame, ghost, app.spinner_frame, rect);
+            }
+        }
     }
 
     if app.terminals.len() > grid::DISPLAY_CAP && inner.height >= 2 {
@@ -358,6 +373,96 @@ fn draw_card(frame: &mut Frame, terminal: &TerminalRow, hovered: bool, rect: Rec
         Line::from(">_"),
         Line::from(""),
         Line::from(grid::card_label(&terminal.name)).centered(),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Border drawn cell by cell so the marching gradient can color each segment
+/// independently, which Block's single border_style cannot do.
+fn draw_march_border(frame: &mut Frame, rect: Rect, frame_count: usize) {
+    let mut points: Vec<(u16, u16, &str)> = Vec::new();
+    for i in 0..rect.width {
+        points.push((rect.x + i, rect.y, "─"));
+    }
+    for j in 1..rect.height.saturating_sub(1) {
+        points.push((rect.right() - 1, rect.y + j, "│"));
+    }
+    for i in (0..rect.width).rev() {
+        points.push((rect.x + i, rect.bottom() - 1, "─"));
+    }
+    for j in (1..rect.height.saturating_sub(1)).rev() {
+        points.push((rect.x, rect.y + j, "│"));
+    }
+    let len = points.len();
+    let buf = frame.buffer_mut();
+    for (k, (x, y, glyph)) in points.into_iter().enumerate() {
+        let glyph = match (
+            x == rect.x,
+            x == rect.right() - 1,
+            y == rect.y,
+            y == rect.bottom() - 1,
+        ) {
+            (true, _, true, _) => "┌",
+            (_, true, true, _) => "┐",
+            (true, _, _, true) => "└",
+            (_, true, _, true) => "┘",
+            _ => glyph,
+        };
+        let level = super::anim::march_level(frame_count, k, len);
+        buf[(x, y)]
+            .set_symbol(glyph)
+            .set_fg(theme::GHOST_RAMP[level]);
+    }
+}
+
+fn draw_ghost_card(frame: &mut Frame, ghost: &super::app::Ghost, frame_count: usize, rect: Rect) {
+    use super::app::GhostPhase;
+    match &ghost.phase {
+        GhostPhase::Creating => {
+            draw_march_border(frame, rect, frame_count);
+            let inner = Rect::new(
+                rect.x + 1,
+                rect.y + 1,
+                rect.width.saturating_sub(2),
+                rect.height.saturating_sub(2),
+            );
+            let dots = ".".repeat(1 + frame_count / 3 % 3);
+            let shimmer: Line = Line::from(
+                (0..inner.width)
+                    .map(|i| {
+                        let level = super::anim::shimmer_level(frame_count, i, 0);
+                        Span::styled("░", Style::default().fg(theme::SHIM[level]))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let lines = vec![
+                Line::from(Span::styled(
+                    format!("creating{dots}"),
+                    Style::default().fg(theme::STATE_PENDING),
+                )),
+                Line::from(""),
+                Line::from(""),
+                shimmer,
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        GhostPhase::Confirmed { .. } => {
+            draw_flash_card(frame, rect, "created", theme::BORDER_FOCUSED)
+        }
+        GhostPhase::Failed { .. } => draw_flash_card(frame, rect, "failed", theme::STATUS_ERROR_BG),
+    }
+}
+
+fn draw_flash_card(frame: &mut Frame, rect: Rect, label: &str, color: ratatui::style::Color) {
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let lines = vec![
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(label.to_string(), Style::default().fg(color))).centered(),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -853,6 +958,24 @@ mod tests {
         let (app, _) = app_with_servers();
         let text = rendered_sized(&app, 150, 30);
         assert!(text.contains("+ new named server"), "buffer:\n{text}");
+    }
+
+    #[test]
+    fn ghost_card_occupies_the_next_slot() {
+        let (mut app, _) = committed(&["1"]);
+        app.ghost = Some(crate::tui::app::Ghost {
+            op: 9,
+            phase: crate::tui::app::GhostPhase::Creating,
+        });
+        let text = rendered(&app);
+        assert!(text.contains("creating"), "buffer:\n{text}");
+
+        app.ghost.as_mut().unwrap().phase =
+            crate::tui::app::GhostPhase::Confirmed { ticks_left: 3 };
+        assert!(rendered(&app).contains("created"));
+
+        app.ghost.as_mut().unwrap().phase = crate::tui::app::GhostPhase::Failed { ticks_left: 3 };
+        assert!(rendered(&app).contains("failed"));
     }
 
     #[test]
