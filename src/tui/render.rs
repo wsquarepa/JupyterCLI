@@ -37,7 +37,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     draw_statusbar(frame, app, rows[1]);
     if let Some(dialog) = &app.dialog {
-        super::dialogs::render_dialog(frame, dialog, app.spinner_frame);
+        super::dialogs::render_dialog(frame, dialog);
     }
 }
 
@@ -300,6 +300,9 @@ fn draw_skeleton(frame: &mut Frame, app: &App, inner: Rect) {
 
 const SPAWN_BAR_WIDTH: u16 = 44;
 const SPAWN_LOG_LINES: usize = 6;
+/// Left-aligned `{secs:.1}s` column width in the spawn log (right-padded so
+/// short stamps keep a gap before the message, matching the old 6-wide field).
+const SPAWN_LOG_STAMP_WIDTH: usize = 6;
 
 fn render_centered_line(frame: &mut Frame, inner: Rect, y: u16, line: Line<'static>) {
     if y >= inner.bottom() {
@@ -309,6 +312,56 @@ fn render_centered_line(frame: &mut Frame, inner: Rect, y: u16, line: Line<'stat
         Paragraph::new(line.centered()),
         Rect::new(inner.x, y, inner.width, 1),
     );
+}
+
+/// Truncate `text` to `budget` columns, using a trailing `...` when clipped.
+fn ellipsize(text: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    let len = text.chars().count();
+    if len <= budget {
+        return text.to_string();
+    }
+    if budget <= 3 {
+        return ".".repeat(budget);
+    }
+    let mut out: String = text.chars().take(budget - 3).collect();
+    out.push_str("...");
+    out
+}
+
+/// One spawn log row: left-aligned timestamp column, message centered in
+/// `width` when it fits without covering the stamp, otherwise left-aligned
+/// after the stamp and ellipsized to the remaining columns.
+fn format_spawn_log_line(width: usize, at_ticks: u32, message: &str) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let stamp = format!("{:.1}s", f64::from(at_ticks) / 10.0);
+    let stamp_width = SPAWN_LOG_STAMP_WIDTH.max(stamp.chars().count());
+    if width <= stamp_width {
+        return ellipsize(&stamp, width);
+    }
+    let stamp_field = format!("{stamp:<stamp_width$}");
+    let msg_len = message.chars().count();
+    let ideal_start = width.saturating_sub(msg_len) / 2;
+    let (msg_start, text) = if ideal_start >= stamp_width && ideal_start + msg_len <= width {
+        (ideal_start, message.to_string())
+    } else {
+        let budget = width - stamp_width;
+        if msg_len <= budget {
+            (stamp_width, message.to_string())
+        } else {
+            (stamp_width, ellipsize(message, budget))
+        }
+    };
+    let mut out = stamp_field;
+    while out.chars().count() < msg_start {
+        out.push(' ');
+    }
+    out.push_str(&text);
+    out.chars().take(width).collect()
 }
 
 fn draw_spawn(frame: &mut Frame, app: &App, spawn: &super::app::SpawnView, inner: Rect) {
@@ -376,37 +429,22 @@ fn draw_spawn(frame: &mut Frame, app: &App, spawn: &super::app::SpawnView, inner
     let log_y = y0 + 9;
     let start = spawn.log.len().saturating_sub(SPAWN_LOG_LINES);
     let recent = &spawn.log[start..];
-    let log_x = inner.x + inner.width.saturating_sub(bar_width + 7) / 2;
-    let lines: Vec<Line> = recent
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            let newest = i + 1 == recent.len();
-            let style = if newest {
-                Style::default()
-            } else {
-                Style::default().fg(theme::DIMMED)
-            };
-            Line::from(Span::styled(
-                format!(
-                    "{:>6.1}s  {}",
-                    f64::from(entry.at_ticks) / 10.0,
-                    entry.message
-                ),
-                style,
-            ))
-        })
-        .collect();
-    let height = (inner.bottom().saturating_sub(log_y)).min(lines.len() as u16);
-    if height > 0 && log_y < inner.bottom() {
+    let log_width = usize::from(inner.width);
+    for (i, entry) in recent.iter().enumerate() {
+        let y = log_y + i as u16;
+        if y >= inner.bottom() {
+            break;
+        }
+        let newest = i + 1 == recent.len();
+        let style = if newest {
+            Style::default()
+        } else {
+            Style::default().fg(theme::DIMMED)
+        };
+        let text = format_spawn_log_line(log_width, entry.at_ticks, &entry.message);
         frame.render_widget(
-            Paragraph::new(lines),
-            Rect::new(
-                log_x,
-                log_y,
-                inner.width.saturating_sub(log_x - inner.x),
-                height,
-            ),
+            Paragraph::new(Line::from(Span::styled(text, style))),
+            Rect::new(inner.x, y, inner.width, 1),
         );
     }
 }
@@ -1207,5 +1245,140 @@ mod tests {
         let text = rendered(&app);
         assert!(text.contains("spawn failed"), "buffer:\n{text}");
         assert!(text.contains("quota exceeded"), "buffer:\n{text}");
+    }
+
+    #[test]
+    fn create_named_starting_dialog_does_not_cover_spawn_progress() {
+        let (mut app, _) = app_with_servers();
+        app.spawn = Some(crate::tui::app::SpawnView {
+            op: 7,
+            server: "gpu".to_string(),
+            reported: 40,
+            shown: 42.0,
+            elapsed_ticks: 20,
+            log: vec![crate::tui::app::SpawnLogLine {
+                at_ticks: 10,
+                message: "Pod scheduled".to_string(),
+            }],
+            outcome: None,
+        });
+        app.dialog = Some(crate::tui::dialogs::Dialog::CreateNamed({
+            let mut create =
+                crate::tui::dialogs::CreateNamedDialog::new(&std::collections::BTreeMap::new());
+            for c in "gpu".chars() {
+                create.input.on_key(&crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(c),
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            }
+            create.op = Some(7);
+            create.step = crate::tui::dialogs::CreateStep::Starting;
+            create
+        }));
+        let text = rendered(&app);
+        assert!(text.contains("Starting gpu"), "progress visible:\n{text}");
+        assert!(text.contains("42%"), "progress bar visible:\n{text}");
+        assert!(
+            !text.contains("Create named server"),
+            "starting dialog must not cover the progress takeover:\n{text}"
+        );
+        assert!(
+            !text.contains("starting 'gpu'"),
+            "starting spinner dialog must not cover progress:\n{text}"
+        );
+    }
+
+    #[test]
+    fn format_spawn_log_line_left_aligns_stamp_and_centers_short_message() {
+        let line = format_spawn_log_line(40, 20, "ready");
+        assert!(
+            line.starts_with("2.0s"),
+            "stamp is left-aligned, not right-padded: {line:?}"
+        );
+        assert!(
+            !line.starts_with(' '),
+            "no leading spaces before stamp: {line:?}"
+        );
+        let msg_at = line.find("ready").expect("message present");
+        // "ready" (5) centered in 40: start 17; stamp column is 6, so no clash.
+        assert_eq!(msg_at, 17, "short message is centered: {line:?}");
+        assert_eq!(line.chars().count(), 22); // stamp..message, no trailing pad required
+    }
+
+    #[test]
+    fn format_spawn_log_line_left_aligns_and_ellipsizes_when_message_is_long() {
+        let message = "This is an ultra long line which will exceed the window width and more";
+        let line = format_spawn_log_line(40, 40, message);
+        assert!(line.starts_with("4.0s"), "stamp left-aligned: {line:?}");
+        assert!(
+            line.ends_with("..."),
+            "long message ends with ellipsis: {line:?}"
+        );
+        assert_eq!(line.chars().count(), 40, "fits the width exactly: {line:?}");
+        // Message starts at the stamp column (no overlap).
+        let after_stamp = &line[SPAWN_LOG_STAMP_WIDTH..];
+        assert!(
+            after_stamp.starts_with("This is"),
+            "message left-aligned after stamp: {line:?}"
+        );
+        assert!(!line.contains("and more"), "tail is clipped: {line:?}");
+    }
+
+    #[test]
+    fn format_spawn_log_line_left_aligns_message_when_centering_would_hit_stamp() {
+        // Wide message that fits after the stamp but whose centered start would
+        // land inside the stamp column.
+        let message = "abcdefghij"; // 10 chars
+        let width = 20;
+        // Centered start would be (20-10)/2 = 5, but stamp column is 6.
+        let line = format_spawn_log_line(width, 0, message);
+        assert!(line.starts_with("0.0s"), "{line:?}");
+        assert_eq!(
+            line.find(message),
+            Some(SPAWN_LOG_STAMP_WIDTH),
+            "falls back to left-align after stamp: {line:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_log_lines_stamp_left_message_centered_in_the_grid_pane() {
+        let (mut app, _) = app_with_servers();
+        let message = "Pod scheduled on node gpu-07";
+        app.spawn = Some(crate::tui::app::SpawnView {
+            op: 5,
+            server: "gpu-a100".to_string(),
+            reported: 35,
+            shown: 38.0,
+            elapsed_ticks: 42,
+            log: vec![crate::tui::app::SpawnLogLine {
+                at_ticks: 30,
+                message: message.to_string(),
+            }],
+            outcome: None,
+        });
+        let text = rendered(&app);
+        let line = text
+            .lines()
+            .find(|l| l.contains(message) && l.contains("3.0s"))
+            .unwrap_or_else(|| panic!("log line missing:\n{text}"));
+        let pane_start = line
+            .find("││")
+            .map(|i| i + "││".len())
+            .unwrap_or_else(|| panic!("grid pane borders missing:\n{line}"));
+        let pane_end = line[pane_start..]
+            .rfind('│')
+            .map(|i| pane_start + i)
+            .unwrap_or(line.len());
+        let pane = &line[pane_start..pane_end];
+        let stamp_at = pane.find("3.0s").expect("stamp in pane");
+        assert_eq!(stamp_at, 0, "stamp is left-aligned in the pane:\n{pane:?}");
+        let msg_at = pane.find(message).expect("message in pane");
+        let msg_end = msg_at + message.len();
+        let left_pad = msg_at;
+        let right_pad = pane.len().saturating_sub(msg_end);
+        assert!(
+            left_pad.abs_diff(right_pad) <= 1,
+            "message text should be centered, left_pad={left_pad} right_pad={right_pad}:\n{pane:?}\nfull:\n{text}"
+        );
     }
 }

@@ -359,7 +359,7 @@ fn parse_permalink(raw: &str) -> Result<JsonMap, String> {
         .map_err(|e| format!("permalink options are not valid JSON: {e}"))
 }
 
-pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
+pub fn render_dialog(frame: &mut Frame, dialog: &Dialog) {
     let area = frame.area();
     match dialog {
         Dialog::Start(start) => {
@@ -409,6 +409,12 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
             );
         }
         Dialog::CreateNamed(create) => {
+            // Spawn takeover already paints progress for this create; drawing
+            // the dialog would cover the bar. Keep the dialog in state so Esc
+            // and failure recovery still work, but paint nothing.
+            if matches!(create.step, CreateStep::Starting) {
+                return;
+            }
             let mut lines: Vec<Line> = Vec::new();
             match create.step {
                 CreateStep::Name => {
@@ -436,12 +442,7 @@ pub fn render_dialog(frame: &mut Frame, dialog: &Dialog, spinner_frame: usize) {
                     }
                     lines.extend(render_picker(&create.picker, super::wizard::CONTENT_WIDTH));
                 }
-                CreateStep::Starting => {
-                    let name = create.input.value();
-                    let glyph = crate::tui::app::SPINNER_FRAMES
-                        [spinner_frame % crate::tui::app::SPINNER_FRAMES.len()];
-                    lines.push(Line::from(format!("starting '{name}'  {glyph}")));
-                }
+                CreateStep::Starting => unreachable!("handled above"),
             }
             let hints = match create.step {
                 CreateStep::Name => " Enter: continue  Esc: cancel ",
@@ -651,7 +652,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_dialog(frame, &dialog, 0))
+            .draw(|frame| render_dialog(frame, &dialog))
             .unwrap();
         let text = crate::tui::render::buffer_text(&terminal);
         assert!(text.contains("Enter/y: confirm"), "buffer was:\n{text}");
@@ -665,7 +666,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_dialog(frame, &dialog, 0))
+            .draw(|frame| render_dialog(frame, &dialog))
             .unwrap();
         let text = crate::tui::render::buffer_text(&terminal);
         assert!(text.contains("Start the default server"));
@@ -681,9 +682,7 @@ mod tests {
     fn render_to_text(dialog: &Dialog) -> String {
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| render_dialog(frame, dialog, 0))
-            .unwrap();
+        terminal.draw(|frame| render_dialog(frame, dialog)).unwrap();
         crate::tui::render::buffer_text(&terminal)
     }
 
@@ -722,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn create_named_starting_step_shows_the_name_and_spinner() {
+    fn create_named_starting_step_is_not_drawn() {
         let now = std::time::Instant::now();
         let mut dialog = create_dialog();
         for c in ['g', 'p', 'u'] {
@@ -733,7 +732,16 @@ mod tests {
             d.step = CreateStep::Starting;
         }
         let text = render_to_text(&dialog);
-        assert!(text.contains("starting 'gpu'"), "buffer was:\n{text}");
+        // Starting hands progress off to the spawn takeover; drawing the
+        // dialog would cover the progress bar.
+        assert!(
+            !text.contains("Create named server"),
+            "starting dialog must stay invisible:\n{text}"
+        );
+        assert!(
+            !text.contains("starting 'gpu'"),
+            "starting dialog must stay invisible:\n{text}"
+        );
     }
 
     #[test]
