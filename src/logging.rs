@@ -1,7 +1,9 @@
-//! Logging setup and redaction helpers. CLI runs log to stderr gated by
-//! `RUST_LOG`; the TUI logs to an auto-named file because stderr writes would
-//! corrupt the alternate screen. Token material and terminal payload bytes are
-//! never recorded; a token appears only as a fingerprint.
+//! Logging setup and redaction helpers. CLI always installs a stderr
+//! subscriber (default `warn`; `--verbose` raises jhc to debug). The TUI only
+//! logs when `--verbose` or `RUST_LOG` is set, writing to an auto-named file
+//! because stderr would corrupt the alternate screen. Token material and
+//! terminal payload bytes are never recorded; a token appears only as a
+//! fingerprint.
 
 use std::path::PathBuf;
 
@@ -12,15 +14,17 @@ use tracing_subscriber::fmt::time::UtcTime;
 
 pub const BODY_SNIPPET_CHARS: usize = 2000;
 
-/// Default `RUST_LOG`-style directive used only when `RUST_LOG` is unset in CLI
-/// mode. `--verbose` raises jhc targets to debug; third-party stays at warn.
+/// Default `RUST_LOG`-style directive used only when `RUST_LOG` is unset.
+/// `--verbose` raises jhc targets to debug; third-party stays at warn.
 pub fn cli_directive(verbose: bool) -> &'static str {
     if verbose { "warn,jhc=debug" } else { "warn" }
 }
 
-/// Default directive for the TUI file sink when `RUST_LOG` is unset: capture all
-/// jhc instrumentation, keep third-party crates at warn.
-pub const TUI_DIRECTIVE: &str = "warn,jhc=debug";
+/// Whether the TUI should install a file log sink. Opt-in only: `--verbose`
+/// and/or a set `RUST_LOG` environment variable (presence, not value).
+pub fn tui_logging_active(verbose: bool, rust_log_present: bool) -> bool {
+    verbose || rust_log_present
+}
 
 /// `jhc-YYYYMMDDTHHMMSSZ-<pid>.log`. UTC keeps names sortable and unambiguous
 /// across timezones; the pid disambiguates same-second launches.
@@ -62,12 +66,16 @@ pub fn init_cli(verbose: bool) {
         .init();
 }
 
-/// Install the global file subscriber for the TUI and return the log path.
-/// Any I/O failure returns Err WITHOUT installing a subscriber: the diagnostics
-/// channel must never prevent the TUI from launching, and under the alternate
-/// screen there is nowhere to surface the error. With no subscriber installed,
-/// tracing events become no-ops.
-pub fn init_tui() -> std::io::Result<PathBuf> {
+/// Install the global file subscriber for the TUI when logging is requested.
+/// Returns `Ok(None)` when neither `--verbose` nor `RUST_LOG` is set (no file,
+/// no subscriber). Any I/O failure returns Err WITHOUT installing a subscriber:
+/// the diagnostics channel must never prevent the TUI from launching, and under
+/// the alternate screen there is nowhere to surface the error. With no
+/// subscriber installed, tracing events become no-ops.
+pub fn init_tui(verbose: bool) -> std::io::Result<Option<PathBuf>> {
+    if !tui_logging_active(verbose, std::env::var_os("RUST_LOG").is_some()) {
+        return Ok(None);
+    }
     let dir = dirs::state_dir()
         .or_else(dirs::cache_dir)
         .ok_or_else(|| std::io::Error::other("no state or cache directory"))?
@@ -79,8 +87,8 @@ pub fn init_tui() -> std::io::Result<PathBuf> {
         .create(true)
         .append(true)
         .open(&path)?;
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(TUI_DIRECTIVE));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(cli_directive(verbose)));
     // Mutex<File> serializes concurrent task writes so events never interleave.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -88,7 +96,7 @@ pub fn init_tui() -> std::io::Result<PathBuf> {
         .with_ansi(false)
         .with_writer(std::sync::Mutex::new(file))
         .init();
-    Ok(path)
+    Ok(Some(path))
 }
 
 #[cfg(test)]
@@ -119,5 +127,13 @@ mod tests {
     fn cli_directive_switches_on_verbose() {
         assert_eq!(cli_directive(false), "warn");
         assert_eq!(cli_directive(true), "warn,jhc=debug");
+    }
+
+    #[test]
+    fn tui_logging_active_only_with_verbose_or_rust_log() {
+        assert!(!tui_logging_active(false, false));
+        assert!(tui_logging_active(true, false));
+        assert!(tui_logging_active(false, true));
+        assert!(tui_logging_active(true, true));
     }
 }

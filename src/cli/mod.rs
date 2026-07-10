@@ -35,7 +35,7 @@ pub struct Cli {
     /// Hub profile from the config to use for this invocation
     #[arg(long, global = true)]
     pub hub: Option<String>,
-    /// Raise log verbosity to stderr (RUST_LOG=jhc=debug)
+    /// Raise log verbosity (RUST_LOG=jhc=debug). CLI writes to stderr; TUI writes to a log file.
     #[arg(long, global = true)]
     pub verbose: bool,
     #[command(subcommand)]
@@ -347,7 +347,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
     let ok = std::process::ExitCode::SUCCESS;
     match cli.command {
         None => {
-            crate::tui::run(cli.hub.as_deref()).await?;
+            crate::tui::run(cli.hub.as_deref(), cli.verbose).await?;
             Ok(ok)
         }
         Some(Command::Init { url, token, name }) => {

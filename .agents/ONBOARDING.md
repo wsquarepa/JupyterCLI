@@ -51,7 +51,7 @@ The TUI is a pure state machine driven by an async event loop, deliberately kept
 
 ### Logging
 
-`logging.rs` owns `tracing` subscriber setup via `tracing-subscriber`'s `EnvFilter`, so `RUST_LOG` controls filtering everywhere. CLI runs log to stderr (default `warn`; `--verbose` raises jhc targets to `warn,jhc=debug`); the TUI auto-writes a file under the XDG state dir (`dirs::state_dir()` falling back to `dirs::cache_dir()`, `jhc/logs/jhc-<UTC-timestamp>-<pid>.log`, printed on exit) because stderr writes would corrupt the alternate screen. Spans (`#[tracing::instrument]`) wrap the public async api methods and `exec`; events use `key=value` fields, never string-interpolated dynamic values. Redaction is mandatory: a token appears only as `fingerprint(token)` plus its length, and terminal/WS payload bytes are never logged (only direction and byte length, at `trace`).
+`logging.rs` owns `tracing` subscriber setup via `tracing-subscriber`'s `EnvFilter`, so `RUST_LOG` controls filtering everywhere. CLI runs always install a stderr subscriber (default `warn`; `--verbose` raises jhc targets to `warn,jhc=debug`). The TUI only logs when `--verbose` or `RUST_LOG` is set, and then writes a file under the XDG state dir (`dirs::state_dir()` falling back to `dirs::cache_dir()`, `jhc/logs/jhc-<UTC-timestamp>-<pid>.log`, printed on exit) because stderr writes would corrupt the alternate screen. Spans (`#[tracing::instrument]`) wrap the public async api methods and `exec`; events use `key=value` fields, never string-interpolated dynamic values. Redaction is mandatory: a token appears only as `fingerprint(token)` plus its length, and terminal/WS payload bytes are never logged (only direction and byte length, at `trace`).
 
 ## Testing conventions
 

@@ -33,11 +33,13 @@ A `403` means the token authenticates but lacks the scope for that operation. Ju
 
 A `403` whose body does not name a scope (JupyterHub replies with a bare `Forbidden`) means the token itself failed to resolve to an authorized user, not that it lacks a scope. This usually happens when the hub's authenticator requires a fresh browser login on some interval (for example a CILogon hub with `auth_refresh_age`), even though the token is otherwise valid. Sign in to the hub web UI at `<hub url>/hub/home` and retry.
 
-The TUI writes a diagnostic log to `~/.local/state/jhc/logs/jhc-<UTC-timestamp>-<pid>.log` (the exact path is printed when you exit the TUI). For CLI commands, raise verbosity to stderr with `--verbose`, or set `RUST_LOG` for fine-grained control:
+Logging is opt-in via `--verbose` or `RUST_LOG`. CLI commands write to stderr; the TUI writes to `~/.local/state/jhc/logs/jhc-<UTC-timestamp>-<pid>.log` (the path is printed when you exit, only if logging was enabled):
 
 ```sh
 jhc --verbose status
 RUST_LOG=jhc=debug jhc status
+jhc --verbose
+RUST_LOG=jhc=debug jhc
 ```
 
 ## Config File Permissions Warning

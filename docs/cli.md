@@ -12,7 +12,7 @@ These apply to every subcommand.
 |---|---|
 | `-V`, `--version` | Print version and exit |
 | `--hub <NAME>` | Hub profile from the config to use for this invocation; defaults to `default_hub` |
-| `--verbose` | Raise log verbosity to stderr (equivalent to RUST_LOG=jhc=debug) |
+| `--verbose` | Raise log verbosity (equivalent to RUST_LOG=jhc=debug). CLI writes to stderr; TUI writes to a log file under the XDG state dir |
 
 ## Address Syntax
 

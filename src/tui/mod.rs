@@ -19,8 +19,8 @@ use crate::config::{self, Config, ConfigError};
 
 const TICK_EVERY: Duration = Duration::from_millis(100);
 
-pub async fn run(hub_flag: Option<&str>) -> Result<(), CliError> {
-    let log_path = crate::logging::init_tui().ok();
+pub async fn run(hub_flag: Option<&str>, verbose: bool) -> Result<(), CliError> {
+    let log_path = crate::logging::init_tui(verbose).ok().flatten();
     let print_log_path = || {
         if let Some(path) = log_path.as_deref() {
             eprintln!("log: {}", path.display());
