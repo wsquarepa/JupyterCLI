@@ -230,8 +230,8 @@ pub fn wait_backoff(attempt: u32) -> std::time::Duration {
 // literal, fails the -d test, and the loop emits nothing. A remote bashrc that sets
 // failglob makes the probe exit non-zero instead, which surfaces as a loud probe
 // failure rather than a false "no jobs". A pid file is trusted only when it is all
-// digits: kill -0 on -1 or an empty string succeeds against the caller's own group and
-// would report a dead job alive.
+// digits without a leading zero: kill -0 on -1, 0, or an empty string succeeds against
+// the caller's own group and would report a dead job alive.
 // One line per job, fields separated by the ASCII unit separator (0x1f, printf \037):
 // id, exit code or -, pid-alive 1/0, started timestamp or -, meta.json base64 or -.
 // base64 keeps arbitrary metadata bytes from ever colliding with the delimiter.
@@ -244,7 +244,7 @@ pub fn build_probe_script(id: Option<&str>) -> String {
         "for d in {glob}; do [ -d \"$d\" ] || continue; \
          if [ -f \"$d/exit\" ]; then ec=$(cat \"$d/exit\"); else ec=-; fi; \
          if [ -f \"$d/pid\" ]; then pid=$(cat \"$d/pid\"); else pid=; fi; \
-         case \"$pid\" in ''|*[!0-9]*) alive=0;; *) if kill -0 \"$pid\" 2>/dev/null; then alive=1; else alive=0; fi;; esac; \
+         case \"$pid\" in ''|0*|*[!0-9]*) alive=0;; *) if kill -0 \"$pid\" 2>/dev/null; then alive=1; else alive=0; fi;; esac; \
          if [ -f \"$d/started\" ]; then st=$(cat \"$d/started\"); else st=-; fi; \
          if [ -f \"$d/meta.json\" ]; then meta=$(base64 -w0 < \"$d/meta.json\"); else meta=-; fi; \
          printf '%s\\037%s\\037%s\\037%s\\037%s\\n' \"$(basename \"$d\")\" \"$ec\" \"$alive\" \"$st\" \"$meta\"; \
@@ -460,11 +460,12 @@ mod tests {
 
     #[test]
     fn probe_treats_non_numeric_pid_files_as_dead() {
-        // `kill -0 -1` signals the caller's own group and succeeds, so a damaged pid
-        // file must never read as alive; a real live pid must.
+        // `kill -0 -1` and `kill -0 0` signal the caller's own group and succeed, so a
+        // damaged pid file must never read as alive; a real live pid must.
         let home = tempfile::tempdir().unwrap();
         let mut expected = Vec::new();
         for (id, pid, expect_alive) in [
+            ("aabbccd0", "0".to_string(), false),
             ("aabbccd1", "-1".to_string(), false),
             ("aabbccd2", String::new(), false),
             ("aabbccd3", "12abc".to_string(), false),
@@ -526,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_exit_codes_for_budget_and_interrupt_are_success() {
+    fn follow_exit_codes_for_budget_are_success() {
         for ok in [0, 124, 141] {
             assert!(follow_exit_ok(ok));
         }
