@@ -180,7 +180,7 @@ pub enum JobCmd {
         #[arg(long)]
         follow: bool,
         /// Stop following after this many seconds
-        #[arg(long, requires = "follow")]
+        #[arg(long, requires = "follow", value_parser = clap::value_parser!(u64).range(1..))]
         max_wait: Option<u64>,
         /// Emit at most this many bytes
         #[arg(long)]

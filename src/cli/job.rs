@@ -38,42 +38,35 @@ struct ScriptOutcome {
     exit_code: i32,
 }
 
-async fn run_script_on(
+async fn run_script_to(
     ctx: &Ctx,
     target: &JobTarget,
     script: &str,
-) -> Result<ScriptOutcome, CliError> {
+    out: &mut impl std::io::Write,
+) -> Result<i32, CliError> {
     let name = target.client.create_terminal().await?.name;
     let url = target.client.ws_terminal_url(&name)?;
     let sock = TermSocket::connect(&url, &ctx.hub.effective_token()).await?;
-    let mut buf: Vec<u8> = Vec::new();
-    let result = shellops::exec(sock, script, None, true, &mut buf).await;
+    let result = shellops::exec(sock, script, None, true, out).await;
     // Same belt as exec_cmd: the remote `exit` self-destructs the terminal, DELETE
     // covers error paths and terminado versions that keep exited terminals listed.
     if let Err(cleanup) = target.client.delete_terminal(&name).await {
         eprintln!("warning: could not clean up shell {name}: {cleanup}");
     }
-    let outcome = result?;
-    Ok(ScriptOutcome {
-        output: String::from_utf8_lossy(&buf).into_owned(),
-        exit_code: outcome.exit_code,
-    })
+    Ok(result?.exit_code)
 }
 
-async fn run_script_streaming(
+async fn run_script_on(
     ctx: &Ctx,
     target: &JobTarget,
     script: &str,
-) -> Result<i32, CliError> {
-    let name = target.client.create_terminal().await?.name;
-    let url = target.client.ws_terminal_url(&name)?;
-    let sock = TermSocket::connect(&url, &ctx.hub.effective_token()).await?;
-    let mut stdout = std::io::stdout();
-    let result = shellops::exec(sock, script, None, true, &mut stdout).await;
-    if let Err(cleanup) = target.client.delete_terminal(&name).await {
-        eprintln!("warning: could not clean up shell {name}: {cleanup}");
-    }
-    Ok(result?.exit_code)
+) -> Result<ScriptOutcome, CliError> {
+    let mut buf: Vec<u8> = Vec::new();
+    let exit_code = run_script_to(ctx, target, script, &mut buf).await?;
+    Ok(ScriptOutcome {
+        output: String::from_utf8_lossy(&buf).into_owned(),
+        exit_code,
+    })
 }
 
 fn job_ref(raw: &str) -> Result<(Option<String>, String), CliError> {
@@ -196,7 +189,7 @@ async fn tail(
     let target = resolve_target(ctx, server.as_deref()).await?;
     if follow {
         let script = jobops::build_follow_script(&id, max_wait, max_bytes);
-        let code = run_script_streaming(ctx, &target, &script).await?;
+        let code = run_script_to(ctx, &target, &script, &mut std::io::stdout()).await?;
         if code == jobops::TAIL_MISSING_EXIT {
             return Err(not_found(&id, &target.display));
         }
