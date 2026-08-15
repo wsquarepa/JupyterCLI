@@ -307,6 +307,78 @@ async fn kill(ctx: &Ctx, job: &str, force: bool, json: bool) -> Result<(), CliEr
     Ok(())
 }
 
+async fn remove(ctx: &Ctx, job: &str, json: bool) -> Result<(), CliError> {
+    let (server, id) = job_ref(job)?;
+    let target = resolve_target(ctx, server.as_deref()).await?;
+    let records = probe(ctx, &target, Some(id.as_str())).await?;
+    let record = records
+        .first()
+        .ok_or_else(|| not_found(&id, &target.display))?;
+    if jobops::classify(record, target.server_started_unix) == jobops::JobState::Running {
+        return Err(CliError::Usage(format!(
+            "job {id} is running; kill it first with: jhc job kill {id}"
+        )));
+    }
+    let ids = vec![id.clone()];
+    let outcome = run_script_on(ctx, &target, &jobops::build_remove_script(&ids)).await?;
+    if outcome.exit_code != 0 {
+        return Err(CliError::Usage(format!(
+            "remove failed on server {} (exit {}): {}",
+            target.display,
+            outcome.exit_code,
+            outcome.output.trim()
+        )));
+    }
+    if json {
+        println!("{}", serde_json::json!({"removed": [id]}));
+    } else {
+        println!("removed job {id} from server {}", target.display);
+    }
+    Ok(())
+}
+
+async fn clean(ctx: &Ctx, server: Option<&str>, json: bool) -> Result<(), CliError> {
+    let target = resolve_target(ctx, server).await?;
+    let records = probe(ctx, &target, None).await?;
+    let finished: Vec<(String, jobops::JobState)> = records
+        .iter()
+        .filter_map(|r| {
+            let state = jobops::classify(r, target.server_started_unix);
+            (state != jobops::JobState::Running).then(|| (r.id.clone(), state))
+        })
+        .collect();
+    if finished.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({"removed": []}));
+        } else {
+            println!("nothing to clean on server {}", target.display);
+        }
+        return Ok(());
+    }
+    let ids: Vec<String> = finished.iter().map(|(id, _)| id.clone()).collect();
+    let outcome = run_script_on(ctx, &target, &jobops::build_remove_script(&ids)).await?;
+    if outcome.exit_code != 0 {
+        return Err(CliError::Usage(format!(
+            "clean failed on server {} (exit {}): {}",
+            target.display,
+            outcome.exit_code,
+            outcome.output.trim()
+        )));
+    }
+    if json {
+        let removed: Vec<serde_json::Value> = finished
+            .iter()
+            .map(|(id, state)| serde_json::json!({"id": id, "state": jobops::state_label(*state)}))
+            .collect();
+        println!("{}", serde_json::json!({"removed": removed}));
+    } else {
+        for (id, state) in &finished {
+            println!("removed job {id} ({})", jobops::state_label(*state));
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
     match cmd {
         JobCmd::Start {
@@ -344,13 +416,14 @@ pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
             kill(ctx, &job, force, json).await?;
             Ok(ExitCode::SUCCESS)
         }
-        JobCmd::Rm { job, .. } => {
-            job_ref(&job)?;
-            Err(CliError::Usage("job rm is not implemented yet".to_string()))
+        JobCmd::Rm { job, json } => {
+            remove(ctx, &job, json).await?;
+            Ok(ExitCode::SUCCESS)
         }
-        JobCmd::Clean { .. } => Err(CliError::Usage(
-            "job clean is not implemented yet".to_string(),
-        )),
+        JobCmd::Clean { server, json } => {
+            clean(ctx, server.as_deref(), json).await?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

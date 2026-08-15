@@ -101,13 +101,16 @@ async fn job_list_json_classifies_running_and_exited() {
     );
     let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let jobs = payload["jobs"].as_array().unwrap();
-    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs.len(), 3);
     assert_eq!(jobs[0]["id"], "aaaaaaaa");
     assert_eq!(jobs[0]["state"], "running");
     assert_eq!(jobs[0]["name"], "vllm");
     assert_eq!(jobs[0]["exit_code"], serde_json::Value::Null);
     assert_eq!(jobs[1]["state"], "exited");
     assert_eq!(jobs[1]["exit_code"], 7);
+    assert_eq!(jobs[2]["id"], "cccccccc");
+    assert_eq!(jobs[2]["state"], "orphaned");
+    assert_eq!(jobs[2]["exit_code"], serde_json::Value::Null);
 }
 
 #[tokio::test]
@@ -240,6 +243,15 @@ async fn job_wait_missing_job_exits_125() {
 }
 
 #[tokio::test]
+async fn job_wait_orphaned_exits_125() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "wait", "cccccccc"]).await;
+    assert_eq!(out.status.code(), Some(125));
+    assert!(String::from_utf8(out.stderr).unwrap().contains("orphaned"));
+}
+
+#[tokio::test]
 async fn job_wait_times_out_with_125_while_running() {
     let mock = MockJupyter::spawn().await;
     let dir = tempfile::tempdir().unwrap();
@@ -329,5 +341,50 @@ async fn job_kill_signals_running_and_refuses_exited() {
     assert!(
         stderr.contains("already exited") && stderr.contains("7"),
         "stderr: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn job_rm_refuses_running_and_removes_exited() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let running = jhc(&mock, dir.path(), &["job", "rm", "aaaaaaaa"]).await;
+    assert!(!running.status.success());
+    let stderr = String::from_utf8(running.stderr).unwrap();
+    assert!(
+        stderr.contains("running") && stderr.contains("jhc job kill"),
+        "stderr: {stderr}"
+    );
+
+    let exited = jhc(&mock, dir.path(), &["job", "rm", "bbbbbbbb"]).await;
+    assert!(
+        exited.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&exited.stderr)
+    );
+    assert!(
+        String::from_utf8(exited.stdout)
+            .unwrap()
+            .contains("removed job bbbbbbbb")
+    );
+}
+
+#[tokio::test]
+async fn job_clean_removes_only_finished_jobs() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "clean"]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("bbbbbbbb"), "stdout: {stdout}");
+    assert!(stdout.contains("cccccccc"), "stdout: {stdout}");
+    assert!(stdout.contains("orphaned"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("aaaaaaaa"),
+        "must not touch the running job: {stdout}"
     );
 }

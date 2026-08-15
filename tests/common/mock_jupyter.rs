@@ -119,13 +119,14 @@ fn probe_record(
     id: &str,
     exit: &str,
     alive: &str,
+    started: &str,
     name: serde_json::Value,
     command: &str,
 ) -> String {
     use base64::Engine as _;
     let meta = serde_json::json!({"id": id, "name": name, "command": command});
     let b64 = base64::engine::general_purpose::STANDARD.encode(meta.to_string());
-    format!("{id}\x1f{exit}\x1f{alive}\x1f2026-08-14T10:00:00Z\x1f{b64}\r\n")
+    format!("{id}\x1f{exit}\x1f{alive}\x1f{started}\x1f{b64}\r\n")
 }
 
 /// Canned remote answers for the job scripts, keyed on distinctive substrings.
@@ -137,20 +138,42 @@ fn job_reply(payload: &str) -> (String, i32) {
             "aaaaaaaa",
             "-",
             "1",
+            "2026-08-14T10:00:00Z",
             serde_json::json!("vllm"),
             "'sleep' '999'",
         )
     };
-    let exited = || probe_record("bbbbbbbb", "7", "0", serde_json::json!(null), "'false'");
+    let exited = || {
+        probe_record(
+            "bbbbbbbb",
+            "7",
+            "0",
+            "2026-08-14T10:00:00Z",
+            serde_json::json!(null),
+            "'false'",
+        )
+    };
+    let orphaned = || {
+        probe_record(
+            "cccccccc",
+            "-",
+            "1",
+            "2026-08-14T08:00:00Z",
+            serde_json::json!("stale"),
+            "'sleep' '999'",
+        )
+    };
     if payload.contains("for d in") {
         if payload.contains("jobs/aaaaaaaa") {
             (running(), 0)
         } else if payload.contains("jobs/bbbbbbbb") {
             (exited(), 0)
+        } else if payload.contains("jobs/cccccccc") {
+            (orphaned(), 0)
         } else if payload.contains("jobs/eeeeeeee") {
             (String::new(), 0)
         } else {
-            (format!("{}{}", running(), exited()), 0)
+            (format!("{}{}{}", running(), exited(), orphaned()), 0)
         }
     } else if payload.contains("mkdir -p") {
         (String::new(), 0)
