@@ -185,13 +185,25 @@ pub fn shell_join(args: &[String]) -> String {
         .join(" ")
 }
 
+// Ephemeral shells are single-use, so `exit` reaps the remote bash. A reused
+// persistent shell must survive; `stty echo` only undoes the `stty -echo`,
+// leaving background jobs and the bash process intact.
+//
+// When a Ctrl-C reaches the remote terminal, bash sees its foreground child die of
+// SIGINT and abandons the rest of the command line, so the end sentinel and `exit`
+// never run and `exec` waits forever on a leaked terminal. `trap : INT` makes bash
+// itself survive the interrupt while children keep the default action, so the
+// child still dies with 130 and the sentinel reports it. Only the ephemeral shell
+// gets the trap: it is discarded right after, whereas a persistent shell would keep
+// the changed INT disposition across every later interactive use.
 pub fn build_exec_line(command: &str, nonce: &str, ephemeral: bool) -> String {
-    // Ephemeral shells are single-use, so `exit` reaps the remote bash. A reused
-    // persistent shell must survive; `stty echo` only undoes the `stty -echo` above,
-    // leaving background jobs and the bash process intact.
-    let tail = if ephemeral { "exit" } else { "stty echo" };
+    let (head, tail) = if ephemeral {
+        ("trap : INT; ", "exit")
+    } else {
+        ("", "stty echo")
+    };
     format!(
-        "stty -echo; printf '\\036{nonce}:S\\036'; {{ {command}; }}; printf '\\036{nonce}:%d\\036' $?; {tail}\n"
+        "{head}stty -echo; printf '\\036{nonce}:S\\036'; {{ {command}; }}; printf '\\036{nonce}:%d\\036' $?; {tail}\n"
     )
 }
 
@@ -540,7 +552,7 @@ mod tests {
     #[test]
     fn exec_line_shape() {
         let line = build_exec_line("nvidia-smi", "abcd1234", true);
-        assert!(line.starts_with("stty -echo; printf"));
+        assert!(line.starts_with("trap : INT; stty -echo; printf"));
         assert!(line.contains("{ nvidia-smi; }"));
         assert!(line.ends_with("; exit\n"));
     }
@@ -549,8 +561,48 @@ mod tests {
     fn exec_line_reuse_restores_echo_without_exit() {
         let line = build_exec_line("nvidia-smi", "abcd1234", false);
         assert!(line.starts_with("stty -echo; printf"));
+        assert!(!line.contains("trap : INT"));
         assert!(line.contains("{ nvidia-smi; }"));
         assert!(line.ends_with("; stty echo\n"));
         assert!(!line.contains("; exit\n"));
+    }
+
+    #[test]
+    fn ephemeral_exec_line_reports_130_when_the_process_group_is_interrupted() {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt as _;
+
+        // Bash aborts the rest of a command line when the foreground child dies of
+        // SIGINT and bash itself was interrupted too, exactly what a terminal Ctrl-C
+        // does to the whole foreground process group. Reproduce that with a fresh
+        // process group signalled as a whole; the trap must keep bash alive so the
+        // end sentinel still prints the child's 130.
+        let nonce = "abcd1234";
+        let mut child = std::process::Command::new("bash")
+            .args(["-c", &build_exec_line("sleep 5", nonce, true)])
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("bash must be runnable in tests");
+        std::thread::sleep(Duration::from_millis(500));
+        let signalled = std::process::Command::new("kill")
+            .args(["-INT", "--", &format!("-{}", child.id())])
+            .status()
+            .expect("kill must be runnable in tests");
+        assert!(signalled.success());
+        let mut raw = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut raw)
+            .unwrap();
+        child.wait().unwrap();
+
+        let mut parser = ExecParser::new(nonce);
+        let (_, code) = parser.push(&raw);
+        assert_eq!(code, Some(130), "raw stdout: {raw:?}");
     }
 }
