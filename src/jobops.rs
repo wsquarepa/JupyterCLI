@@ -70,11 +70,15 @@ pub fn build_start_script(id: &str, meta_json: &str, command: &str) -> String {
     )
 }
 
+// The body runs in a subshell so `exit 66` leaves only that subshell and the code
+// flows to `$?`; exiting the ephemeral terminado bash itself would drop the exec
+// end sentinel and jhc would see a closed connection instead of the code.
+fn tail_body(id: &str, cmd: &str) -> String {
+    format!("( log=\"{JOBS_DIR}/{id}/log\"; [ -f \"$log\" ] || exit {TAIL_MISSING_EXIT}; {cmd} )")
+}
+
 pub fn build_tail_script(id: &str, max_bytes: u64) -> String {
-    format!(
-        "log=\"{JOBS_DIR}/{id}/log\"; [ -f \"$log\" ] || exit {TAIL_MISSING_EXIT}; \
-         tail -c {max_bytes} \"$log\""
-    )
+    tail_body(id, &format!("tail -c {max_bytes} \"$log\""))
 }
 
 // --max-bytes doubles as the initial window and the stream cap, so tail never emits
@@ -89,7 +93,7 @@ pub fn build_follow_script(id: &str, max_wait: Option<u64>, max_bytes: Option<u6
     if let Some(bytes) = max_bytes {
         cmd = format!("{cmd} | head -c {bytes}");
     }
-    format!("log=\"{JOBS_DIR}/{id}/log\"; [ -f \"$log\" ] || exit {TAIL_MISSING_EXIT}; {cmd}")
+    tail_body(id, &cmd)
 }
 
 pub fn follow_exit_ok(code: i32) -> bool {
@@ -335,11 +339,82 @@ mod tests {
         assert_bash_parses(&build_start_script("aabbccdd", "{}", nasty));
     }
 
+    // Runs a generated script the way `jhc` does remotely: through the ephemeral exec
+    // line under a real bash, with `$HOME` pointed at a scratch dir. Returns the exit
+    // code recovered from the end sentinel, or None when the shell died before it.
+    fn run_ephemeral(script: &str, home: &std::path::Path) -> (String, Option<i32>) {
+        let nonce = "abcd1234";
+        let output = std::process::Command::new("bash")
+            .args(["-c", &crate::shellops::build_exec_line(script, nonce, true)])
+            .env("HOME", home)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("bash must be runnable in tests");
+        let mut parser = crate::shellops::ExecParser::new(nonce);
+        parser.push(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    fn wait_for_file(path: &std::path::Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn start_probe_and_remove_round_trip_through_real_bash() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".jhc/jobs/aabbccdd");
+        let meta = r#"{"id":"aabbccdd","name":null,"command":"'true'"}"#;
+
+        let (_, code) = run_ephemeral(&build_start_script("aabbccdd", meta, "'true'"), home.path());
+        assert_eq!(code, Some(0));
+        wait_for_file(&dir.join("exit"));
+        for file in ["pid", "started", "meta.json", "log"] {
+            assert!(dir.join(file).is_file(), "missing {file}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("exit")).unwrap().trim(),
+            "0"
+        );
+
+        let (output, code) = run_ephemeral(&build_probe_script(Some("aabbccdd")), home.path());
+        assert_eq!(code, Some(0), "probe output: {output:?}");
+        let records = parse_probe_output(&output).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "aabbccdd");
+        assert_eq!(records[0].exit, Some(0));
+        assert_eq!(records[0].meta.as_ref().unwrap().command, "'true'");
+
+        let (_, code) = run_ephemeral(&build_remove_script(&["aabbccdd".to_string()]), home.path());
+        assert_eq!(code, Some(0));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn tail_scripts_report_a_missing_log_through_the_sentinel() {
+        // `exit 66` must leave only a subshell: exiting the ephemeral bash itself
+        // would drop the end sentinel and surface as a closed connection instead.
+        let home = tempfile::tempdir().unwrap();
+        let (_, code) = run_ephemeral(&build_tail_script("aabbccdd", 4096), home.path());
+        assert_eq!(code, Some(TAIL_MISSING_EXIT));
+        let (_, code) = run_ephemeral(&build_follow_script("aabbccdd", Some(1), None), home.path());
+        assert_eq!(code, Some(TAIL_MISSING_EXIT));
+    }
+
     #[test]
     fn tail_script_bounds_bytes_and_reserves_missing_exit() {
         let script = build_tail_script("aabbccdd", 4096);
+        assert!(script.starts_with("( log=\"$HOME/.jhc/jobs/aabbccdd/log\";"));
         assert!(script.contains("tail -c 4096 \"$log\""));
-        assert!(script.contains("exit 66"));
+        assert!(script.contains("|| exit 66;"));
+        assert!(script.ends_with(" )"));
         assert_bash_parses(&script);
     }
 
@@ -355,6 +430,9 @@ mod tests {
         let both = build_follow_script("aabbccdd", Some(30), Some(9000));
         assert!(both.contains("timeout 30 tail -c 9000 -f \"$log\" | head -c 9000"));
         for script in [&bare, &waited, &both] {
+            assert!(script.starts_with("( log=\"$HOME/.jhc/jobs/aabbccdd/log\";"));
+            assert!(script.contains("|| exit 66;"));
+            assert!(script.ends_with(" )"));
             assert_bash_parses(script);
         }
     }
