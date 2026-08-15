@@ -5,6 +5,8 @@ pub const JOB_ID_LEN: usize = 8;
 // the remote shell expands it. Home is the one path guaranteed writable and
 // persistent on JupyterHub pods.
 const JOBS_DIR: &str = "$HOME/.jhc/jobs";
+const GENERATION_SLACK_SECS: i64 = 60;
+const WAIT_BACKOFF_CEILING_SECS: u64 = 15;
 
 pub fn gen_job_id() -> String {
     use rand::RngExt as _;
@@ -82,6 +84,51 @@ pub struct ProbeRecord {
     pub pid_alive: bool,
     pub started_at: Option<String>,
     pub meta: Option<JobMeta>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    Running,
+    Exited(i32),
+    Orphaned,
+}
+
+pub fn state_label(state: JobState) -> &'static str {
+    match state {
+        JobState::Running => "running",
+        JobState::Exited(_) => "exited",
+        JobState::Orphaned => "orphaned",
+    }
+}
+
+pub fn parse_utc_timestamp(raw: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|dt| dt.unix_timestamp())
+}
+
+// The generation check closes the pid-reuse hole after a pod recycle: a live pid can
+// belong to an unrelated process. The slack absorbs pod/hub clock skew and biases
+// uncertainty toward Running, because misreporting a live job as orphaned lets
+// `job clean` destroy a live job's log.
+pub fn classify(record: &ProbeRecord, server_started_unix: Option<i64>) -> JobState {
+    if let Some(code) = record.exit {
+        return JobState::Exited(code);
+    }
+    if !record.pid_alive {
+        return JobState::Orphaned;
+    }
+    let job_started = record.started_at.as_deref().and_then(parse_utc_timestamp);
+    if let (Some(job), Some(server)) = (job_started, server_started_unix)
+        && job + GENERATION_SLACK_SECS < server
+    {
+        return JobState::Orphaned;
+    }
+    JobState::Running
+}
+
+pub fn wait_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((1u64 << attempt.min(4)).min(WAIT_BACKOFF_CEILING_SECS))
 }
 
 // One line per job, fields separated by the ASCII unit separator (0x1f, printf \037):
@@ -179,6 +226,16 @@ mod tests {
             .status()
             .expect("bash must be runnable in tests");
         assert!(status.success(), "bash rejected script: {script}");
+    }
+
+    fn record(exit: Option<i32>, pid_alive: bool, started_at: Option<&str>) -> ProbeRecord {
+        ProbeRecord {
+            id: "aabbccdd".to_string(),
+            exit,
+            pid_alive,
+            started_at: started_at.map(String::from),
+            meta: None,
+        }
     }
 
     #[test]
@@ -295,5 +352,56 @@ mod tests {
     fn probe_output_empty_means_no_jobs() {
         assert!(parse_probe_output("").unwrap().is_empty());
         assert!(parse_probe_output("\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn timestamps_parse_rfc3339_with_and_without_fraction() {
+        assert_eq!(parse_utc_timestamp("1970-01-01T00:01:00Z"), Some(60));
+        assert_eq!(parse_utc_timestamp("1970-01-01T00:01:00.500000Z"), Some(60));
+        assert_eq!(parse_utc_timestamp("not a time"), None);
+        assert_eq!(parse_utc_timestamp("-"), None);
+    }
+
+    #[test]
+    fn classification_prefers_exit_file_then_pid_then_generation() {
+        // exit file wins even over a live pid
+        assert_eq!(
+            classify(&record(Some(7), true, None), None),
+            JobState::Exited(7)
+        );
+        // dead or missing pid means orphaned
+        assert_eq!(
+            classify(&record(None, false, None), None),
+            JobState::Orphaned
+        );
+        // live pid, no timestamps: running
+        assert_eq!(classify(&record(None, true, None), None), JobState::Running);
+    }
+
+    #[test]
+    fn generation_check_orphans_stale_jobs_with_slack_toward_running() {
+        let job = record(None, true, Some("1970-01-01T00:01:00Z")); // unix 60
+        // server started 61s after the job: beyond slack, pid must be reused
+        assert_eq!(classify(&job, Some(121)), JobState::Orphaned);
+        // exactly at the slack boundary: still running (bias toward running)
+        assert_eq!(classify(&job, Some(120)), JobState::Running);
+        // server older than the job: running
+        assert_eq!(classify(&job, Some(0)), JobState::Running);
+        // unparsable job timestamp: check skipped, running
+        let odd = record(None, true, Some("gibberish"));
+        assert_eq!(classify(&odd, Some(9_999_999)), JobState::Running);
+    }
+
+    #[test]
+    fn wait_backoff_doubles_to_a_fifteen_second_ceiling() {
+        let secs: Vec<u64> = (0..7).map(|a| wait_backoff(a).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 15, 15, 15]);
+    }
+
+    #[test]
+    fn state_labels_are_stable_json_values() {
+        assert_eq!(state_label(JobState::Running), "running");
+        assert_eq!(state_label(JobState::Exited(7)), "exited");
+        assert_eq!(state_label(JobState::Orphaned), "orphaned");
     }
 }
