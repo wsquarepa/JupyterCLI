@@ -167,15 +167,20 @@ pub async fn peek(
 
 pub const JHC_FAILURE_EXIT: i32 = 125;
 
-// Quote each `jhc exec -- <argv>` element for the remote terminado bash so it re-parses
-// the line into the identical argv. Without quoting, argument boundaries and shell
-// metacharacters (spaces, quotes, `:`, `://`, newlines) are reinterpreted by that shell,
-// which drops/splits arguments and can leave a heredoc waiting on stdin forever. Single
-// quotes are literal for every byte except `'` itself, which is closed, escaped with a
-// backslash, and reopened (`'\''`).
+// Quote one string for the remote terminado bash so it re-parses to the identical
+// bytes. Single quotes are literal for every byte except `'` itself, which is closed,
+// escaped with a backslash, and reopened (`'\''`).
+pub fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+// Join quoted `jhc exec -- <argv>` elements into the remote shell line. Without quoting,
+// argument boundaries and shell metacharacters (spaces, quotes, `:`, `://`, newlines)
+// are reinterpreted by that shell, which drops/splits arguments and can leave a heredoc
+// waiting on stdin forever.
 pub fn shell_join(args: &[String]) -> String {
     args.iter()
-        .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+        .map(|arg| shell_quote(arg))
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -504,6 +509,13 @@ mod tests {
             shell_join(&args),
             "'bash' '-c' 'curl -H \"Authorization: token X\" https://hub/api/users/me'"
         );
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quotes() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]
