@@ -130,6 +130,23 @@ pub enum JobError {
         "job '{id}' has unreadable metadata: {reason}; recreate it or remove it with: jhc job rm {id}"
     )]
     BadMeta { id: String, reason: String },
+    #[error("job {id} not found on server {server}; run: jhc job list")]
+    NotFound { id: String, server: String },
+    #[error("{verb} failed on server {server} (exit {exit_code}): {output}")]
+    RemoteFailed {
+        verb: &'static str,
+        server: String,
+        exit_code: i32,
+        output: String,
+    },
+    #[error(
+        "kill failed on server {server} (exit {exit_code}); the job may have just exited: {output}"
+    )]
+    KillFailed {
+        server: String,
+        exit_code: i32,
+        output: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -627,6 +644,38 @@ mod tests {
     fn wait_backoff_doubles_to_a_fifteen_second_ceiling() {
         let secs: Vec<u64> = (0..7).map(|a| wait_backoff(a).as_secs()).collect();
         assert_eq!(secs, [1, 2, 4, 8, 15, 15, 15]);
+    }
+
+    #[test]
+    fn remote_failure_messages_are_actionable() {
+        let not_found = JobError::NotFound {
+            id: "aabbccdd".to_string(),
+            server: "ww41".to_string(),
+        };
+        assert_eq!(
+            not_found.to_string(),
+            "job aabbccdd not found on server ww41; run: jhc job list"
+        );
+        let failed = JobError::RemoteFailed {
+            verb: "tail",
+            server: "ww41".to_string(),
+            exit_code: 2,
+            output: "tail: no such file".to_string(),
+        };
+        assert_eq!(
+            failed.to_string(),
+            "tail failed on server ww41 (exit 2): tail: no such file"
+        );
+        let kill = JobError::KillFailed {
+            server: "ww41".to_string(),
+            exit_code: 1,
+            output: "kill: no such process".to_string(),
+        };
+        assert!(kill.to_string().contains("the job may have just exited"));
+        assert!(
+            kill.to_string()
+                .starts_with("kill failed on server ww41 (exit 1)")
+        );
     }
 
     #[test]

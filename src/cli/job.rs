@@ -98,27 +98,52 @@ fn job_row(record: &jobops::ProbeRecord, state: jobops::JobState) -> JobRow {
     }
 }
 
+fn remote_failed(verb: &'static str, target: &JobTarget, exit_code: i32, output: &str) -> CliError {
+    jobops::JobError::RemoteFailed {
+        verb,
+        server: target.display.clone(),
+        exit_code,
+        output: output.trim().to_string(),
+    }
+    .into()
+}
+
+// Runs a script whose only useful result is success: any nonzero exit becomes a
+// typed RemoteFailed carrying the script's output.
+async fn run_script_or_fail(
+    ctx: &Ctx,
+    target: &JobTarget,
+    verb: &'static str,
+    script: &str,
+) -> Result<ScriptOutcome, CliError> {
+    let outcome = run_script_on(ctx, target, script).await?;
+    if outcome.exit_code != 0 {
+        return Err(remote_failed(
+            verb,
+            target,
+            outcome.exit_code,
+            &outcome.output,
+        ));
+    }
+    Ok(outcome)
+}
+
 async fn probe(
     ctx: &Ctx,
     target: &JobTarget,
     id: Option<&str>,
 ) -> Result<Vec<jobops::ProbeRecord>, CliError> {
-    let outcome = run_script_on(ctx, target, &jobops::build_probe_script(id)).await?;
-    if outcome.exit_code != 0 {
-        return Err(CliError::Usage(format!(
-            "job probe failed on server {} (exit {}): {}",
-            target.display,
-            outcome.exit_code,
-            outcome.output.trim()
-        )));
-    }
+    let outcome =
+        run_script_or_fail(ctx, target, "job probe", &jobops::build_probe_script(id)).await?;
     Ok(jobops::parse_probe_output(&outcome.output)?)
 }
 
 fn not_found(id: &str, display: &str) -> CliError {
-    CliError::Usage(format!(
-        "job {id} not found on server {display}; run: jhc job list"
-    ))
+    jobops::JobError::NotFound {
+        id: id.to_string(),
+        server: display.to_string(),
+    }
+    .into()
 }
 
 async fn list(ctx: &Ctx, server: Option<&str>, json: bool) -> Result<(), CliError> {
@@ -194,10 +219,12 @@ async fn tail(
             return Err(not_found(&id, &target.display));
         }
         if !jobops::follow_exit_ok(code) {
-            return Err(CliError::Usage(format!(
-                "tail failed on server {} (exit {code})",
-                target.display
-            )));
+            return Err(remote_failed(
+                "tail",
+                &target,
+                code,
+                "its output was streamed above",
+            ));
         }
         return Ok(());
     }
@@ -208,12 +235,12 @@ async fn tail(
         return Err(not_found(&id, &target.display));
     }
     if outcome.exit_code != 0 {
-        return Err(CliError::Usage(format!(
-            "tail failed on server {} (exit {}): {}",
-            target.display,
+        return Err(remote_failed(
+            "tail",
+            &target,
             outcome.exit_code,
-            outcome.output.trim()
-        )));
+            &outcome.output,
+        ));
     }
     print!("{}", outcome.output);
     Ok(())
@@ -298,12 +325,12 @@ async fn kill(ctx: &Ctx, job: &str, force: bool, json: bool) -> Result<(), CliEr
     }
     let outcome = run_script_on(ctx, &target, &jobops::build_kill_script(&id, force)).await?;
     if outcome.exit_code != 0 {
-        return Err(CliError::Usage(format!(
-            "kill failed on server {} (exit {}); the job may have just exited: {}",
-            target.display,
-            outcome.exit_code,
-            outcome.output.trim()
-        )));
+        return Err(jobops::JobError::KillFailed {
+            server: target.display.clone(),
+            exit_code: outcome.exit_code,
+            output: outcome.output.trim().to_string(),
+        }
+        .into());
     }
     let signal = if force { "SIGKILL" } else { "SIGTERM" };
     if json {
@@ -327,15 +354,7 @@ async fn remove(ctx: &Ctx, job: &str, json: bool) -> Result<(), CliError> {
         )));
     }
     let ids = vec![id.clone()];
-    let outcome = run_script_on(ctx, &target, &jobops::build_remove_script(&ids)).await?;
-    if outcome.exit_code != 0 {
-        return Err(CliError::Usage(format!(
-            "remove failed on server {} (exit {}): {}",
-            target.display,
-            outcome.exit_code,
-            outcome.output.trim()
-        )));
-    }
+    run_script_or_fail(ctx, &target, "remove", &jobops::build_remove_script(&ids)).await?;
     if json {
         println!("{}", serde_json::json!({"removed": [id]}));
     } else {
@@ -363,15 +382,7 @@ async fn clean(ctx: &Ctx, server: Option<&str>, json: bool) -> Result<(), CliErr
         return Ok(());
     }
     let ids: Vec<String> = finished.iter().map(|(id, _)| id.clone()).collect();
-    let outcome = run_script_on(ctx, &target, &jobops::build_remove_script(&ids)).await?;
-    if outcome.exit_code != 0 {
-        return Err(CliError::Usage(format!(
-            "clean failed on server {} (exit {}): {}",
-            target.display,
-            outcome.exit_code,
-            outcome.output.trim()
-        )));
-    }
+    run_script_or_fail(ctx, &target, "clean", &jobops::build_remove_script(&ids)).await?;
     if json {
         let removed: Vec<serde_json::Value> = finished
             .iter()
@@ -452,15 +463,7 @@ async fn start(
         .map_err(|e| CliError::Usage(format!("cannot encode job metadata: {e}")))?;
     let script = jobops::build_start_script(&id, &meta_json, &command);
     let target = resolve_target(ctx, server).await?;
-    let outcome = run_script_on(ctx, &target, &script).await?;
-    if outcome.exit_code != 0 {
-        return Err(CliError::Usage(format!(
-            "job setup failed on server {} (exit {}): {}",
-            target.display,
-            outcome.exit_code,
-            outcome.output.trim()
-        )));
-    }
+    run_script_or_fail(ctx, &target, "job setup", &script).await?;
     if json {
         println!(
             "{}",
