@@ -45,17 +45,19 @@ pub fn log_path(id: &str) -> String {
 // $! names the wrong process. The exit code is written to exit.tmp then renamed so a
 // reader never observes a half-written file. The if/else keeps a setup failure
 // visible in the exec exit status without `exit`, which would kill the terminado
-// bash before the exit sentinel prints.
+// bash before the exit sentinel prints. The subshell around the launch matters: the
+// interactive terminado bash would otherwise print a job-control notice for the
+// background job between exec's sentinels.
 pub fn build_start_script(id: &str, meta_json: &str, command: &str) -> String {
     let runner = format!(
-        "echo $$ > \"$0/pid\"; {{ {command}; }} > \"$0/log\" 2>&1; \
+        "echo $$ > \"$0/pid\"; {{ {command}; }} < /dev/null > \"$0/log\" 2>&1; \
          echo $? > \"$0/exit.tmp\" && mv \"$0/exit.tmp\" \"$0/exit\""
     );
     format!(
         "dir=\"{JOBS_DIR}/{id}\"; \
          if mkdir -p \"$dir\" && printf '%s' {meta} > \"$dir/meta.json\" && \
          date -u +%FT%TZ > \"$dir/started\"; \
-         then setsid bash -c {script} \"$dir\" & else false; fi",
+         then ( setsid bash -c {script} \"$dir\" & ) else false; fi",
         meta = shell_quote(meta_json),
         script = shell_quote(&runner),
     )
@@ -113,7 +115,8 @@ mod tests {
         assert!(script.contains("setsid bash -c"));
         assert!(script.contains("echo $$ > \"$0/pid\""));
         assert!(script.contains("mv \"$0/exit.tmp\" \"$0/exit\""));
-        assert!(script.ends_with("\"$dir\" & else false; fi"));
+        assert!(script.ends_with("\"$dir\" & ) else false; fi"));
+        assert!(script.contains("< /dev/null > \"$0/log\" 2>&1"));
         assert_bash_parses(&script);
     }
 
