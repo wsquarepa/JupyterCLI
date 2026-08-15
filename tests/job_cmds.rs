@@ -409,6 +409,75 @@ async fn job_rm_refuses_running_and_removes_exited() {
 }
 
 #[tokio::test]
+async fn job_rm_json_matches_the_clean_shape() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "rm", "bbbbbbbb", "--json"]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({"removed": [{"id": "bbbbbbbb", "state": "exited"}]})
+    );
+}
+
+#[tokio::test]
+async fn job_wait_json_reports_orphaned_and_running_states() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let orphaned = jhc(&mock, dir.path(), &["job", "wait", "cccccccc", "--json"]).await;
+    assert_eq!(orphaned.status.code(), Some(125));
+    let payload: serde_json::Value = serde_json::from_slice(&orphaned.stdout).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({"id": "cccccccc", "state": "orphaned"})
+    );
+    assert!(
+        String::from_utf8(orphaned.stderr)
+            .unwrap()
+            .contains("orphaned")
+    );
+
+    let running = jhc(
+        &mock,
+        dir.path(),
+        &["job", "wait", "aaaaaaaa", "--max-wait", "1", "--json"],
+    )
+    .await;
+    assert_eq!(running.status.code(), Some(125));
+    let payload: serde_json::Value = serde_json::from_slice(&running.stdout).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({"id": "aaaaaaaa", "state": "running"})
+    );
+    assert!(
+        String::from_utf8(running.stderr)
+            .unwrap()
+            .contains("still running")
+    );
+}
+
+#[tokio::test]
+async fn job_clean_json_lists_removed_ids_with_states() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "clean", "--json"]).await;
+    assert!(out.status.success());
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({"removed": [
+            {"id": "bbbbbbbb", "state": "exited"},
+            {"id": "cccccccc", "state": "orphaned"},
+        ]})
+    );
+}
+
+#[tokio::test]
 async fn job_clean_removes_only_finished_jobs() {
     let mock = MockJupyter::spawn().await;
     let dir = tempfile::tempdir().unwrap();

@@ -276,6 +276,9 @@ async fn wait(
                     "job {id} is orphaned (its process is gone without an exit code, \
                      likely a server restart); its outcome is unknown"
                 );
+                if json {
+                    println!("{}", serde_json::json!({"id": id, "state": "orphaned"}));
+                }
                 return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
             }
             jobops::JobState::Running => {}
@@ -286,6 +289,9 @@ async fn wait(
             let elapsed = started.elapsed();
             if elapsed >= budget {
                 eprintln!("job {id} still running after {}s", budget.as_secs());
+                if json {
+                    println!("{}", serde_json::json!({"id": id, "state": "running"}));
+                }
                 return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
             }
             pause = pause.min(budget.saturating_sub(elapsed));
@@ -348,7 +354,8 @@ async fn remove(ctx: &Ctx, job: &str, json: bool) -> Result<(), CliError> {
     let record = records
         .first()
         .ok_or_else(|| not_found(&id, &target.display))?;
-    if jobops::classify(record, target.server_started_unix) == jobops::JobState::Running {
+    let state = jobops::classify(record, target.server_started_unix);
+    if state == jobops::JobState::Running {
         return Err(CliError::Usage(format!(
             "job {id} is running; kill it first with: jhc job kill {id}"
         )));
@@ -356,7 +363,10 @@ async fn remove(ctx: &Ctx, job: &str, json: bool) -> Result<(), CliError> {
     let ids = vec![id.clone()];
     run_script_or_fail(ctx, &target, "remove", &jobops::build_remove_script(&ids)).await?;
     if json {
-        println!("{}", serde_json::json!({"removed": [id]}));
+        println!(
+            "{}",
+            serde_json::json!({"removed": [{"id": id, "state": jobops::state_label(state)}]})
+        );
     } else {
         println!("removed job {id} from server {}", target.display);
     }
