@@ -88,3 +88,57 @@ async fn job_rejects_malformed_ids_before_any_network_io() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("not a job id"), "stderr: {stderr}");
 }
+
+#[tokio::test]
+async fn job_list_json_classifies_running_and_exited() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "list", "--json"]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let jobs = payload["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0]["id"], "aaaaaaaa");
+    assert_eq!(jobs[0]["state"], "running");
+    assert_eq!(jobs[0]["name"], "vllm");
+    assert_eq!(jobs[0]["exit_code"], serde_json::Value::Null);
+    assert_eq!(jobs[1]["state"], "exited");
+    assert_eq!(jobs[1]["exit_code"], 7);
+}
+
+#[tokio::test]
+async fn job_list_human_output_is_a_table() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "list"]).await;
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("JOB"), "header missing: {stdout}");
+    assert!(stdout.contains("aaaaaaaa") && stdout.contains("running"));
+    assert!(stdout.contains("bbbbbbbb") && stdout.contains("exited"));
+}
+
+#[tokio::test]
+async fn job_status_shows_one_job_and_404s_actionably() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "status", "aaaaaaaa"]).await;
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("running") && stdout.contains("'sleep' '999'"),
+        "stdout: {stdout}"
+    );
+
+    let missing = jhc(&mock, dir.path(), &["job", "status", "eeeeeeee"]).await;
+    assert!(!missing.status.success());
+    let stderr = String::from_utf8(missing.stderr).unwrap();
+    assert!(
+        stderr.contains("not found") && stderr.contains("jhc job list"),
+        "stderr: {stderr}"
+    );
+}

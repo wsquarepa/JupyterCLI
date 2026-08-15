@@ -12,6 +12,7 @@ use super::{CliError, Ctx, JobCmd};
 struct JobTarget {
     client: ServerClient,
     display: String,
+    server_started_unix: Option<i64>,
 }
 
 async fn resolve_target(ctx: &Ctx, server: Option<&str>) -> Result<JobTarget, CliError> {
@@ -21,7 +22,15 @@ async fn resolve_target(ctx: &Ctx, server: Option<&str>) -> Result<JobTarget, Cl
         .as_deref()
         .ok_or_else(|| CliError::Usage(format!("server '{display}' reports no URL")))?;
     let client = ServerClient::from_hub(&ctx.client, url_path)?;
-    Ok(JobTarget { client, display })
+    let server_started_unix = entry
+        .started
+        .as_deref()
+        .and_then(jobops::parse_utc_timestamp);
+    Ok(JobTarget {
+        client,
+        display,
+        server_started_unix,
+    })
 }
 
 struct ScriptOutcome {
@@ -57,6 +66,109 @@ fn job_ref(raw: &str) -> Result<(Option<String>, String), CliError> {
     Ok((server, id))
 }
 
+#[derive(serde::Serialize)]
+struct JobRow {
+    id: String,
+    name: Option<String>,
+    command: Option<String>,
+    state: String,
+    exit_code: Option<i32>,
+    started_at: Option<String>,
+    log_path: String,
+}
+
+fn job_row(record: &jobops::ProbeRecord, state: jobops::JobState) -> JobRow {
+    JobRow {
+        id: record.id.clone(),
+        name: record.meta.as_ref().and_then(|m| m.name.clone()),
+        command: record.meta.as_ref().map(|m| m.command.clone()),
+        state: jobops::state_label(state).to_string(),
+        exit_code: record.exit,
+        started_at: record.started_at.clone(),
+        log_path: jobops::log_path(&record.id),
+    }
+}
+
+async fn probe(
+    ctx: &Ctx,
+    target: &JobTarget,
+    id: Option<&str>,
+) -> Result<Vec<jobops::ProbeRecord>, CliError> {
+    let outcome = run_script_on(ctx, target, &jobops::build_probe_script(id)).await?;
+    if outcome.exit_code != 0 {
+        return Err(CliError::Usage(format!(
+            "job probe failed on server {} (exit {}): {}",
+            target.display,
+            outcome.exit_code,
+            outcome.output.trim()
+        )));
+    }
+    Ok(jobops::parse_probe_output(&outcome.output)?)
+}
+
+fn not_found(id: &str, display: &str) -> CliError {
+    CliError::Usage(format!(
+        "job {id} not found on server {display}; run: jhc job list"
+    ))
+}
+
+async fn list(ctx: &Ctx, server: Option<&str>, json: bool) -> Result<(), CliError> {
+    let target = resolve_target(ctx, server).await?;
+    let records = probe(ctx, &target, None).await?;
+    let rows: Vec<JobRow> = records
+        .iter()
+        .map(|r| job_row(r, jobops::classify(r, target.server_started_unix)))
+        .collect();
+    if json {
+        println!("{}", serde_json::json!({ "jobs": rows }));
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("no jobs on server {}", target.display);
+        return Ok(());
+    }
+    println!(
+        "{:<10} {:<14} {:<10} {:<6} STARTED",
+        "JOB", "NAME", "STATE", "EXIT"
+    );
+    for row in rows {
+        println!(
+            "{:<10} {:<14} {:<10} {:<6} {}",
+            row.id,
+            row.name.as_deref().unwrap_or("-"),
+            row.state,
+            row.exit_code.map_or("-".to_string(), |c| c.to_string()),
+            row.started_at.as_deref().unwrap_or("-"),
+        );
+    }
+    Ok(())
+}
+
+async fn status(ctx: &Ctx, job: &str, json: bool) -> Result<(), CliError> {
+    let (server, id) = job_ref(job)?;
+    let target = resolve_target(ctx, server.as_deref()).await?;
+    let records = probe(ctx, &target, Some(id.as_str())).await?;
+    let record = records
+        .first()
+        .ok_or_else(|| not_found(&id, &target.display))?;
+    let state = jobops::classify(record, target.server_started_unix);
+    let row = job_row(record, state);
+    if json {
+        println!("{}", serde_json::json!(row));
+        return Ok(());
+    }
+    println!("job {} on server {}", row.id, target.display);
+    println!("  name:    {}", row.name.as_deref().unwrap_or("-"));
+    println!("  command: {}", row.command.as_deref().unwrap_or("-"));
+    println!("  state:   {}", row.state);
+    if let Some(code) = row.exit_code {
+        println!("  exit:    {code}");
+    }
+    println!("  started: {}", row.started_at.as_deref().unwrap_or("-"));
+    println!("  log:     {}", row.log_path);
+    Ok(())
+}
+
 pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
     match cmd {
         JobCmd::Start {
@@ -68,14 +180,13 @@ pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
             start(ctx, server.as_deref(), name, json, &command).await?;
             Ok(ExitCode::SUCCESS)
         }
-        JobCmd::List { .. } => Err(CliError::Usage(
-            "job list is not implemented yet".to_string(),
-        )),
-        JobCmd::Status { job, .. } => {
-            job_ref(&job)?;
-            Err(CliError::Usage(
-                "job status is not implemented yet".to_string(),
-            ))
+        JobCmd::List { server, json } => {
+            list(ctx, server.as_deref(), json).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        JobCmd::Status { job, json } => {
+            status(ctx, &job, json).await?;
+            Ok(ExitCode::SUCCESS)
         }
         JobCmd::Tail { job, .. } => {
             job_ref(&job)?;
