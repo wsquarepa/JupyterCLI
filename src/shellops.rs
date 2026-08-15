@@ -108,12 +108,22 @@ pub async fn peek(
     mut sock: TermSocket,
     raw: bool,
     follow: bool,
+    max_wait: Option<Duration>,
+    max_bytes: Option<u64>,
     out: &mut impl std::io::Write,
 ) -> Result<(), ApiError> {
     let mut stripper = AnsiStripper::new();
+    let deadline = max_wait.map(|wait| tokio::time::Instant::now() + wait);
+    let mut written: u64 = 0;
     loop {
         let frame = if follow {
-            sock.next_frame().await?
+            match deadline {
+                Some(when) => match tokio::time::timeout_at(when, sock.next_frame()).await {
+                    Ok(frame) => frame?,
+                    Err(_) => break,
+                },
+                None => sock.next_frame().await?,
+            }
         } else {
             match tokio::time::timeout(PEEK_IDLE, sock.next_frame()).await {
                 Ok(frame) => frame?,
@@ -124,15 +134,29 @@ pub async fn peek(
             None => break,
             Some(TermFrame::Stdout(text)) => {
                 let rendered = if raw { text } else { stripper.push(&text) };
-                out.write_all(rendered.as_bytes())
-                    .map_err(|e| ApiError::Protocol {
-                        url: "stdout".to_string(),
-                        reason: format!("cannot write output: {e}"),
-                    })?;
+                // The budget counts emitted bytes and truncates mid-chunk, so a burst
+                // larger than the remaining budget cannot overshoot it.
+                let bytes = rendered.as_bytes();
+                let emit = match max_bytes {
+                    Some(budget) => {
+                        let remaining =
+                            usize::try_from(budget.saturating_sub(written)).unwrap_or(usize::MAX);
+                        &bytes[..bytes.len().min(remaining)]
+                    }
+                    None => bytes,
+                };
+                out.write_all(emit).map_err(|e| ApiError::Protocol {
+                    url: "stdout".to_string(),
+                    reason: format!("cannot write output: {e}"),
+                })?;
                 out.flush().map_err(|e| ApiError::Protocol {
                     url: "stdout".to_string(),
                     reason: format!("cannot flush output: {e}"),
                 })?;
+                written += emit.len() as u64;
+                if max_bytes.is_some_and(|budget| written >= budget) {
+                    break;
+                }
             }
             Some(TermFrame::Disconnect) => break,
             Some(TermFrame::Setup) | Some(TermFrame::Unknown(_)) => {}

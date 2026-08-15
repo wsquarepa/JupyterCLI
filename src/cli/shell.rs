@@ -84,18 +84,25 @@ pub async fn run(ctx: &Ctx, cmd: ShellCmd) -> Result<(), CliError> {
             shellops::send(sock, &text.join(" ")).await?;
             Ok(())
         }
-        ShellCmd::Peek { shell, follow, raw } => {
+        ShellCmd::Peek {
+            shell,
+            follow,
+            raw,
+            max_wait,
+            max_bytes,
+        } => {
             let (server, name) = parse_shell_ref(&shell);
             let (client, _) = server_client_for(ctx, server.as_deref()).await?;
             let sock = connect(&client, ctx, &name).await?;
             let mut stdout = std::io::stdout();
             if follow {
+                let wait = max_wait.map(std::time::Duration::from_secs);
                 tokio::select! {
-                    result = shellops::peek(sock, raw, true, &mut stdout) => result?,
+                    result = shellops::peek(sock, raw, true, wait, max_bytes, &mut stdout) => result?,
                     _ = tokio::signal::ctrl_c() => {}
                 }
             } else {
-                shellops::peek(sock, raw, false, &mut stdout).await?;
+                shellops::peek(sock, raw, false, None, None, &mut stdout).await?;
             }
             Ok(())
         }

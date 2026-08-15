@@ -183,6 +183,12 @@ fetch it instead:\n  jhc shell send SHELL -- 'cmd |& tee job.log'\n  jhc cp :job
         /// Emit verbatim bytes instead of stripped text
         #[arg(long)]
         raw: bool,
+        /// Stop following after this many seconds
+        #[arg(long, value_name = "SECS", requires = "follow")]
+        max_wait: Option<u64>,
+        /// Stop following after emitting this many output bytes
+        #[arg(long, value_name = "BYTES", requires = "follow")]
+        max_bytes: Option<u64>,
     },
     /// Destroy a shell
     Kill {

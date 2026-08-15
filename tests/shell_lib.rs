@@ -43,7 +43,9 @@ async fn peek_prints_stripped_replay_then_stops_on_idle() {
     .await;
     let sock = TermSocket::connect(&mock.url(), "tok").await.unwrap();
     let mut out: Vec<u8> = Vec::new();
-    shellops::peek(sock, false, false, &mut out).await.unwrap();
+    shellops::peek(sock, false, false, None, None, &mut out)
+        .await
+        .unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "prompt$ tail -f log\nline1\n"
@@ -55,8 +57,41 @@ async fn peek_raw_preserves_escapes() {
     let mock = MockTerminado::spawn("\x1b[31mred\x1b[0m", |_| Vec::new()).await;
     let sock = TermSocket::connect(&mock.url(), "tok").await.unwrap();
     let mut out: Vec<u8> = Vec::new();
-    shellops::peek(sock, true, false, &mut out).await.unwrap();
+    shellops::peek(sock, true, false, None, None, &mut out)
+        .await
+        .unwrap();
     assert_eq!(out, b"\x1b[31mred\x1b[0m");
+}
+
+#[tokio::test]
+async fn peek_follow_stops_cleanly_at_max_bytes() {
+    let mock = MockTerminado::spawn("0123456789", |_| Vec::new()).await;
+    let sock = TermSocket::connect(&mock.url(), "tok").await.unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    shellops::peek(sock, true, true, None, Some(4), &mut out)
+        .await
+        .unwrap();
+    assert_eq!(out, b"0123");
+}
+
+#[tokio::test]
+async fn peek_follow_stops_cleanly_at_max_wait() {
+    let mock = MockTerminado::spawn("", |_| Vec::new()).await;
+    let sock = TermSocket::connect(&mock.url(), "tok").await.unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    let started = std::time::Instant::now();
+    shellops::peek(
+        sock,
+        true,
+        true,
+        Some(std::time::Duration::from_millis(100)),
+        None,
+        &mut out,
+    )
+    .await
+    .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(out.is_empty());
 }
 
 #[tokio::test]
