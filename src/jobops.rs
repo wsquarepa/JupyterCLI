@@ -119,9 +119,13 @@ pub fn build_remove_script(ids: &[String]) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
     #[error(
-        "malformed job probe record: expected 5 fields, got {fields} ({line_len} bytes); the remote ~/.jhc/jobs state may be damaged"
+        "malformed job probe record ({line_len} bytes): {reason}; the remote ~/.jhc/jobs state may be damaged"
     )]
-    MalformedRecord { fields: usize, line_len: usize },
+    MalformedRecord { reason: String, line_len: usize },
+    #[error(
+        "job directory '{id}' under ~/.jhc/jobs is not a job id ({JOB_ID_LEN} lowercase hex chars); remove it by hand"
+    )]
+    BadId { id: String },
     #[error(
         "job '{id}' has unreadable metadata: {reason}; recreate it or remove it with: jhc job rm {id}"
     )]
@@ -208,32 +212,42 @@ pub fn parse_probe_output(text: &str) -> Result<Vec<ProbeRecord>, JobError> {
         if line.is_empty() {
             continue;
         }
+        let malformed = |reason: String| JobError::MalformedRecord {
+            reason,
+            line_len: line.len(),
+        };
         let fields: Vec<&str> = line.split('\x1f').collect();
         let [id, exit, alive, started, meta] = fields.as_slice() else {
-            return Err(JobError::MalformedRecord {
-                fields: fields.len(),
-                line_len: line.len(),
-            });
+            return Err(malformed(format!(
+                "expected 5 fields, got {}",
+                fields.len()
+            )));
         };
+        // Directory names feed rm -rf and kill scripts, so a stray non-job entry under
+        // the jobs dir must be refused here rather than trusted downstream.
+        if validate_job_id(id).is_err() {
+            return Err(JobError::BadId { id: id.to_string() });
+        }
         let exit = match *exit {
             "-" => None,
-            digits => Some(
-                digits
+            digits => {
+                let code = digits
                     .parse::<i32>()
-                    .map_err(|_| JobError::MalformedRecord {
-                        fields: fields.len(),
-                        line_len: line.len(),
-                    })?,
-            ),
+                    .ok()
+                    .filter(|code| (0..=255).contains(code))
+                    .ok_or_else(|| {
+                        malformed(format!("exit code {digits:?} is not an integer in 0..=255"))
+                    })?;
+                Some(code)
+            }
         };
         let pid_alive = match *alive {
             "1" => true,
             "0" => false,
-            _ => {
-                return Err(JobError::MalformedRecord {
-                    fields: fields.len(),
-                    line_len: line.len(),
-                });
+            other => {
+                return Err(malformed(format!(
+                    "pid-alive flag {other:?} is neither 0 nor 1"
+                )));
             }
         };
         let started_at = (*started != "-").then(|| started.to_string());
@@ -512,20 +526,57 @@ mod tests {
         assert!(records[1].meta.is_none());
     }
 
+    fn malformed_reason(text: &str) -> String {
+        match parse_probe_output(text) {
+            Err(JobError::MalformedRecord { reason, .. }) => reason,
+            other => panic!("expected MalformedRecord, got {other:?}"),
+        }
+    }
+
     #[test]
     fn probe_output_rejects_malformed_records_loudly() {
-        assert!(matches!(
-            parse_probe_output("only-two\x1ffields\n"),
-            Err(JobError::MalformedRecord { fields: 2, .. })
-        ));
-        assert!(matches!(
-            parse_probe_output("aabbccdd\x1fnot-a-code\x1f1\x1f-\x1f-\n"),
-            Err(JobError::MalformedRecord { .. })
-        ));
+        assert!(malformed_reason("only-two\x1ffields\n").contains("expected 5 fields, got 2"));
+        assert!(malformed_reason("aabbccdd\x1fnot-a-code\x1f1\x1f-\x1f-\n").contains("exit code"));
+        assert!(malformed_reason("aabbccdd\x1f0\x1fmaybe\x1f-\x1f-\n").contains("pid-alive"));
         assert!(matches!(
             parse_probe_output("aabbccdd\x1f-\x1f1\x1f-\x1f!!notb64!!\n"),
             Err(JobError::BadMeta { .. })
         ));
+        let err = parse_probe_output("only-two\x1ffields\n").unwrap_err();
+        assert!(
+            err.to_string().contains("expected 5 fields, got 2")
+                && err.to_string().contains("~/.jhc/jobs"),
+            "message: {err}"
+        );
+    }
+
+    #[test]
+    fn probe_output_rejects_exit_codes_outside_a_byte() {
+        for bad in ["-1", "256", "99999"] {
+            let reason = malformed_reason(&format!("aabbccdd\x1f{bad}\x1f0\x1f-\x1f-\n"));
+            assert!(reason.contains("0..=255"), "reason: {reason}");
+        }
+        let records = parse_probe_output("aabbccdd\x1f255\x1f0\x1f-\x1f-\n").unwrap();
+        assert_eq!(records[0].exit, Some(255));
+    }
+
+    #[test]
+    fn probe_output_rejects_directory_names_that_are_not_job_ids() {
+        // Record ids feed rm -rf and kill scripts, so a stray directory under
+        // ~/.jhc/jobs must be refused before it can reach any of them.
+        for bad in ["$(reboot)", "AABBCCDD", "aabbccd", "../etc"] {
+            match parse_probe_output(&format!("{bad}\x1f-\x1f1\x1f-\x1f-\n")) {
+                Err(JobError::BadId { id }) => {
+                    assert_eq!(id, bad);
+                }
+                other => panic!("expected BadId for {bad:?}, got {other:?}"),
+            }
+        }
+        let err = parse_probe_output("$(reboot)\x1f-\x1f1\x1f-\x1f-\n").unwrap_err();
+        assert!(
+            err.to_string().contains("remove it by hand"),
+            "message: {err}"
+        );
     }
 
     #[test]
