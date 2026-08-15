@@ -1,10 +1,10 @@
 use crate::shellops::shell_quote;
 
 pub const JOB_ID_LEN: usize = 8;
-// $HOME stays unexpanded here; every generated script wraps it in double quotes and
-// the remote shell expands it. Home is the one path guaranteed writable and
-// persistent on JupyterHub pods.
-const JOBS_DIR: &str = "$HOME/.jhc/jobs";
+// Relative to the remote home. Scripts spell it as "$HOME/<rel>" (unexpanded here, the
+// remote shell expands it inside double quotes) and user-facing paths as "~/<rel>". Home
+// is the one path guaranteed writable and persistent on JupyterHub pods.
+const JOBS_DIR_REL: &str = ".jhc/jobs";
 const GENERATION_SLACK_SECS: i64 = 60;
 const WAIT_BACKOFF_CEILING_SECS: u64 = 15;
 pub const DEFAULT_TAIL_BYTES: u64 = 65536;
@@ -43,7 +43,7 @@ pub struct JobMeta {
 }
 
 pub fn log_path(id: &str) -> String {
-    format!("~/.jhc/jobs/{id}/log")
+    format!("~/{JOBS_DIR_REL}/{id}/log")
 }
 
 // The runner records its own $$ rather than the launcher capturing $!, because
@@ -54,14 +54,17 @@ pub fn log_path(id: &str) -> String {
 // bash before the exit sentinel prints. The subshell around the launch matters: the
 // interactive terminado bash would otherwise print a job-control notice for the
 // background job between exec's sentinels.
-// The runner traps TERM with a no-op handler rather than ignoring it: a handler is reset to default across exec, so the job command still dies on the group SIGTERM that job kill sends, while the runner survives to record its exit code; SIG_IGN would be inherited by the command.
+// The runner traps TERM with a no-op handler rather than ignoring it: a handler is
+// reset to default across exec, so the job command still dies on the group SIGTERM
+// that job kill sends, while the runner survives to record its exit code; SIG_IGN
+// would be inherited by the command.
 pub fn build_start_script(id: &str, meta_json: &str, command: &str) -> String {
     let runner = format!(
         "trap ':' TERM; echo $$ > \"$0/pid\"; {{ {command}; }} < /dev/null > \"$0/log\" 2>&1; \
          echo $? > \"$0/exit.tmp\" && mv \"$0/exit.tmp\" \"$0/exit\""
     );
     format!(
-        "dir=\"{JOBS_DIR}/{id}\"; \
+        "dir=\"$HOME/{JOBS_DIR_REL}/{id}\"; \
          if mkdir -p \"$dir\" && printf '%s' {meta} > \"$dir/meta.json\" && \
          date -u +%FT%TZ > \"$dir/started\"; \
          then ( setsid bash -c {script} \"$dir\" & ) else false; fi",
@@ -74,7 +77,9 @@ pub fn build_start_script(id: &str, meta_json: &str, command: &str) -> String {
 // flows to `$?`; exiting the ephemeral terminado bash itself would drop the exec
 // end sentinel and jhc would see a closed connection instead of the code.
 fn tail_body(id: &str, cmd: &str) -> String {
-    format!("( log=\"{JOBS_DIR}/{id}/log\"; [ -f \"$log\" ] || exit {TAIL_MISSING_EXIT}; {cmd} )")
+    format!(
+        "( log=\"$HOME/{JOBS_DIR_REL}/{id}/log\"; [ -f \"$log\" ] || exit {TAIL_MISSING_EXIT}; {cmd} )"
+    )
 }
 
 pub fn build_tail_script(id: &str, max_bytes: u64) -> String {
@@ -83,7 +88,9 @@ pub fn build_tail_script(id: &str, max_bytes: u64) -> String {
 
 // --max-bytes doubles as the initial window and the stream cap, so tail never emits
 // more than the budget. `timeout` wraps tail, not the pipeline: on expiry head sees
-// EOF and the pipeline exits 0; a plain timeout expiry without head exits 124.
+// EOF and the pipeline exits 0; a plain timeout expiry without head exits 124. The
+// prompt return once head's budget fills relies on GNU tail noticing the closed pipe;
+// an older coreutils lingers until the next log write or the timeout.
 pub fn build_follow_script(id: &str, max_wait: Option<u64>, max_bytes: Option<u64>) -> String {
     let window = max_bytes.unwrap_or(DEFAULT_TAIL_BYTES);
     let mut cmd = format!("tail -c {window} -f \"$log\"");
@@ -104,13 +111,13 @@ pub fn follow_exit_ok(code: i32) -> bool {
 // included); this script trusts the pid file it finds.
 pub fn build_kill_script(id: &str, force: bool) -> String {
     let sig = if force { "KILL" } else { "TERM" };
-    format!("d=\"{JOBS_DIR}/{id}\"; kill -{sig} -- -\"$(cat \"$d/pid\")\"")
+    format!("d=\"$HOME/{JOBS_DIR_REL}/{id}\"; kill -{sig} -- -\"$(cat \"$d/pid\")\"")
 }
 
 pub fn build_remove_script(ids: &[String]) -> String {
     let dirs = ids
         .iter()
-        .map(|id| format!("\"{JOBS_DIR}/{id}\""))
+        .map(|id| format!("\"$HOME/{JOBS_DIR_REL}/{id}\""))
         .collect::<Vec<_>>()
         .join(" ");
     format!("rm -rf -- {dirs}")
@@ -190,7 +197,18 @@ pub fn classify(record: &ProbeRecord, server_started_unix: Option<i64>) -> JobSt
     if !record.pid_alive {
         return JobState::Orphaned;
     }
-    let job_started = record.started_at.as_deref().and_then(parse_utc_timestamp);
+    let job_started = record.started_at.as_deref().and_then(|raw| {
+        let parsed = parse_utc_timestamp(raw);
+        if parsed.is_none() {
+            tracing::debug!(
+                target: "jhc::job",
+                id = %record.id,
+                started_at = %raw,
+                "job start timestamp is unparsable; generation check skipped"
+            );
+        }
+        parsed
+    });
     if let (Some(job), Some(server)) = (job_started, server_started_unix)
         && job + GENERATION_SLACK_SECS < server
     {
@@ -203,13 +221,17 @@ pub fn wait_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs((1u64 << attempt.min(4)).min(WAIT_BACKOFF_CEILING_SECS))
 }
 
+// The all-jobs glob relies on bash's default globbing: with no jobs the pattern stays
+// literal, fails the -d test, and the loop emits nothing. A remote bashrc that sets
+// failglob makes the probe exit non-zero instead, which surfaces as a loud probe
+// failure rather than a false "no jobs".
 // One line per job, fields separated by the ASCII unit separator (0x1f, printf \037):
 // id, exit code or -, pid-alive 1/0, started timestamp or -, meta.json base64 or -.
 // base64 keeps arbitrary metadata bytes from ever colliding with the delimiter.
 pub fn build_probe_script(id: Option<&str>) -> String {
     let glob = match id {
-        Some(id) => format!("\"{JOBS_DIR}/{id}/\""),
-        None => format!("\"{JOBS_DIR}\"/*/"),
+        Some(id) => format!("\"$HOME/{JOBS_DIR_REL}/{id}/\""),
+        None => format!("\"$HOME/{JOBS_DIR_REL}\"/*/"),
     };
     format!(
         "for d in {glob}; do [ -d \"$d\" ] || continue; \

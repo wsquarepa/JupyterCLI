@@ -1,4 +1,5 @@
 use crate::api::server::ServerClient;
+use crate::api::types::Server;
 use crate::api::ws::TermSocket;
 use crate::attach::{self, AttachOutcome};
 use crate::shellops;
@@ -9,7 +10,7 @@ use super::{CliError, Ctx, ShellCmd};
 pub async fn server_entry_for(
     ctx: &Ctx,
     server: Option<&str>,
-) -> Result<(crate::api::types::Server, String), CliError> {
+) -> Result<(Server, String), CliError> {
     let user = ctx.client.whoami().await?;
     let key = server.unwrap_or_default().to_string();
     let display = if key.is_empty() {
@@ -31,16 +32,24 @@ pub async fn server_entry_for(
     Ok((found.clone(), display))
 }
 
+pub fn client_for_entry(
+    ctx: &Ctx,
+    entry: &Server,
+    display: &str,
+) -> Result<ServerClient, CliError> {
+    let url_path = entry
+        .url
+        .as_deref()
+        .ok_or_else(|| CliError::Usage(format!("server '{display}' reports no URL")))?;
+    Ok(ServerClient::from_hub(&ctx.client, url_path)?)
+}
+
 pub async fn server_client_for(
     ctx: &Ctx,
     server: Option<&str>,
 ) -> Result<(ServerClient, String), CliError> {
     let (entry, display) = server_entry_for(ctx, server).await?;
-    let url_path = entry
-        .url
-        .as_deref()
-        .ok_or_else(|| CliError::Usage(format!("server '{display}' reports no URL")))?;
-    Ok((ServerClient::from_hub(&ctx.client, url_path)?, display))
+    Ok((client_for_entry(ctx, &entry, &display)?, display))
 }
 
 async fn connect(client: &ServerClient, ctx: &Ctx, shell: &str) -> Result<TermSocket, CliError> {

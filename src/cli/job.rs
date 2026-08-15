@@ -6,7 +6,7 @@ use crate::jobops::{self, JobMeta};
 use crate::shellops;
 
 use super::addr::parse_shell_ref;
-use super::shell::server_entry_for;
+use super::shell::{client_for_entry, server_entry_for};
 use super::{CliError, Ctx, JobCmd};
 
 struct JobTarget {
@@ -17,11 +17,7 @@ struct JobTarget {
 
 async fn resolve_target(ctx: &Ctx, server: Option<&str>) -> Result<JobTarget, CliError> {
     let (entry, display) = server_entry_for(ctx, server).await?;
-    let url_path = entry
-        .url
-        .as_deref()
-        .ok_or_else(|| CliError::Usage(format!("server '{display}' reports no URL")))?;
-    let client = ServerClient::from_hub(&ctx.client, url_path)?;
+    let client = client_for_entry(ctx, &entry, &display)?;
     let server_started_unix = entry
         .started
         .as_deref()
@@ -144,6 +140,41 @@ fn not_found(id: &str, display: &str) -> CliError {
         server: display.to_string(),
     }
     .into()
+}
+
+async fn start(
+    ctx: &Ctx,
+    server: Option<&str>,
+    name: Option<String>,
+    json: bool,
+    command_args: &[String],
+) -> Result<(), CliError> {
+    let command = shellops::shell_join(command_args);
+    let id = jobops::gen_job_id();
+    let meta = JobMeta {
+        id: id.clone(),
+        name,
+        command: command.clone(),
+    };
+    let meta_json = serde_json::to_string(&meta)
+        .map_err(|e| CliError::Usage(format!("cannot encode job metadata: {e}")))?;
+    let script = jobops::build_start_script(&id, &meta_json, &command);
+    let target = resolve_target(ctx, server).await?;
+    run_script_or_fail(ctx, &target, "job setup", &script).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "id": id,
+                "name": meta.name,
+                "log_path": jobops::log_path(&id),
+            })
+        );
+    } else {
+        println!("started job {id} on server {}", target.display);
+        println!("log: {}", jobops::log_path(&id));
+    }
+    Ok(())
 }
 
 async fn list(ctx: &Ctx, server: Option<&str>, json: bool) -> Result<(), CliError> {
@@ -453,39 +484,4 @@ pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
     }
-}
-
-async fn start(
-    ctx: &Ctx,
-    server: Option<&str>,
-    name: Option<String>,
-    json: bool,
-    command_args: &[String],
-) -> Result<(), CliError> {
-    let command = shellops::shell_join(command_args);
-    let id = jobops::gen_job_id();
-    let meta = JobMeta {
-        id: id.clone(),
-        name,
-        command: command.clone(),
-    };
-    let meta_json = serde_json::to_string(&meta)
-        .map_err(|e| CliError::Usage(format!("cannot encode job metadata: {e}")))?;
-    let script = jobops::build_start_script(&id, &meta_json, &command);
-    let target = resolve_target(ctx, server).await?;
-    run_script_or_fail(ctx, &target, "job setup", &script).await?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "id": id,
-                "name": meta.name,
-                "log_path": jobops::log_path(&id),
-            })
-        );
-    } else {
-        println!("started job {id} on server {}", target.display);
-        println!("log: {}", jobops::log_path(&id));
-    }
-    Ok(())
 }
