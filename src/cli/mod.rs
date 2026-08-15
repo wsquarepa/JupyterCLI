@@ -25,6 +25,8 @@ pub enum CliError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Job(#[from] crate::jobops::JobError),
+    #[error("interrupted")]
+    Interrupted,
 }
 
 #[derive(Parser)]
@@ -427,6 +429,10 @@ pub fn main() -> std::process::ExitCode {
             eprintln!("{}", init::NO_CONFIG_GUIDANCE);
             exit_code_for_failure(proxies_remote_exit)
         }
+        Err(CliError::Interrupted) => {
+            eprintln!("interrupted");
+            exit_code_for_interrupt(proxies_remote_exit)
+        }
         Err(e) => {
             eprintln!("error: {e}");
             let mut source = std::error::Error::source(&e);
@@ -444,6 +450,16 @@ fn exit_code_for_failure(proxies_remote_exit: bool) -> std::process::ExitCode {
         std::process::ExitCode::from(crate::shellops::JHC_FAILURE_EXIT as u8)
     } else {
         std::process::ExitCode::from(1)
+    }
+}
+
+// 130 is the shell convention for "died on SIGINT"; under a verb that proxies a remote
+// exit code it would masquerade as the remote command's own status, so 125 there.
+fn exit_code_for_interrupt(proxies_remote_exit: bool) -> std::process::ExitCode {
+    if proxies_remote_exit {
+        std::process::ExitCode::from(crate::shellops::JHC_FAILURE_EXIT as u8)
+    } else {
+        std::process::ExitCode::from(130)
     }
 }
 

@@ -78,13 +78,15 @@ async fn serve_terminado(stream: TcpStream) {
                         }
                         awaiting_eof_nonce = Some(nonce);
                     } else if payload.contains(".jhc/jobs") {
-                        let (body, code) = job_reply(payload);
-                        for out in [
-                            format!("{payload}\r\n"),
-                            format!("\x1e{nonce}:S\x1e"),
-                            body,
-                            format!("\x1e{nonce}:{code}\x1e"),
-                        ] {
+                        // A hanging script (None) echoes the line and the start sentinel,
+                        // then never finishes: the terminal stays open until jhc closes it.
+                        let mut frames =
+                            vec![format!("{payload}\r\n"), format!("\x1e{nonce}:S\x1e")];
+                        if let Some((body, code)) = job_reply(payload) {
+                            frames.push(body);
+                            frames.push(format!("\x1e{nonce}:{code}\x1e"));
+                        }
+                        for out in frames {
                             let frame = serde_json::json!(["stdout", out]).to_string();
                             ws.send(Message::Text(frame.into())).await.unwrap();
                         }
@@ -132,7 +134,8 @@ fn probe_record(
 /// Canned remote answers for the job scripts, keyed on distinctive substrings.
 /// Match order matters: probes contain `kill -0`, so they must match before the
 /// kill arm; the fallthrough 127 makes an unmatched script an obvious test failure.
-fn job_reply(payload: &str) -> (String, i32) {
+/// `None` means the script never finishes (job dddddddd), for interruption tests.
+fn job_reply(payload: &str) -> Option<(String, i32)> {
     let running = || {
         probe_record(
             "aaaaaaaa",
@@ -163,13 +166,15 @@ fn job_reply(payload: &str) -> (String, i32) {
             "'sleep' '999'",
         )
     };
-    if payload.contains("for d in") {
+    let reply = if payload.contains("for d in") {
         if payload.contains("jobs/aaaaaaaa") {
             (running(), 0)
         } else if payload.contains("jobs/bbbbbbbb") {
             (exited(), 0)
         } else if payload.contains("jobs/cccccccc") {
             (orphaned(), 0)
+        } else if payload.contains("jobs/dddddddd") {
+            return None;
         } else if payload.contains("jobs/eeeeeeee") {
             (String::new(), 0)
         } else {
@@ -197,7 +202,8 @@ fn job_reply(payload: &str) -> (String, i32) {
         (String::new(), 0)
     } else {
         (String::new(), 127)
-    }
+    };
+    Some(reply)
 }
 
 async fn serve_http(mut stream: TcpStream, head: &str) {

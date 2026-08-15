@@ -106,8 +106,10 @@ pub fn build_follow_script(id: &str, max_wait: Option<u64>, max_bytes: Option<u6
     tail_body(id, &cmd)
 }
 
+// 124 is timeout's expiry without head, 141 is tail dying of SIGPIPE once head has its
+// budget; a Ctrl-C never reaches the remote tail because jhc cancels the exec instead.
 pub fn follow_exit_ok(code: i32) -> bool {
-    matches!(code, 0 | 124 | 130 | 141)
+    matches!(code, 0 | 124 | 141)
 }
 
 // The caller must have classified the job as Running first (generation check
@@ -525,10 +527,10 @@ mod tests {
 
     #[test]
     fn follow_exit_codes_for_budget_and_interrupt_are_success() {
-        for ok in [0, 124, 130, 141] {
+        for ok in [0, 124, 141] {
             assert!(follow_exit_ok(ok));
         }
-        for bad in [1, 2, 66, 127] {
+        for bad in [1, 2, 66, 127, 130] {
             assert!(!follow_exit_ok(bad));
         }
     }

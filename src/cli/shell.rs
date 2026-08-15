@@ -57,6 +57,52 @@ async fn connect(client: &ServerClient, ctx: &Ctx, shell: &str) -> Result<TermSo
     Ok(TermSocket::connect(&url, &ctx.hub.effective_token()).await?)
 }
 
+// Registering the listener installs tokio's process-wide SIGINT handler, so from this
+// point on a Ctrl-C only has an effect where something awaits `recv()`; callers create
+// it right before the first await they want interruptible and keep it alive until the
+// last one. Multiple listeners can coexist; each is notified independently.
+pub fn interrupt_listener() -> Result<tokio::signal::unix::Signal, CliError> {
+    Ok(tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::interrupt(),
+    )?)
+}
+
+// Creates a throwaway terminal and connects to it. A Ctrl-C during either step returns
+// `CliError::Interrupted` with the terminal already deleted; without this the process
+// would die between create and connect (before exec's own handler exists) and leak
+// the terminal against the server's terminal_limit.
+pub async fn open_ephemeral(
+    ctx: &Ctx,
+    client: &ServerClient,
+    interrupt: &mut tokio::signal::unix::Signal,
+) -> Result<(String, TermSocket), CliError> {
+    let name = tokio::select! {
+        biased;
+        _ = interrupt.recv() => return Err(CliError::Interrupted),
+        created = client.create_terminal() => created?.name,
+    };
+    let connected = tokio::select! {
+        biased;
+        _ = interrupt.recv() => Err(CliError::Interrupted),
+        sock = connect(client, ctx, &name) => sock,
+    };
+    match connected {
+        Ok(sock) => Ok((name, sock)),
+        Err(e) => {
+            close_ephemeral(client, &name).await;
+            Err(e)
+        }
+    }
+}
+
+// The remote `exit` self-destructs the terminal; DELETE is the belt for error paths,
+// interrupted execs, and terminado versions that keep exited terminals listed.
+pub async fn close_ephemeral(client: &ServerClient, name: &str) {
+    if let Err(cleanup) = client.delete_terminal(name).await {
+        eprintln!("warning: could not clean up shell {name}: {cleanup}");
+    }
+}
+
 pub async fn run(ctx: &Ctx, cmd: ShellCmd) -> Result<(), CliError> {
     match cmd {
         ShellCmd::New { server } => {
@@ -176,9 +222,16 @@ pub async fn exec_cmd(
     };
 
     let (client, _) = server_client_for(ctx, reuse_server.as_deref()).await?;
-    let (shell_name, ephemeral) = match reuse_shell {
-        Some(name) => (name, false),
-        None => (client.create_terminal().await?.name, true),
+    let (shell_name, ephemeral, sock) = match reuse_shell {
+        Some(name) => {
+            let sock = connect(&client, ctx, &name).await?;
+            (name, false, sock)
+        }
+        None => {
+            let mut interrupt = interrupt_listener()?;
+            let (name, sock) = open_ephemeral(ctx, &client, &mut interrupt).await?;
+            (name, true, sock)
+        }
     };
 
     let stdin_pipe = if std::io::stdin().is_terminal() {
@@ -187,17 +240,11 @@ pub async fn exec_cmd(
         Some(tokio::io::stdin())
     };
 
-    let url = client.ws_terminal_url(&shell_name)?;
-    let sock = TermSocket::connect(&url, &ctx.hub.effective_token()).await?;
     let mut stdout = std::io::stdout();
     let result = shellops::exec(sock, command, stdin_pipe, ephemeral, &mut stdout).await;
 
     if ephemeral {
-        // The remote `exit` self-destructs the terminal; DELETE is the belt for
-        // error paths and for terminado versions that keep exited terminals listed.
-        if let Err(cleanup) = client.delete_terminal(&shell_name).await {
-            eprintln!("warning: could not clean up shell {shell_name}: {cleanup}");
-        }
+        close_ephemeral(&client, &shell_name).await;
     }
     Ok(result?.exit_code)
 }

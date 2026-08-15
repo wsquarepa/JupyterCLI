@@ -559,3 +559,50 @@ async fn job_rm_removes_an_orphaned_job() {
     assert_eq!(json["removed"][0]["id"], "cccccccc");
     assert_eq!(json["removed"][0]["state"], "orphaned");
 }
+
+#[tokio::test]
+async fn job_wait_ctrl_c_during_a_probe_interrupts_with_125() {
+    // The probe for dddddddd never finishes. Ctrl-C must cancel the in-flight exec
+    // rather than being forwarded to the remote shell as \x03, which the (already
+    // installed) SIGINT handler would otherwise do, leaving wait stuck.
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), &format!("http://{}", mock.addr()));
+    let mut cmd = common::client_bin();
+    cmd.env("JHC_CONFIG_DIR", dir.path())
+        .env_remove("JUPYTERHUB_API_TOKEN")
+        .args(["job", "wait", "dddddddd", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = tokio::task::spawn_blocking(move || {
+        let mut child = cmd.spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let signalled = std::process::Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(signalled.success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                panic!("jhc did not exit within 8s of Ctrl-C during a probe");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        child.wait_with_output().unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("interrupted"), "stderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["id"], "dddddddd");
+    assert_eq!(json["state"], "interrupted");
+}

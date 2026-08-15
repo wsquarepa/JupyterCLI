@@ -1,12 +1,13 @@
 use std::process::ExitCode;
 
 use crate::api::server::ServerClient;
-use crate::api::ws::TermSocket;
 use crate::jobops::{self, JobMeta};
 use crate::shellops;
 
 use super::addr::parse_shell_ref;
-use super::shell::{client_for_entry, server_entry_for};
+use super::shell::{
+    client_for_entry, close_ephemeral, interrupt_listener, open_ephemeral, server_entry_for,
+};
 use super::{CliError, Ctx, JobCmd};
 
 struct JobTarget {
@@ -34,21 +35,24 @@ struct ScriptOutcome {
     exit_code: i32,
 }
 
+// Runs one job script in a throwaway terminal. Ctrl-C at any point yields
+// `CliError::Interrupted` with the terminal cleaned up. The select is biased toward
+// the listener so the interrupt cancels exec outright instead of racing exec's own
+// handler, which would forward \x03 to the remote script and leave a half-run probe.
 async fn run_script_to(
     ctx: &Ctx,
     target: &JobTarget,
     script: &str,
     out: &mut impl std::io::Write,
 ) -> Result<i32, CliError> {
-    let name = target.client.create_terminal().await?.name;
-    let url = target.client.ws_terminal_url(&name)?;
-    let sock = TermSocket::connect(&url, &ctx.hub.effective_token()).await?;
-    let result = shellops::exec(sock, script, None, true, out).await;
-    // Same belt as exec_cmd: the remote `exit` self-destructs the terminal, DELETE
-    // covers error paths and terminado versions that keep exited terminals listed.
-    if let Err(cleanup) = target.client.delete_terminal(&name).await {
-        eprintln!("warning: could not clean up shell {name}: {cleanup}");
-    }
+    let mut interrupt = interrupt_listener()?;
+    let (name, sock) = open_ephemeral(ctx, &target.client, &mut interrupt).await?;
+    let result = tokio::select! {
+        biased;
+        _ = interrupt.recv() => Err(CliError::Interrupted),
+        run = shellops::exec(sock, script, None, true, out) => run.map_err(CliError::from),
+    };
+    close_ephemeral(&target.client, &name).await;
     Ok(result?.exit_code)
 }
 
@@ -245,7 +249,11 @@ async fn tail(
     let target = resolve_target(ctx, server.as_deref()).await?;
     if follow {
         let script = jobops::build_follow_script(&id, max_wait, max_bytes);
-        let code = run_script_to(ctx, &target, &script, &mut std::io::stdout()).await?;
+        // Ctrl-C is the documented way to stop following, so it is not a failure.
+        let code = match run_script_to(ctx, &target, &script, &mut std::io::stdout()).await {
+            Err(CliError::Interrupted) => return Ok(()),
+            code => code?,
+        };
         if code == jobops::TAIL_MISSING_EXIT {
             return Err(not_found(&id, &target.display));
         }
@@ -286,12 +294,30 @@ async fn wait(
     let (server, id) = job_ref(job)?;
     let started = std::time::Instant::now();
     let budget = max_wait.map(std::time::Duration::from_secs);
+    // One listener for the whole wait, created before any I/O: every await below either
+    // races against it or (the probe) carries its own, so a Ctrl-C landing anywhere in
+    // the loop ends the wait with 125 instead of being swallowed by the installed handler.
+    let mut interrupt = interrupt_listener()?;
+    let interrupted = || {
+        eprintln!("job {id} wait interrupted; its outcome is unknown");
+        if json {
+            println!("{}", serde_json::json!({"id": id, "state": "interrupted"}));
+        }
+        Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8))
+    };
     let mut attempt: u32 = 0;
     loop {
         // Re-resolve each poll so a server restart mid-wait updates the generation
         // check instead of leaving a reused pid looking alive forever.
-        let target = resolve_target(ctx, server.as_deref()).await?;
-        let records = probe(ctx, &target, Some(id.as_str())).await?;
+        let target = tokio::select! {
+            biased;
+            _ = interrupt.recv() => return interrupted(),
+            target = resolve_target(ctx, server.as_deref()) => target?,
+        };
+        let records = match probe(ctx, &target, Some(id.as_str())).await {
+            Err(CliError::Interrupted) => return interrupted(),
+            records => records?,
+        };
         let Some(record) = records.first() else {
             return Err(not_found(&id, &target.display));
         };
@@ -327,15 +353,10 @@ async fn wait(
             }
             pause = pause.min(budget.saturating_sub(elapsed));
         }
-        // The probe's exec installs a process-wide SIGINT handler, so once the first
-        // poll has run the default "die on Ctrl-C" action is gone; without racing the
-        // pause against the signal, Ctrl-C would be swallowed until the next probe.
         tokio::select! {
+            biased;
+            _ = interrupt.recv() => return interrupted(),
             _ = tokio::time::sleep(pause) => {}
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("job {id} wait interrupted; its outcome is unknown");
-                return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
-            }
         }
     }
 }
