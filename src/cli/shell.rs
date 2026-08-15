@@ -3,6 +3,7 @@ use crate::api::types::Server;
 use crate::api::ws::TermSocket;
 use crate::attach::{self, AttachOutcome};
 use crate::shellops;
+use tokio::signal::unix::{Signal, SignalKind};
 
 use super::addr::parse_shell_ref;
 use super::{CliError, Ctx, ShellCmd};
@@ -61,10 +62,8 @@ async fn connect(client: &ServerClient, ctx: &Ctx, shell: &str) -> Result<TermSo
 // point on a Ctrl-C only has an effect where something awaits `recv()`; callers create
 // it right before the first await they want interruptible and keep it alive until the
 // last one. Multiple listeners can coexist; each is notified independently.
-pub fn interrupt_listener() -> Result<tokio::signal::unix::Signal, CliError> {
-    Ok(tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::interrupt(),
-    )?)
+pub fn interrupt_listener() -> Result<Signal, CliError> {
+    Ok(tokio::signal::unix::signal(SignalKind::interrupt())?)
 }
 
 // Creates a throwaway terminal and connects to it. A Ctrl-C during either step returns
@@ -74,7 +73,7 @@ pub fn interrupt_listener() -> Result<tokio::signal::unix::Signal, CliError> {
 pub async fn open_ephemeral(
     ctx: &Ctx,
     client: &ServerClient,
-    interrupt: &mut tokio::signal::unix::Signal,
+    interrupt: &mut Signal,
 ) -> Result<(String, TermSocket), CliError> {
     let name = tokio::select! {
         biased;

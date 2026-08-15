@@ -9,6 +9,7 @@ use super::shell::{
     client_for_entry, close_ephemeral, interrupt_listener, open_ephemeral, server_entry_for,
 };
 use super::{CliError, Ctx, JobCmd};
+use tokio::signal::unix::Signal;
 
 struct JobTarget {
     client: ServerClient,
@@ -39,14 +40,16 @@ struct ScriptOutcome {
 // `CliError::Interrupted` with the terminal cleaned up. The select is biased toward
 // the listener so the interrupt cancels exec outright instead of racing exec's own
 // handler, which would forward \x03 to the remote script and leave a half-run probe.
+// The listener is the caller's so that a verb running several scripts has no gap
+// between them in which a Ctrl-C could be missed.
 async fn run_script_to(
     ctx: &Ctx,
     target: &JobTarget,
     script: &str,
+    interrupt: &mut Signal,
     out: &mut impl std::io::Write,
 ) -> Result<i32, CliError> {
-    let mut interrupt = interrupt_listener()?;
-    let (name, sock) = open_ephemeral(ctx, &target.client, &mut interrupt).await?;
+    let (name, sock) = open_ephemeral(ctx, &target.client, interrupt).await?;
     let result = tokio::select! {
         biased;
         _ = interrupt.recv() => Err(CliError::Interrupted),
@@ -60,9 +63,10 @@ async fn run_script_on(
     ctx: &Ctx,
     target: &JobTarget,
     script: &str,
+    interrupt: &mut Signal,
 ) -> Result<ScriptOutcome, CliError> {
     let mut buf: Vec<u8> = Vec::new();
-    let exit_code = run_script_to(ctx, target, script, &mut buf).await?;
+    let exit_code = run_script_to(ctx, target, script, interrupt, &mut buf).await?;
     Ok(ScriptOutcome {
         output: String::from_utf8_lossy(&buf).into_owned(),
         exit_code,
@@ -115,8 +119,9 @@ async fn run_script_or_fail(
     target: &JobTarget,
     verb: &'static str,
     script: &str,
+    interrupt: &mut Signal,
 ) -> Result<ScriptOutcome, CliError> {
-    let outcome = run_script_on(ctx, target, script).await?;
+    let outcome = run_script_on(ctx, target, script, interrupt).await?;
     if outcome.exit_code != 0 {
         return Err(remote_failed(
             verb,
@@ -132,9 +137,16 @@ async fn probe(
     ctx: &Ctx,
     target: &JobTarget,
     id: Option<&str>,
+    interrupt: &mut Signal,
 ) -> Result<Vec<jobops::ProbeRecord>, CliError> {
-    let outcome =
-        run_script_or_fail(ctx, target, "job probe", &jobops::build_probe_script(id)).await?;
+    let outcome = run_script_or_fail(
+        ctx,
+        target,
+        "job probe",
+        &jobops::build_probe_script(id),
+        interrupt,
+    )
+    .await?;
     Ok(jobops::parse_probe_output(&outcome.output)?)
 }
 
@@ -164,7 +176,8 @@ async fn start(
         .map_err(|e| CliError::Usage(format!("cannot encode job metadata: {e}")))?;
     let script = jobops::build_start_script(&id, &meta_json, &command);
     let target = resolve_target(ctx, server).await?;
-    run_script_or_fail(ctx, &target, "job setup", &script).await?;
+    let mut interrupt = interrupt_listener()?;
+    run_script_or_fail(ctx, &target, "job setup", &script, &mut interrupt).await?;
     if json {
         println!(
             "{}",
@@ -183,7 +196,8 @@ async fn start(
 
 async fn list(ctx: &Ctx, server: Option<&str>, json: bool) -> Result<(), CliError> {
     let target = resolve_target(ctx, server).await?;
-    let records = probe(ctx, &target, None).await?;
+    let mut interrupt = interrupt_listener()?;
+    let records = probe(ctx, &target, None, &mut interrupt).await?;
     let rows: Vec<JobRow> = records
         .iter()
         .map(|r| job_row(r, jobops::classify(r, target.server_started_unix)))
@@ -216,7 +230,8 @@ async fn list(ctx: &Ctx, server: Option<&str>, json: bool) -> Result<(), CliErro
 async fn status(ctx: &Ctx, job: &str, json: bool) -> Result<(), CliError> {
     let (server, id) = job_ref(job)?;
     let target = resolve_target(ctx, server.as_deref()).await?;
-    let records = probe(ctx, &target, Some(id.as_str())).await?;
+    let mut interrupt = interrupt_listener()?;
+    let records = probe(ctx, &target, Some(id.as_str()), &mut interrupt).await?;
     let record = records
         .first()
         .ok_or_else(|| not_found(&id, &target.display))?;
@@ -247,10 +262,12 @@ async fn tail(
 ) -> Result<(), CliError> {
     let (server, id) = job_ref(job)?;
     let target = resolve_target(ctx, server.as_deref()).await?;
+    let mut interrupt = interrupt_listener()?;
     if follow {
         let script = jobops::build_follow_script(&id, max_wait, max_bytes);
         // Ctrl-C is the documented way to stop following, so it is not a failure.
-        let code = match run_script_to(ctx, &target, &script, &mut std::io::stdout()).await {
+        let mut stdout = std::io::stdout();
+        let code = match run_script_to(ctx, &target, &script, &mut interrupt, &mut stdout).await {
             Err(CliError::Interrupted) => return Ok(()),
             code => code?,
         };
@@ -269,7 +286,7 @@ async fn tail(
     }
     let bytes = max_bytes.unwrap_or(jobops::DEFAULT_TAIL_BYTES);
     let script = jobops::build_tail_script(&id, bytes);
-    let outcome = run_script_on(ctx, &target, &script).await?;
+    let outcome = run_script_on(ctx, &target, &script, &mut interrupt).await?;
     if outcome.exit_code == jobops::TAIL_MISSING_EXIT {
         return Err(not_found(&id, &target.display));
     }
@@ -294,9 +311,9 @@ async fn wait(
     let (server, id) = job_ref(job)?;
     let started = std::time::Instant::now();
     let budget = max_wait.map(std::time::Duration::from_secs);
-    // One listener for the whole wait, created before any I/O: every await below either
-    // races against it or (the probe) carries its own, so a Ctrl-C landing anywhere in
-    // the loop ends the wait with 125 instead of being swallowed by the installed handler.
+    // One listener for the whole wait, created before any I/O and shared with every
+    // probe, so a Ctrl-C landing anywhere in the loop ends the wait with 125 instead of
+    // being swallowed by the installed handler.
     let mut interrupt = interrupt_listener()?;
     let interrupted = || {
         eprintln!("job {id} wait interrupted; its outcome is unknown");
@@ -314,7 +331,7 @@ async fn wait(
             _ = interrupt.recv() => return interrupted(),
             target = resolve_target(ctx, server.as_deref()) => target?,
         };
-        let records = match probe(ctx, &target, Some(id.as_str())).await {
+        let records = match probe(ctx, &target, Some(id.as_str()), &mut interrupt).await {
             Err(CliError::Interrupted) => return interrupted(),
             records => records?,
         };
@@ -364,7 +381,8 @@ async fn wait(
 async fn kill(ctx: &Ctx, job: &str, force: bool, json: bool) -> Result<(), CliError> {
     let (server, id) = job_ref(job)?;
     let target = resolve_target(ctx, server.as_deref()).await?;
-    let records = probe(ctx, &target, Some(id.as_str())).await?;
+    let mut interrupt = interrupt_listener()?;
+    let records = probe(ctx, &target, Some(id.as_str()), &mut interrupt).await?;
     let record = records
         .first()
         .ok_or_else(|| not_found(&id, &target.display))?;
@@ -381,7 +399,13 @@ async fn kill(ctx: &Ctx, job: &str, force: bool, json: bool) -> Result<(), CliEr
         }
         jobops::JobState::Running => {}
     }
-    let outcome = run_script_on(ctx, &target, &jobops::build_kill_script(&id, force)).await?;
+    let outcome = run_script_on(
+        ctx,
+        &target,
+        &jobops::build_kill_script(&id, force),
+        &mut interrupt,
+    )
+    .await?;
     if outcome.exit_code != 0 {
         return Err(jobops::JobError::KillFailed {
             server: target.display.clone(),
@@ -402,7 +426,8 @@ async fn kill(ctx: &Ctx, job: &str, force: bool, json: bool) -> Result<(), CliEr
 async fn remove(ctx: &Ctx, job: &str, json: bool) -> Result<(), CliError> {
     let (server, id) = job_ref(job)?;
     let target = resolve_target(ctx, server.as_deref()).await?;
-    let records = probe(ctx, &target, Some(id.as_str())).await?;
+    let mut interrupt = interrupt_listener()?;
+    let records = probe(ctx, &target, Some(id.as_str()), &mut interrupt).await?;
     let record = records
         .first()
         .ok_or_else(|| not_found(&id, &target.display))?;
@@ -413,7 +438,14 @@ async fn remove(ctx: &Ctx, job: &str, json: bool) -> Result<(), CliError> {
         )));
     }
     let ids = vec![id.clone()];
-    run_script_or_fail(ctx, &target, "remove", &jobops::build_remove_script(&ids)).await?;
+    run_script_or_fail(
+        ctx,
+        &target,
+        "remove",
+        &jobops::build_remove_script(&ids),
+        &mut interrupt,
+    )
+    .await?;
     if json {
         println!(
             "{}",
@@ -427,7 +459,8 @@ async fn remove(ctx: &Ctx, job: &str, json: bool) -> Result<(), CliError> {
 
 async fn clean(ctx: &Ctx, server: Option<&str>, json: bool) -> Result<(), CliError> {
     let target = resolve_target(ctx, server).await?;
-    let records = probe(ctx, &target, None).await?;
+    let mut interrupt = interrupt_listener()?;
+    let records = probe(ctx, &target, None, &mut interrupt).await?;
     let finished: Vec<(String, jobops::JobState)> = records
         .iter()
         .filter_map(|r| {
@@ -444,7 +477,14 @@ async fn clean(ctx: &Ctx, server: Option<&str>, json: bool) -> Result<(), CliErr
         return Ok(());
     }
     let ids: Vec<String> = finished.iter().map(|(id, _)| id.clone()).collect();
-    run_script_or_fail(ctx, &target, "clean", &jobops::build_remove_script(&ids)).await?;
+    run_script_or_fail(
+        ctx,
+        &target,
+        "clean",
+        &jobops::build_remove_script(&ids),
+        &mut interrupt,
+    )
+    .await?;
     if json {
         let removed: Vec<serde_json::Value> = finished
             .iter()

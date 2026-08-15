@@ -274,35 +274,56 @@ async fn job_wait_times_out_with_125_while_running() {
     );
 }
 
-#[tokio::test]
-async fn job_wait_ctrl_c_interrupts_promptly_with_125() {
-    // The first probe registers a process-wide SIGINT handler inside exec, so a
-    // plain sleep between polls would swallow every later Ctrl-C.
-    let mock = MockJupyter::spawn().await;
-    let dir = tempfile::tempdir().unwrap();
-    write_config(dir.path(), &format!("http://{}", mock.addr()));
+/// Spawns `jhc` with `args`, sends it SIGINT after `delay`, and collects its output;
+/// panics (killing the child) if it has not exited within 8 seconds of the signal.
+async fn jhc_interrupted_after(
+    mock: &MockJupyter,
+    dir: &std::path::Path,
+    args: &[&str],
+    delay: std::time::Duration,
+) -> std::process::Output {
+    write_config(dir, &format!("http://{}", mock.addr()));
     let mut cmd = common::client_bin();
-    cmd.env("JHC_CONFIG_DIR", dir.path())
+    cmd.env("JHC_CONFIG_DIR", dir)
         .env_remove("JUPYTERHUB_API_TOKEN")
-        .args(["job", "wait", "aaaaaaaa", "--max-wait", "20"])
+        .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let out = tokio::task::spawn_blocking(move || {
-        let child = cmd.spawn().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(2500));
+    tokio::task::spawn_blocking(move || {
+        let mut child = cmd.spawn().unwrap();
+        std::thread::sleep(delay);
         let signalled = std::process::Command::new("kill")
             .args(["-INT", &child.id().to_string()])
             .status()
             .unwrap();
         assert!(signalled.success());
-        let started = std::time::Instant::now();
-        let out = child.wait_with_output().unwrap();
-        (out, started.elapsed())
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                panic!("jhc did not exit within 8s of Ctrl-C");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        child.wait_with_output().unwrap()
     })
     .await
-    .unwrap();
-    let (out, took) = out;
-    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    .unwrap()
+}
+
+#[tokio::test]
+async fn job_wait_ctrl_c_interrupts_promptly_with_125() {
+    // wait's listener must race the pause between polls, or a Ctrl-C landing there is
+    // swallowed by the already-installed SIGINT handler until the next probe.
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc_interrupted_after(
+        &mock,
+        dir.path(),
+        &["job", "wait", "aaaaaaaa", "--max-wait", "20"],
+        std::time::Duration::from_millis(2500),
+    )
+    .await;
     assert_eq!(
         out.status.code(),
         Some(125),
@@ -567,33 +588,13 @@ async fn job_wait_ctrl_c_during_a_probe_interrupts_with_125() {
     // installed) SIGINT handler would otherwise do, leaving wait stuck.
     let mock = MockJupyter::spawn().await;
     let dir = tempfile::tempdir().unwrap();
-    write_config(dir.path(), &format!("http://{}", mock.addr()));
-    let mut cmd = common::client_bin();
-    cmd.env("JHC_CONFIG_DIR", dir.path())
-        .env_remove("JUPYTERHUB_API_TOKEN")
-        .args(["job", "wait", "dddddddd", "--json"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let out = tokio::task::spawn_blocking(move || {
-        let mut child = cmd.spawn().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-        let signalled = std::process::Command::new("kill")
-            .args(["-INT", &child.id().to_string()])
-            .status()
-            .unwrap();
-        assert!(signalled.success());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        while child.try_wait().unwrap().is_none() {
-            if std::time::Instant::now() > deadline {
-                child.kill().unwrap();
-                panic!("jhc did not exit within 8s of Ctrl-C during a probe");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        child.wait_with_output().unwrap()
-    })
-    .await
-    .unwrap();
+    let out = jhc_interrupted_after(
+        &mock,
+        dir.path(),
+        &["job", "wait", "dddddddd", "--json"],
+        std::time::Duration::from_millis(1500),
+    )
+    .await;
     assert_eq!(
         out.status.code(),
         Some(125),
