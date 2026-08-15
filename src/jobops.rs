@@ -7,6 +7,10 @@ pub const JOB_ID_LEN: usize = 8;
 const JOBS_DIR: &str = "$HOME/.jhc/jobs";
 const GENERATION_SLACK_SECS: i64 = 60;
 const WAIT_BACKOFF_CEILING_SECS: u64 = 15;
+pub const DEFAULT_TAIL_BYTES: u64 = 65536;
+// Reserved by the tail scripts for "no such job log": log content cannot forge an
+// exit status, so this stays unambiguous where a sentinel string in output would not.
+pub const TAIL_MISSING_EXIT: i32 = 66;
 
 pub fn gen_job_id() -> String {
     use rand::RngExt as _;
@@ -63,6 +67,48 @@ pub fn build_start_script(id: &str, meta_json: &str, command: &str) -> String {
         meta = shell_quote(meta_json),
         script = shell_quote(&runner),
     )
+}
+
+pub fn build_tail_script(id: &str, max_bytes: u64) -> String {
+    format!(
+        "log=\"{JOBS_DIR}/{id}/log\"; [ -f \"$log\" ] || exit {TAIL_MISSING_EXIT}; \
+         tail -c {max_bytes} \"$log\""
+    )
+}
+
+// --max-bytes doubles as the initial window and the stream cap, so tail never emits
+// more than the budget. `timeout` wraps tail, not the pipeline: on expiry head sees
+// EOF and the pipeline exits 0; a plain timeout expiry without head exits 124.
+pub fn build_follow_script(id: &str, max_wait: Option<u64>, max_bytes: Option<u64>) -> String {
+    let window = max_bytes.unwrap_or(DEFAULT_TAIL_BYTES);
+    let mut cmd = format!("tail -c {window} -f \"$log\"");
+    if let Some(secs) = max_wait {
+        cmd = format!("timeout {secs} {cmd}");
+    }
+    if let Some(bytes) = max_bytes {
+        cmd = format!("{cmd} | head -c {bytes}");
+    }
+    format!("log=\"{JOBS_DIR}/{id}/log\"; [ -f \"$log\" ] || exit {TAIL_MISSING_EXIT}; {cmd}")
+}
+
+pub fn follow_exit_ok(code: i32) -> bool {
+    matches!(code, 0 | 124 | 130 | 141)
+}
+
+// The caller must have classified the job as Running first (generation check
+// included); this script trusts the pid file it finds.
+pub fn build_kill_script(id: &str, force: bool) -> String {
+    let sig = if force { "KILL" } else { "TERM" };
+    format!("d=\"{JOBS_DIR}/{id}\"; kill -{sig} -- -\"$(cat \"$d/pid\")\"")
+}
+
+pub fn build_remove_script(ids: &[String]) -> String {
+    let dirs = ids
+        .iter()
+        .map(|id| format!("\"{JOBS_DIR}/{id}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("rm -rf -- {dirs}")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -285,6 +331,60 @@ mod tests {
     fn start_script_survives_hostile_command_bytes() {
         let nasty = "'echo' 'a'\\''b'ne'wline\n$(reboot)'";
         assert_bash_parses(&build_start_script("aabbccdd", "{}", nasty));
+    }
+
+    #[test]
+    fn tail_script_bounds_bytes_and_reserves_missing_exit() {
+        let script = build_tail_script("aabbccdd", 4096);
+        assert!(script.contains("tail -c 4096 \"$log\""));
+        assert!(script.contains("exit 66"));
+        assert_bash_parses(&script);
+    }
+
+    #[test]
+    fn follow_script_composes_window_timeout_and_byte_budget() {
+        let bare = build_follow_script("aabbccdd", None, None);
+        assert!(bare.contains(&format!("tail -c {DEFAULT_TAIL_BYTES} -f \"$log\"")));
+        assert!(!bare.contains("timeout") && !bare.contains("head"));
+
+        let waited = build_follow_script("aabbccdd", Some(30), None);
+        assert!(waited.contains("timeout 30 tail -c"));
+
+        let both = build_follow_script("aabbccdd", Some(30), Some(9000));
+        assert!(both.contains("timeout 30 tail -c 9000 -f \"$log\" | head -c 9000"));
+        for script in [&bare, &waited, &both] {
+            assert_bash_parses(script);
+        }
+    }
+
+    #[test]
+    fn follow_exit_codes_for_budget_and_interrupt_are_success() {
+        for ok in [0, 124, 130, 141] {
+            assert!(follow_exit_ok(ok));
+        }
+        for bad in [1, 2, 66, 127] {
+            assert!(!follow_exit_ok(bad));
+        }
+    }
+
+    #[test]
+    fn kill_script_signals_the_process_group() {
+        let term = build_kill_script("aabbccdd", false);
+        assert!(term.contains("kill -TERM -- -\"$(cat \"$d/pid\")\""));
+        let kill = build_kill_script("aabbccdd", true);
+        assert!(kill.contains("kill -KILL"));
+        assert_bash_parses(&term);
+        assert_bash_parses(&kill);
+    }
+
+    #[test]
+    fn remove_script_deletes_each_named_job_dir() {
+        let script = build_remove_script(&["aabbccdd".to_string(), "11223344".to_string()]);
+        assert_eq!(
+            script,
+            "rm -rf -- \"$HOME/.jhc/jobs/aabbccdd\" \"$HOME/.jhc/jobs/11223344\""
+        );
+        assert_bash_parses(&script);
     }
 
     #[test]
