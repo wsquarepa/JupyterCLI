@@ -62,11 +62,23 @@ impl TermSocket {
                 reason: "token contains characters invalid in a header".to_string(),
             })?;
         request.headers_mut().insert("Authorization", auth);
+        // A 404 on the upgrade is how a stale terminal id surfaces: terminado keeps no
+        // record of terminals from before a server restart, so the handshake rejection
+        // is the only signal that the shell is gone.
         let (ws, _) = tokio_tungstenite::connect_async(request)
             .await
-            .map_err(|e| ApiError::Ws {
-                url: url.to_string(),
-                source: Box::new(e),
+            .map_err(|e| match e {
+                tokio_tungstenite::tungstenite::Error::Http(ref resp)
+                    if resp.status().as_u16() == 404 =>
+                {
+                    ApiError::ShellNotFound {
+                        url: url.to_string(),
+                    }
+                }
+                e => ApiError::Ws {
+                    url: url.to_string(),
+                    source: Box::new(e),
+                },
             })?;
         tracing::debug!(target: "jhc::ws", url = %url, "connect");
         Ok(Self {
@@ -182,6 +194,32 @@ mod tests {
         assert!(decode_frame("not json").is_err());
         assert!(decode_frame("{}").is_err());
         assert!(decode_frame("[]").is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_upgrade_404_maps_to_stale_shell_error() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+        });
+        let url = format!("ws://{addr}/user/ww41/terminals/websocket/7");
+        let err = match TermSocket::connect(&url, "tok").await {
+            Ok(_) => panic!("connect against a 404 upgrade must fail"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ApiError::ShellNotFound { .. }), "got: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("server restart"), "got: {msg}");
+        assert!(msg.contains("jhc shell list"), "got: {msg}");
     }
 
     #[test]

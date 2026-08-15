@@ -22,6 +22,10 @@ pub enum ApiError {
     },
     #[error("this server does not expose the terminals API ({url} returned 404)")]
     TerminalsUnsupported { url: String },
+    #[error(
+        "shell not found ({url} returned 404): shells do not survive a server restart, so this id may be stale; run jhc shell list to see the current shells"
+    )]
+    ShellNotFound { url: String },
     #[error("{method} {url} returned {status}: {body}")]
     Status {
         method: &'static str,
