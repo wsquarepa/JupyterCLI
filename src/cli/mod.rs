@@ -1,6 +1,7 @@
 pub mod addr;
 pub mod fs;
 pub mod init;
+pub mod job;
 pub mod preset;
 pub mod server;
 pub mod shell;
@@ -22,6 +23,8 @@ pub enum CliError {
     Usage(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Job(#[from] crate::jobops::JobError),
 }
 
 #[derive(Parser)]
@@ -132,6 +135,95 @@ jhc exec -- bash -s < script.sh"
     /// Manage hub API tokens
     #[command(subcommand)]
     Token(TokenCmd),
+    /// Run and manage detached jobs on a server
+    #[command(subcommand)]
+    Job(JobCmd),
+}
+
+#[derive(Subcommand)]
+pub enum JobCmd {
+    /// Start a command as a detached job that survives disconnects
+    Start {
+        /// Server to run on; omit for the default server
+        server: Option<String>,
+        /// Display label stored with the job
+        #[arg(long)]
+        name: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Command and arguments to run
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// List jobs on a server
+    List {
+        /// Server to list; omit for the default server
+        server: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one job in detail
+    Status {
+        /// Job as [SERVER:]JOB
+        job: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print or follow a job's log
+    Tail {
+        /// Job as [SERVER:]JOB
+        job: String,
+        /// Keep streaming new log output
+        #[arg(long)]
+        follow: bool,
+        /// Stop following after this many seconds
+        #[arg(long, requires = "follow")]
+        max_wait: Option<u64>,
+        /// Emit at most this many bytes
+        #[arg(long)]
+        max_bytes: Option<u64>,
+    },
+    /// Block until a job finishes, then exit with its code
+    Wait {
+        /// Job as [SERVER:]JOB
+        job: String,
+        /// Give up after this many seconds and exit 125
+        #[arg(long)]
+        max_wait: Option<u64>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Signal a running job's process group
+    Kill {
+        /// Job as [SERVER:]JOB
+        job: String,
+        /// Send SIGKILL instead of SIGTERM
+        #[arg(long)]
+        force: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a finished job's state directory
+    Rm {
+        /// Job as [SERVER:]JOB
+        job: String,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete every exited and orphaned job on a server
+    Clean {
+        /// Server to clean; omit for the default server
+        server: Option<String>,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -358,6 +450,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
         Some(Command::Cp { .. }) => "cp",
         Some(Command::Rm { .. }) => "rm",
         Some(Command::Token(_)) => "token",
+        Some(Command::Job(_)) => "job",
     };
     let _span = tracing::info_span!("command", name = verb, hub = ?cli.hub).entered();
     let ok = std::process::ExitCode::SUCCESS;
@@ -441,5 +534,6 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
             token::run(&Ctx::load(cli.hub.as_deref())?, cmd).await?;
             Ok(ok)
         }
+        Some(Command::Job(cmd)) => job::run(&Ctx::load(cli.hub.as_deref())?, cmd).await,
     }
 }

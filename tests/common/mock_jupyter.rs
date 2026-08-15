@@ -77,6 +77,17 @@ async fn serve_terminado(stream: TcpStream) {
                             ws.send(Message::Text(frame.into())).await.unwrap();
                         }
                         awaiting_eof_nonce = Some(nonce);
+                    } else if payload.contains(".jhc/jobs") {
+                        let (body, code) = job_reply(payload);
+                        for out in [
+                            format!("{payload}\r\n"),
+                            format!("\x1e{nonce}:S\x1e"),
+                            body,
+                            format!("\x1e{nonce}:{code}\x1e"),
+                        ] {
+                            let frame = serde_json::json!(["stdout", out]).to_string();
+                            ws.send(Message::Text(frame.into())).await.unwrap();
+                        }
                     } else {
                         for out in [
                             format!("{payload}\r\n"),
@@ -104,6 +115,61 @@ async fn serve_terminado(stream: TcpStream) {
     }
 }
 
+fn probe_record(
+    id: &str,
+    exit: &str,
+    alive: &str,
+    name: serde_json::Value,
+    command: &str,
+) -> String {
+    use base64::Engine as _;
+    let meta = serde_json::json!({"id": id, "name": name, "command": command});
+    let b64 = base64::engine::general_purpose::STANDARD.encode(meta.to_string());
+    format!("{id}\x1f{exit}\x1f{alive}\x1f2026-08-14T10:00:00Z\x1f{b64}\r\n")
+}
+
+/// Canned remote answers for the job scripts, keyed on distinctive substrings.
+/// Match order matters: probes contain `kill -0`, so they must match before the
+/// kill arm; the fallthrough 127 makes an unmatched script an obvious test failure.
+fn job_reply(payload: &str) -> (String, i32) {
+    let running = || {
+        probe_record(
+            "aaaaaaaa",
+            "-",
+            "1",
+            serde_json::json!("vllm"),
+            "'sleep' '999'",
+        )
+    };
+    let exited = || probe_record("bbbbbbbb", "7", "0", serde_json::json!(null), "'false'");
+    if payload.contains("for d in") {
+        if payload.contains("jobs/aaaaaaaa") {
+            (running(), 0)
+        } else if payload.contains("jobs/bbbbbbbb") {
+            (exited(), 0)
+        } else if payload.contains("jobs/eeeeeeee") {
+            (String::new(), 0)
+        } else {
+            (format!("{}{}", running(), exited()), 0)
+        }
+    } else if payload.contains("mkdir -p") {
+        (String::new(), 0)
+    } else if payload.contains("tail -c") {
+        if payload.contains("jobs/eeeeeeee") {
+            (String::new(), 66)
+        } else {
+            ("job log line\r\n".to_string(), 0)
+        }
+    } else if payload.contains("kill -TERM")
+        || payload.contains("kill -KILL")
+        || payload.contains("rm -rf")
+    {
+        (String::new(), 0)
+    } else {
+        (String::new(), 127)
+    }
+}
+
 async fn serve_http(mut stream: TcpStream, head: &str) {
     // Drain the peeked request. Closing a socket with unread bytes sends RST instead of FIN,
     // which can truncate the response before the client reads it. The head is ASCII and these
@@ -114,7 +180,7 @@ async fn serve_http(mut stream: TcpStream, head: &str) {
     let (status, body): (&str, &str) = if head.starts_with("GET /hub/api/user ") {
         (
             "200 OK",
-            r#"{"name":"ww41","servers":{"":{"name":"","ready":true,"url":"/user/ww41/","user_options":{}}}}"#,
+            r#"{"name":"ww41","servers":{"":{"name":"","ready":true,"url":"/user/ww41/","started":"2026-08-14T09:00:00Z","user_options":{}}}}"#,
         )
     } else if head.starts_with("POST /user/ww41/api/terminals ") {
         ("200 OK", r#"{"name":"1"}"#)

@@ -19,6 +19,8 @@ pub struct Server {
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
+    pub started: Option<String>,
+    #[serde(default)]
     pub user_options: JsonMap,
 }
 
