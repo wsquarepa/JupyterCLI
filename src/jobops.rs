@@ -54,9 +54,10 @@ pub fn log_path(id: &str) -> String {
 // bash before the exit sentinel prints. The subshell around the launch matters: the
 // interactive terminado bash would otherwise print a job-control notice for the
 // background job between exec's sentinels.
+// The runner traps TERM with a no-op handler rather than ignoring it: a handler is reset to default across exec, so the job command still dies on the group SIGTERM that job kill sends, while the runner survives to record its exit code; SIG_IGN would be inherited by the command.
 pub fn build_start_script(id: &str, meta_json: &str, command: &str) -> String {
     let runner = format!(
-        "echo $$ > \"$0/pid\"; {{ {command}; }} < /dev/null > \"$0/log\" 2>&1; \
+        "trap ':' TERM; echo $$ > \"$0/pid\"; {{ {command}; }} < /dev/null > \"$0/log\" 2>&1; \
          echo $? > \"$0/exit.tmp\" && mv \"$0/exit.tmp\" \"$0/exit\""
     );
     format!(
@@ -321,6 +322,7 @@ mod tests {
         assert!(script.contains("date -u +%FT%TZ > \"$dir/started\""));
         assert!(script.contains("setsid bash -c"));
         assert!(script.contains("echo $$ > \"$0/pid\""));
+        assert!(script.contains("trap '\\'':'\\'' TERM; echo $$ > \"$0/pid\""));
         assert!(script.contains("mv \"$0/exit.tmp\" \"$0/exit\""));
         assert!(script.ends_with("\"$dir\" & ) else false; fi"));
         assert!(script.contains("< /dev/null > \"$0/log\" 2>&1"));
