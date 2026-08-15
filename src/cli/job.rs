@@ -60,6 +60,22 @@ async fn run_script_on(
     })
 }
 
+async fn run_script_streaming(
+    ctx: &Ctx,
+    target: &JobTarget,
+    script: &str,
+) -> Result<i32, CliError> {
+    let name = target.client.create_terminal().await?.name;
+    let url = target.client.ws_terminal_url(&name)?;
+    let sock = TermSocket::connect(&url, &ctx.hub.effective_token()).await?;
+    let mut stdout = std::io::stdout();
+    let result = shellops::exec(sock, script, None, true, &mut stdout).await;
+    if let Err(cleanup) = target.client.delete_terminal(&name).await {
+        eprintln!("warning: could not clean up shell {name}: {cleanup}");
+    }
+    Ok(result?.exit_code)
+}
+
 fn job_ref(raw: &str) -> Result<(Option<String>, String), CliError> {
     let (server, id) = parse_shell_ref(raw);
     jobops::validate_job_id(&id).map_err(CliError::Usage)?;
@@ -169,6 +185,47 @@ async fn status(ctx: &Ctx, job: &str, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn tail(
+    ctx: &Ctx,
+    job: &str,
+    follow: bool,
+    max_wait: Option<u64>,
+    max_bytes: Option<u64>,
+) -> Result<(), CliError> {
+    let (server, id) = job_ref(job)?;
+    let target = resolve_target(ctx, server.as_deref()).await?;
+    if follow {
+        let script = jobops::build_follow_script(&id, max_wait, max_bytes);
+        let code = run_script_streaming(ctx, &target, &script).await?;
+        if code == jobops::TAIL_MISSING_EXIT {
+            return Err(not_found(&id, &target.display));
+        }
+        if !jobops::follow_exit_ok(code) {
+            return Err(CliError::Usage(format!(
+                "tail failed on server {} (exit {code})",
+                target.display
+            )));
+        }
+        return Ok(());
+    }
+    let bytes = max_bytes.unwrap_or(jobops::DEFAULT_TAIL_BYTES);
+    let script = jobops::build_tail_script(&id, bytes);
+    let outcome = run_script_on(ctx, &target, &script).await?;
+    if outcome.exit_code == jobops::TAIL_MISSING_EXIT {
+        return Err(not_found(&id, &target.display));
+    }
+    if outcome.exit_code != 0 {
+        return Err(CliError::Usage(format!(
+            "tail failed on server {} (exit {}): {}",
+            target.display,
+            outcome.exit_code,
+            outcome.output.trim()
+        )));
+    }
+    print!("{}", outcome.output);
+    Ok(())
+}
+
 pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
     match cmd {
         JobCmd::Start {
@@ -188,11 +245,14 @@ pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
             status(ctx, &job, json).await?;
             Ok(ExitCode::SUCCESS)
         }
-        JobCmd::Tail { job, .. } => {
-            job_ref(&job)?;
-            Err(CliError::Usage(
-                "job tail is not implemented yet".to_string(),
-            ))
+        JobCmd::Tail {
+            job,
+            follow,
+            max_wait,
+            max_bytes,
+        } => {
+            tail(ctx, &job, follow, max_wait, max_bytes).await?;
+            Ok(ExitCode::SUCCESS)
         }
         JobCmd::Wait { job, .. } => {
             job_ref(&job)?;

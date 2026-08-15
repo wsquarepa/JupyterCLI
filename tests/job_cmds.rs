@@ -142,3 +142,43 @@ async fn job_status_shows_one_job_and_404s_actionably() {
         "stderr: {stderr}"
     );
 }
+
+#[tokio::test]
+async fn job_tail_prints_log_bytes_and_follow_budget_exits_zero() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "tail", "aaaaaaaa"]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("job log line")
+    );
+
+    let follow = jhc(
+        &mock,
+        dir.path(),
+        &["job", "tail", "aaaaaaaa", "--follow", "--max-wait", "1"],
+    )
+    .await;
+    assert_eq!(follow.status.code(), Some(0));
+    assert!(
+        String::from_utf8(follow.stdout)
+            .unwrap()
+            .contains("job log line")
+    );
+}
+
+#[tokio::test]
+async fn job_tail_missing_job_is_an_actionable_error() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "tail", "eeeeeeee"]).await;
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("not found"), "stderr: {stderr}");
+}
