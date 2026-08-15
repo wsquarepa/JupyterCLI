@@ -496,3 +496,66 @@ async fn job_clean_removes_only_finished_jobs() {
         "must not touch the running job: {stdout}"
     );
 }
+
+#[tokio::test]
+async fn job_start_reports_a_remote_setup_failure() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "start", "--", "setup-fails"]).await;
+    assert!(!out.status.success());
+    assert!(
+        out.stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("job setup failed")
+            && stderr.contains("exit 1")
+            && stderr.contains("Read-only file system"),
+        "stderr: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn job_kill_force_json_reports_sigkill_and_refuses_orphaned() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(
+        &mock,
+        dir.path(),
+        &["job", "kill", "aaaaaaaa", "--force", "--json"],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["id"], "aaaaaaaa");
+    assert_eq!(json["signal"], "SIGKILL");
+
+    let orphaned = jhc(&mock, dir.path(), &["job", "kill", "cccccccc"]).await;
+    assert!(!orphaned.status.success());
+    let stderr = String::from_utf8(orphaned.stderr).unwrap();
+    assert!(
+        stderr.contains("orphaned") && stderr.contains("jhc job rm cccccccc"),
+        "stderr: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn job_rm_removes_an_orphaned_job() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "rm", "cccccccc", "--json"]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["removed"][0]["id"], "cccccccc");
+    assert_eq!(json["removed"][0]["state"], "orphaned");
+}

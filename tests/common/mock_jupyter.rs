@@ -176,7 +176,14 @@ fn job_reply(payload: &str) -> (String, i32) {
             (format!("{}{}{}", running(), exited(), orphaned()), 0)
         }
     } else if payload.contains("mkdir -p") {
-        (String::new(), 0)
+        if payload.contains("setup-fails") {
+            (
+                "mkdir: cannot create directory: Read-only file system\r\n".to_string(),
+                1,
+            )
+        } else {
+            (String::new(), 0)
+        }
     } else if payload.contains("tail -c") {
         if payload.contains("jobs/eeeeeeee") {
             (String::new(), 66)
