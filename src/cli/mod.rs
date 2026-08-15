@@ -91,7 +91,10 @@ pub enum Command {
     #[command(
         after_help = "Arguments after -- are run as an argv, not a shell line: quoting and \
 argument boundaries are preserved exactly, so no top-level shell interpretation happens. For \
-pipes, redirection, or globbing, invoke a shell yourself:\n  jhc exec -- bash -c 'ls | grep foo'"
+pipes, redirection, or globbing, invoke a shell yourself:\n  jhc exec -- bash -c 'ls | grep foo'\
+\n\nPiped stdin is forwarded to the remote command byte for byte, and end of input is sent as \
+Ctrl-D. This runs a local script remotely as one unit, with no quoting or line-splitting:\n  \
+jhc exec -- bash -s < script.sh"
     )]
     Exec {
         /// Server to run on; omit for the default server

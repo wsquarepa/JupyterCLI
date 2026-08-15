@@ -58,6 +58,10 @@ async fn serve_terminado(stream: TcpStream) {
     ws.send(Message::Text("[\"setup\", {}]".to_string().into()))
         .await
         .unwrap();
+    // Set once an exec of `bash -s` arrives: the exit sentinel is then withheld until the
+    // Ctrl-D that jhc sends at stdin EOF, so a test can prove the piped bytes were forwarded
+    // before the command finished. Other exec lines keep the original immediate replies.
+    let mut awaiting_eof_nonce: Option<String> = None;
     while let Some(Ok(msg)) = ws.next().await {
         if let Message::Text(text) = msg {
             let value: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -66,16 +70,34 @@ async fn serve_terminado(stream: TcpStream) {
                 let payload = arr[1].as_str().unwrap();
                 if let Some(pos) = payload.find("printf '\\036") {
                     let nonce_start = pos + 12;
-                    let nonce = &payload[nonce_start..nonce_start + 16];
-                    for out in [
-                        format!("{payload}\r\n"),
-                        format!("\x1e{nonce}:S\x1e"),
-                        "hi\r\n".to_string(),
-                        format!("\x1e{nonce}:0\x1e"),
-                    ] {
-                        let frame = serde_json::json!(["stdout", out]).to_string();
-                        ws.send(Message::Text(frame.into())).await.unwrap();
+                    let nonce = payload[nonce_start..nonce_start + 16].to_string();
+                    if payload.contains("'bash' '-s'") {
+                        for out in [format!("{payload}\r\n"), format!("\x1e{nonce}:S\x1e")] {
+                            let frame = serde_json::json!(["stdout", out]).to_string();
+                            ws.send(Message::Text(frame.into())).await.unwrap();
+                        }
+                        awaiting_eof_nonce = Some(nonce);
+                    } else {
+                        for out in [
+                            format!("{payload}\r\n"),
+                            format!("\x1e{nonce}:S\x1e"),
+                            "hi\r\n".to_string(),
+                            format!("\x1e{nonce}:0\x1e"),
+                        ] {
+                            let frame = serde_json::json!(["stdout", out]).to_string();
+                            ws.send(Message::Text(frame.into())).await.unwrap();
+                        }
                     }
+                } else if let Some(nonce) = awaiting_eof_nonce.as_ref() {
+                    let out = if payload == "\x04" {
+                        let sentinel = format!("\x1e{nonce}:0\x1e");
+                        awaiting_eof_nonce = None;
+                        sentinel
+                    } else {
+                        format!("got:{payload}")
+                    };
+                    let frame = serde_json::json!(["stdout", out]).to_string();
+                    ws.send(Message::Text(frame.into())).await.unwrap();
                 }
             }
         }
