@@ -54,20 +54,23 @@ pub fn log_path(id: &str) -> String {
 // bash before the exit sentinel prints. The subshell around the launch matters: the
 // interactive terminado bash would otherwise print a job-control notice for the
 // background job between exec's sentinels.
+// The launcher redirects the whole runner, not just the command, so nothing in the job
+// keeps the ephemeral pty open and a runner failure (a mv that cannot write the exit
+// file) lands in the log instead of a dead pty.
 // The runner traps TERM with a no-op handler rather than ignoring it: a handler is
 // reset to default across exec, so the job command still dies on the group SIGTERM
 // that job kill sends, while the runner survives to record its exit code; SIG_IGN
 // would be inherited by the command.
 pub fn build_start_script(id: &str, meta_json: &str, command: &str) -> String {
     let runner = format!(
-        "trap ':' TERM; echo $$ > \"$0/pid\"; {{ {command}; }} < /dev/null > \"$0/log\" 2>&1; \
+        "trap ':' TERM; echo $$ > \"$0/pid\"; {{ {command}; }}; \
          echo $? > \"$0/exit.tmp\" && mv \"$0/exit.tmp\" \"$0/exit\""
     );
     format!(
         "dir=\"$HOME/{JOBS_DIR_REL}/{id}\"; \
          if mkdir -p \"$dir\" && printf '%s' {meta} > \"$dir/meta.json\" && \
          date -u +%FT%TZ > \"$dir/started\"; \
-         then ( setsid bash -c {script} \"$dir\" & ) else false; fi",
+         then ( setsid bash -c {script} \"$dir\" < /dev/null > \"$dir/log\" 2>&1 & ) else false; fi",
         meta = shell_quote(meta_json),
         script = shell_quote(&runner),
     )
@@ -224,7 +227,9 @@ pub fn wait_backoff(attempt: u32) -> std::time::Duration {
 // The all-jobs glob relies on bash's default globbing: with no jobs the pattern stays
 // literal, fails the -d test, and the loop emits nothing. A remote bashrc that sets
 // failglob makes the probe exit non-zero instead, which surfaces as a loud probe
-// failure rather than a false "no jobs".
+// failure rather than a false "no jobs". A pid file is trusted only when it is all
+// digits: kill -0 on -1 or an empty string succeeds against the caller's own group and
+// would report a dead job alive.
 // One line per job, fields separated by the ASCII unit separator (0x1f, printf \037):
 // id, exit code or -, pid-alive 1/0, started timestamp or -, meta.json base64 or -.
 // base64 keeps arbitrary metadata bytes from ever colliding with the delimiter.
@@ -236,7 +241,8 @@ pub fn build_probe_script(id: Option<&str>) -> String {
     format!(
         "for d in {glob}; do [ -d \"$d\" ] || continue; \
          if [ -f \"$d/exit\" ]; then ec=$(cat \"$d/exit\"); else ec=-; fi; \
-         if [ -f \"$d/pid\" ] && kill -0 \"$(cat \"$d/pid\")\" 2>/dev/null; then alive=1; else alive=0; fi; \
+         if [ -f \"$d/pid\" ]; then pid=$(cat \"$d/pid\"); else pid=; fi; \
+         case \"$pid\" in ''|*[!0-9]*) alive=0;; *) if kill -0 \"$pid\" 2>/dev/null; then alive=1; else alive=0; fi;; esac; \
          if [ -f \"$d/started\" ]; then st=$(cat \"$d/started\"); else st=-; fi; \
          if [ -f \"$d/meta.json\" ]; then meta=$(base64 -w0 < \"$d/meta.json\"); else meta=-; fi; \
          printf '%s\\037%s\\037%s\\037%s\\037%s\\n' \"$(basename \"$d\")\" \"$ec\" \"$alive\" \"$st\" \"$meta\"; \
@@ -381,8 +387,8 @@ mod tests {
         assert!(script.contains("echo $$ > \"$0/pid\""));
         assert!(script.contains("trap '\\'':'\\'' TERM; echo $$ > \"$0/pid\""));
         assert!(script.contains("mv \"$0/exit.tmp\" \"$0/exit\""));
-        assert!(script.ends_with("\"$dir\" & ) else false; fi"));
-        assert!(script.contains("< /dev/null > \"$0/log\" 2>&1"));
+        assert!(script.ends_with("\"$dir\" < /dev/null > \"$dir/log\" 2>&1 & ) else false; fi"));
+        assert!(!script.contains("$0/log"));
         assert_bash_parses(&script);
     }
 
@@ -448,6 +454,33 @@ mod tests {
         let (_, code) = run_ephemeral(&build_remove_script(&["aabbccdd".to_string()]), home.path());
         assert_eq!(code, Some(0));
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn probe_treats_non_numeric_pid_files_as_dead() {
+        // `kill -0 -1` signals the caller's own group and succeeds, so a damaged pid
+        // file must never read as alive; a real live pid must.
+        let home = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        for (id, pid, expect_alive) in [
+            ("aabbccd1", "-1".to_string(), false),
+            ("aabbccd2", String::new(), false),
+            ("aabbccd3", "12abc".to_string(), false),
+            ("aabbccd4", std::process::id().to_string(), true),
+        ] {
+            let dir = home.path().join(".jhc/jobs").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("pid"), pid).unwrap();
+            expected.push((id.to_string(), expect_alive));
+        }
+        let (output, code) = run_ephemeral(&build_probe_script(None), home.path());
+        assert_eq!(code, Some(0), "probe output: {output:?}");
+        let records = parse_probe_output(&output).unwrap();
+        let alive: Vec<(String, bool)> = records
+            .iter()
+            .map(|r| (r.id.clone(), r.pid_alive))
+            .collect();
+        assert_eq!(alive, expected);
     }
 
     #[test]
