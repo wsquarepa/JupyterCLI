@@ -240,6 +240,55 @@ async fn job_wait_missing_job_exits_125() {
 }
 
 #[tokio::test]
+async fn job_wait_times_out_with_125_while_running() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(
+        &mock,
+        dir.path(),
+        &["job", "wait", "aaaaaaaa", "--max-wait", "1"],
+    )
+    .await;
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("still running")
+    );
+}
+
+#[tokio::test]
+async fn job_wait_huge_max_wait_does_not_panic() {
+    // The deadline math must never add a Duration to an Instant: that panics on
+    // overflow (exit 101) and would break the "125 or the remote code" contract.
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(
+        &mock,
+        dir.path(),
+        &[
+            "job",
+            "wait",
+            "bbbbbbbb",
+            "--max-wait",
+            "18446744073709551615",
+        ],
+    )
+    .await;
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
 async fn job_wait_transport_failure_exits_125() {
     // Config points at a closed port: Ctx loads fine, the hub call fails.
     let dir = tempfile::tempdir().unwrap();

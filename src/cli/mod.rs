@@ -191,7 +191,7 @@ pub enum JobCmd {
         /// Job as [SERVER:]JOB
         job: String,
         /// Give up after this many seconds and exit 125
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         max_wait: Option<u64>,
         /// Emit machine-readable JSON
         #[arg(long)]

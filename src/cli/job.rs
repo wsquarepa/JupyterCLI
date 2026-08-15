@@ -226,12 +226,8 @@ async fn wait(
     json: bool,
 ) -> Result<ExitCode, CliError> {
     let (server, id) = job_ref(job)?;
-    let deadline = max_wait.map(|s| {
-        (
-            std::time::Instant::now() + std::time::Duration::from_secs(s),
-            s,
-        )
-    });
+    let started = std::time::Instant::now();
+    let budget = max_wait.map(std::time::Duration::from_secs);
     let mut attempt: u32 = 0;
     loop {
         // Re-resolve each poll so a server restart mid-wait updates the generation
@@ -239,11 +235,7 @@ async fn wait(
         let target = resolve_target(ctx, server.as_deref()).await?;
         let records = probe(ctx, &target, Some(id.as_str())).await?;
         let Some(record) = records.first() else {
-            eprintln!(
-                "job {id} not found on server {}; run: jhc job list",
-                target.display
-            );
-            return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
+            return Err(not_found(&id, &target.display));
         };
         match jobops::classify(record, target.server_started_unix) {
             jobops::JobState::Exited(code) => {
@@ -263,14 +255,14 @@ async fn wait(
         }
         let backoff = jobops::wait_backoff(attempt);
         attempt += 1;
-        match deadline {
-            Some((instant, secs)) => {
-                let now = std::time::Instant::now();
-                if now >= instant {
-                    eprintln!("job {id} still running after {secs}s");
+        match budget {
+            Some(budget) => {
+                let elapsed = started.elapsed();
+                if elapsed >= budget {
+                    eprintln!("job {id} still running after {}s", budget.as_secs());
                     return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
                 }
-                tokio::time::sleep(backoff.min(instant - now)).await;
+                tokio::time::sleep(backoff.min(budget.saturating_sub(elapsed))).await;
             }
             None => tokio::time::sleep(backoff).await,
         }
