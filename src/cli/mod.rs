@@ -139,7 +139,7 @@ jhc exec -- bash -s < script.sh"
     #[command(
         subcommand,
         after_help = "A job runs detached from any shell or connection and records its state \
-under ~/.jhc/jobs/<id>/ on the server (log, exit code, metadata). Jobs survive jhc \
+under ~/.jhc/jobs/<id>/ on the server (log, exit code, metadata, pid, start time). Jobs survive jhc \
 exiting; they die with the server. Requires bash and coreutils (setsid, base64, timeout, \
 tail) on the server, which standard JupyterHub images provide.\n  jhc job start -- python train.py\n  jhc job tail SERVER:ID --follow --max-wait 60\n  jhc job wait ID && echo done"
     )]
