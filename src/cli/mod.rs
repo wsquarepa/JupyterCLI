@@ -403,7 +403,12 @@ pub fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
-    let is_exec = matches!(cli.command, Some(Command::Exec { .. }));
+    // exec and job wait both proxy a remote exit code, so their runtime failures must
+    // surface as 125 rather than the generic 1.
+    let proxies_remote_exit = matches!(
+        cli.command,
+        Some(Command::Exec { .. }) | Some(Command::Job(JobCmd::Wait { .. }))
+    );
     let dispatched = runtime.block_on(dispatch(cli));
     // A piped-stdin exec (or a remote-closed attach) leaves a blocking read parked on fd 0
     // via `tokio::io::stdin()`. `Runtime::drop` waits for in-flight blocking tasks, so it
@@ -414,7 +419,7 @@ pub fn main() -> std::process::ExitCode {
         Ok(code) => code,
         Err(CliError::Config(ConfigError::NotFound(_))) => {
             eprintln!("{}", init::NO_CONFIG_GUIDANCE);
-            exit_code_for_failure(is_exec)
+            exit_code_for_failure(proxies_remote_exit)
         }
         Err(e) => {
             eprintln!("error: {e}");
@@ -423,13 +428,13 @@ pub fn main() -> std::process::ExitCode {
                 eprintln!("  caused by: {inner}");
                 source = inner.source();
             }
-            exit_code_for_failure(is_exec)
+            exit_code_for_failure(proxies_remote_exit)
         }
     }
 }
 
-fn exit_code_for_failure(is_exec: bool) -> std::process::ExitCode {
-    if is_exec {
+fn exit_code_for_failure(proxies_remote_exit: bool) -> std::process::ExitCode {
+    if proxies_remote_exit {
         std::process::ExitCode::from(crate::shellops::JHC_FAILURE_EXIT as u8)
     } else {
         std::process::ExitCode::from(1)

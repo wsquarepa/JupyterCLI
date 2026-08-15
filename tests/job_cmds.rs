@@ -205,3 +205,59 @@ async fn job_tail_rejects_zero_max_wait() {
         "stderr: {stderr}"
     );
 }
+
+#[tokio::test]
+async fn job_wait_propagates_the_remote_exit_code() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "wait", "bbbbbbbb"]).await;
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+async fn job_wait_json_reports_the_exit_code() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "wait", "bbbbbbbb", "--json"]).await;
+    assert_eq!(out.status.code(), Some(7));
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["id"], "bbbbbbbb");
+    assert_eq!(payload["exit_code"], 7);
+}
+
+#[tokio::test]
+async fn job_wait_missing_job_exits_125() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "wait", "eeeeeeee"]).await;
+    assert_eq!(out.status.code(), Some(125));
+    assert!(String::from_utf8(out.stderr).unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn job_wait_transport_failure_exits_125() {
+    // Config points at a closed port: Ctx loads fine, the hub call fails.
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), "http://127.0.0.1:9");
+    let out = tokio::task::spawn_blocking(move || {
+        common::client_bin()
+            .env("JHC_CONFIG_DIR", dir.path())
+            .env_remove("JUPYTERHUB_API_TOKEN")
+            .args(["job", "wait", "aaaaaaaa"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

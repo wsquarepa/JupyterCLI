@@ -219,6 +219,64 @@ async fn tail(
     Ok(())
 }
 
+async fn wait(
+    ctx: &Ctx,
+    job: &str,
+    max_wait: Option<u64>,
+    json: bool,
+) -> Result<ExitCode, CliError> {
+    let (server, id) = job_ref(job)?;
+    let deadline = max_wait.map(|s| {
+        (
+            std::time::Instant::now() + std::time::Duration::from_secs(s),
+            s,
+        )
+    });
+    let mut attempt: u32 = 0;
+    loop {
+        // Re-resolve each poll so a server restart mid-wait updates the generation
+        // check instead of leaving a reused pid looking alive forever.
+        let target = resolve_target(ctx, server.as_deref()).await?;
+        let records = probe(ctx, &target, Some(id.as_str())).await?;
+        let Some(record) = records.first() else {
+            eprintln!(
+                "job {id} not found on server {}; run: jhc job list",
+                target.display
+            );
+            return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
+        };
+        match jobops::classify(record, target.server_started_unix) {
+            jobops::JobState::Exited(code) => {
+                if json {
+                    println!("{}", serde_json::json!({"id": id, "exit_code": code}));
+                }
+                return Ok(ExitCode::from(code as u8));
+            }
+            jobops::JobState::Orphaned => {
+                eprintln!(
+                    "job {id} is orphaned (its process is gone without an exit code, \
+                     likely a server restart); its outcome is unknown"
+                );
+                return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
+            }
+            jobops::JobState::Running => {}
+        }
+        let backoff = jobops::wait_backoff(attempt);
+        attempt += 1;
+        match deadline {
+            Some((instant, secs)) => {
+                let now = std::time::Instant::now();
+                if now >= instant {
+                    eprintln!("job {id} still running after {secs}s");
+                    return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
+                }
+                tokio::time::sleep(backoff.min(instant - now)).await;
+            }
+            None => tokio::time::sleep(backoff).await,
+        }
+    }
+}
+
 pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
     match cmd {
         JobCmd::Start {
@@ -247,12 +305,11 @@ pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
             tail(ctx, &job, follow, max_wait, max_bytes).await?;
             Ok(ExitCode::SUCCESS)
         }
-        JobCmd::Wait { job, .. } => {
-            job_ref(&job)?;
-            Err(CliError::Usage(
-                "job wait is not implemented yet".to_string(),
-            ))
-        }
+        JobCmd::Wait {
+            job,
+            max_wait,
+            json,
+        } => wait(ctx, &job, max_wait, json).await,
         JobCmd::Kill { job, .. } => {
             job_ref(&job)?;
             Err(CliError::Usage(
