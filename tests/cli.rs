@@ -205,6 +205,82 @@ fn help_copy_says_jupytercli_and_never_uses_em_dashes() {
 }
 
 #[tokio::test]
+async fn status_json_emits_parseable_hub_user_and_servers() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/hub/api/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "ww41",
+            "servers": {"": {"name": "", "ready": true, "url": "/user/ww41/", "user_options": {"resource": "2_a100"}}}
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), &server.uri());
+    let output = common::client_bin()
+        .env("JHC_CONFIG_DIR", dir.path())
+        .env_remove("JUPYTERHUB_API_TOKEN")
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["hub"]["name"], "test");
+    assert_eq!(value["user"], "ww41");
+    assert_eq!(value["servers"][""]["ready"], true);
+    assert_eq!(value["servers"][""]["user_options"]["resource"], "2_a100");
+}
+
+#[tokio::test]
+async fn shell_list_json_emits_terminals_array() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/hub/api/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "ww41",
+            "servers": {"": {"name": "", "ready": true, "url": "/user/ww41/", "user_options": {}}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/user/ww41/api/terminals"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"name": "1", "last_activity": "2026-08-14T00:00:00Z"},
+            {"name": "2"}
+        ])))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), &server.uri());
+    let output = common::client_bin()
+        .env("JHC_CONFIG_DIR", dir.path())
+        .env_remove("JUPYTERHUB_API_TOKEN")
+        .args(["shell", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["terminals"][0]["name"], "1");
+    assert_eq!(
+        value["terminals"][0]["last_activity"],
+        "2026-08-14T00:00:00Z"
+    );
+    assert_eq!(value["terminals"][1]["name"], "2");
+}
+
+#[tokio::test]
 async fn verbose_prints_request_summaries_without_the_token() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 
 pub type JsonMap = serde_json::Map<String, serde_json::Value>;
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct User {
     pub name: String,
     #[serde(default)]
     pub servers: BTreeMap<String, Server>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Server {
     pub name: String,
     #[serde(default)]
@@ -22,7 +22,7 @@ pub struct Server {
     pub user_options: JsonMap,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Terminal {
     pub name: String,
     #[serde(default)]

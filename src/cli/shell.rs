@@ -55,9 +55,14 @@ pub async fn run(ctx: &Ctx, cmd: ShellCmd) -> Result<(), CliError> {
             println!("created shell {} on server {display}", term.name);
             Ok(())
         }
-        ShellCmd::List { server } => {
+        ShellCmd::List { server, json } => {
             let (client, display) = server_client_for(ctx, server.as_deref()).await?;
             let terminals = client.terminals().await?;
+            if json {
+                let payload = serde_json::json!({"terminals": terminals});
+                println!("{payload}");
+                return Ok(());
+            }
             if terminals.is_empty() {
                 println!("no shells on server {display}");
                 return Ok(());

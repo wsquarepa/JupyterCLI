@@ -57,7 +57,11 @@ pub enum Command {
         name: String,
     },
     /// Show the authenticated user and all servers
-    Status,
+    Status {
+        /// Emit machine-readable JSON instead of the table
+        #[arg(long)]
+        json: bool,
+    },
     /// Start a server
     Start {
         /// Named server to start; omit for the default server
@@ -152,6 +156,9 @@ pub enum ShellCmd {
     List {
         /// Server to list; omit for the default server
         server: Option<String>,
+        /// Emit machine-readable JSON instead of the table
+        #[arg(long)]
+        json: bool,
     },
     /// Write a command line to a shell and return immediately
     Send {
@@ -332,7 +339,7 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
     let verb = match &cli.command {
         None => "tui",
         Some(Command::Init { .. }) => "init",
-        Some(Command::Status) => "status",
+        Some(Command::Status { .. }) => "status",
         Some(Command::Start { .. }) => "start",
         Some(Command::Stop { .. }) => "stop",
         Some(Command::Preset(_)) => "preset",
@@ -354,8 +361,8 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, CliError> {
             init::run(url, token, name).await?;
             Ok(ok)
         }
-        Some(Command::Status) => {
-            server::status(&Ctx::load(cli.hub.as_deref())?).await?;
+        Some(Command::Status { json }) => {
+            server::status(&Ctx::load(cli.hub.as_deref())?, json).await?;
             Ok(ok)
         }
         Some(Command::Start {

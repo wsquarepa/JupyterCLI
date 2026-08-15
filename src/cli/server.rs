@@ -1,7 +1,16 @@
 use super::{CliError, Ctx};
 
-pub async fn status(ctx: &Ctx) -> Result<(), CliError> {
+pub async fn status(ctx: &Ctx, json: bool) -> Result<(), CliError> {
     let user = ctx.client.whoami().await?;
+    if json {
+        let payload = serde_json::json!({
+            "hub": {"name": ctx.hub_name, "url": ctx.hub.url},
+            "user": user.name,
+            "servers": user.servers,
+        });
+        println!("{payload}");
+        return Ok(());
+    }
     println!("hub {} ({}) user {}", ctx.hub_name, ctx.hub.url, user.name);
     if user.servers.is_empty() {
         println!("no servers running");
