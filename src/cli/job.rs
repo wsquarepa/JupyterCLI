@@ -253,18 +253,25 @@ async fn wait(
             }
             jobops::JobState::Running => {}
         }
-        let backoff = jobops::wait_backoff(attempt);
+        let mut pause = jobops::wait_backoff(attempt);
         attempt += 1;
-        match budget {
-            Some(budget) => {
-                let elapsed = started.elapsed();
-                if elapsed >= budget {
-                    eprintln!("job {id} still running after {}s", budget.as_secs());
-                    return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
-                }
-                tokio::time::sleep(backoff.min(budget.saturating_sub(elapsed))).await;
+        if let Some(budget) = budget {
+            let elapsed = started.elapsed();
+            if elapsed >= budget {
+                eprintln!("job {id} still running after {}s", budget.as_secs());
+                return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
             }
-            None => tokio::time::sleep(backoff).await,
+            pause = pause.min(budget.saturating_sub(elapsed));
+        }
+        // The probe's exec installs a process-wide SIGINT handler, so once the first
+        // poll has run the default "die on Ctrl-C" action is gone; without racing the
+        // pause against the signal, Ctrl-C would be swallowed until the next probe.
+        tokio::select! {
+            _ = tokio::time::sleep(pause) => {}
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("job {id} wait interrupted; its outcome is unknown");
+                return Ok(ExitCode::from(shellops::JHC_FAILURE_EXIT as u8));
+            }
         }
     }
 }

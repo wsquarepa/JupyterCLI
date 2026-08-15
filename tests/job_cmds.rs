@@ -275,6 +275,45 @@ async fn job_wait_times_out_with_125_while_running() {
 }
 
 #[tokio::test]
+async fn job_wait_ctrl_c_interrupts_promptly_with_125() {
+    // The first probe registers a process-wide SIGINT handler inside exec, so a
+    // plain sleep between polls would swallow every later Ctrl-C.
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), &format!("http://{}", mock.addr()));
+    let mut cmd = common::client_bin();
+    cmd.env("JHC_CONFIG_DIR", dir.path())
+        .env_remove("JUPYTERHUB_API_TOKEN")
+        .args(["job", "wait", "aaaaaaaa", "--max-wait", "20"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = tokio::task::spawn_blocking(move || {
+        let child = cmd.spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let signalled = std::process::Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(signalled.success());
+        let started = std::time::Instant::now();
+        let out = child.wait_with_output().unwrap();
+        (out, started.elapsed())
+    })
+    .await
+    .unwrap();
+    let (out, took) = out;
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("interrupted"), "stderr: {stderr}");
+}
+
+#[tokio::test]
 async fn job_wait_huge_max_wait_does_not_panic() {
     // The deadline math must never add a Duration to an Instant: that panics on
     // overflow (exit 101) and would break the "125 or the remote code" contract.
