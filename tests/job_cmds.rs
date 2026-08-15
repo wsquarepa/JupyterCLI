@@ -310,3 +310,24 @@ async fn job_wait_transport_failure_exits_125() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[tokio::test]
+async fn job_kill_signals_running_and_refuses_exited() {
+    let mock = MockJupyter::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = jhc(&mock, dir.path(), &["job", "kill", "aaaaaaaa"]).await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8(out.stdout).unwrap().contains("SIGTERM"));
+
+    let exited = jhc(&mock, dir.path(), &["job", "kill", "bbbbbbbb"]).await;
+    assert!(!exited.status.success());
+    let stderr = String::from_utf8(exited.stderr).unwrap();
+    assert!(
+        stderr.contains("already exited") && stderr.contains("7"),
+        "stderr: {stderr}"
+    );
+}

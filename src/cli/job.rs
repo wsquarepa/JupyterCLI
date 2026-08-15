@@ -269,6 +269,44 @@ async fn wait(
     }
 }
 
+async fn kill(ctx: &Ctx, job: &str, force: bool, json: bool) -> Result<(), CliError> {
+    let (server, id) = job_ref(job)?;
+    let target = resolve_target(ctx, server.as_deref()).await?;
+    let records = probe(ctx, &target, Some(id.as_str())).await?;
+    let record = records
+        .first()
+        .ok_or_else(|| not_found(&id, &target.display))?;
+    match jobops::classify(record, target.server_started_unix) {
+        jobops::JobState::Exited(code) => {
+            return Err(CliError::Usage(format!(
+                "job {id} already exited with code {code}; nothing to kill"
+            )));
+        }
+        jobops::JobState::Orphaned => {
+            return Err(CliError::Usage(format!(
+                "job {id} is orphaned (its process is gone); remove it with: jhc job rm {id}"
+            )));
+        }
+        jobops::JobState::Running => {}
+    }
+    let outcome = run_script_on(ctx, &target, &jobops::build_kill_script(&id, force)).await?;
+    if outcome.exit_code != 0 {
+        return Err(CliError::Usage(format!(
+            "kill failed on server {} (exit {}); the job may have just exited: {}",
+            target.display,
+            outcome.exit_code,
+            outcome.output.trim()
+        )));
+    }
+    let signal = if force { "SIGKILL" } else { "SIGTERM" };
+    if json {
+        println!("{}", serde_json::json!({"id": id, "signal": signal}));
+    } else {
+        println!("sent {signal} to job {id} on server {}", target.display);
+    }
+    Ok(())
+}
+
 pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
     match cmd {
         JobCmd::Start {
@@ -302,11 +340,9 @@ pub async fn run(ctx: &Ctx, cmd: JobCmd) -> Result<ExitCode, CliError> {
             max_wait,
             json,
         } => wait(ctx, &job, max_wait, json).await,
-        JobCmd::Kill { job, .. } => {
-            job_ref(&job)?;
-            Err(CliError::Usage(
-                "job kill is not implemented yet".to_string(),
-            ))
+        JobCmd::Kill { job, force, json } => {
+            kill(ctx, &job, force, json).await?;
+            Ok(ExitCode::SUCCESS)
         }
         JobCmd::Rm { job, .. } => {
             job_ref(&job)?;
