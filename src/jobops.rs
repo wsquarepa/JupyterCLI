@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_treats_non_numeric_pid_files_as_dead() {
+    fn probe_treats_untrusted_pid_files_as_dead() {
         // `kill -0 -1` and `kill -0 0` signal the caller's own group and succeed, so a
         // damaged pid file must never read as alive; a real live pid must.
         let home = tempfile::tempdir().unwrap();

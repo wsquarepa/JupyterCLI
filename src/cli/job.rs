@@ -1,5 +1,7 @@
 use std::process::ExitCode;
 
+use tokio::signal::unix::Signal;
+
 use crate::api::server::ServerClient;
 use crate::jobops::{self, JobMeta};
 use crate::shellops;
@@ -9,7 +11,6 @@ use super::shell::{
     client_for_entry, close_ephemeral, interrupt_listener, open_ephemeral, server_entry_for,
 };
 use super::{CliError, Ctx, JobCmd};
-use tokio::signal::unix::Signal;
 
 struct JobTarget {
     client: ServerClient,

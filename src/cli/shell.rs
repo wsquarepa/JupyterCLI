@@ -1,9 +1,10 @@
+use tokio::signal::unix::{Signal, SignalKind};
+
 use crate::api::server::ServerClient;
 use crate::api::types::Server;
 use crate::api::ws::TermSocket;
 use crate::attach::{self, AttachOutcome};
 use crate::shellops;
-use tokio::signal::unix::{Signal, SignalKind};
 
 use super::addr::parse_shell_ref;
 use super::{CliError, Ctx, ShellCmd};
