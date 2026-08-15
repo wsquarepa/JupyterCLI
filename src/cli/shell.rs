@@ -6,10 +6,10 @@ use crate::shellops;
 use super::addr::parse_shell_ref;
 use super::{CliError, Ctx, ShellCmd};
 
-pub async fn server_client_for(
+pub async fn server_entry_for(
     ctx: &Ctx,
     server: Option<&str>,
-) -> Result<(ServerClient, String), CliError> {
+) -> Result<(crate::api::types::Server, String), CliError> {
     let user = ctx.client.whoami().await?;
     let key = server.unwrap_or_default().to_string();
     let display = if key.is_empty() {
@@ -28,7 +28,15 @@ pub async fn server_client_for(
             found.pending.as_deref().unwrap_or("pending")
         )));
     }
-    let url_path = found
+    Ok((found.clone(), display))
+}
+
+pub async fn server_client_for(
+    ctx: &Ctx,
+    server: Option<&str>,
+) -> Result<(ServerClient, String), CliError> {
+    let (entry, display) = server_entry_for(ctx, server).await?;
+    let url_path = entry
         .url
         .as_deref()
         .ok_or_else(|| CliError::Usage(format!("server '{display}' reports no URL")))?;
