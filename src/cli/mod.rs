@@ -110,9 +110,9 @@ pipes, redirection, or globbing, invoke a shell yourself:\n  jhc exec -- bash -c
     },
     /// Copy files between the local machine and a server
     Cp {
-        /// Source: local path or [SERVER:]PATH
+        /// Source: local path, - for stdin, or [SERVER:]PATH
         src: String,
-        /// Destination: local path or [SERVER:]PATH
+        /// Destination: local path, - for stdout, or [SERVER:]PATH
         dst: String,
         /// Copy directories recursively
         #[arg(short, long)]

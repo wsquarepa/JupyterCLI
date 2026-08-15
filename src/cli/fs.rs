@@ -34,6 +34,30 @@ pub async fn ls(ctx: &Ctx, path: &str) -> Result<(), CliError> {
 
 pub async fn cp(ctx: &Ctx, src: &str, dst: &str, recursive: bool) -> Result<(), CliError> {
     match (parse_transfer_arg(src), parse_transfer_arg(dst)) {
+        (TransferSide::Local(local), TransferSide::Remote(remote)) if local == "-" => {
+            if recursive {
+                return Err(CliError::Usage(
+                    "cannot combine - with -r: stdin is a single stream".to_string(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)?;
+            let (client, _) = server_client_for(ctx, remote.server.as_deref()).await?;
+            client.upload(&remote.path, &bytes).await?;
+            println!("stdin -> :{}", remote.path);
+            Ok(())
+        }
+        (TransferSide::Remote(remote), TransferSide::Local(local)) if local == "-" => {
+            if recursive {
+                return Err(CliError::Usage(
+                    "cannot combine - with -r: stdout is a single stream".to_string(),
+                ));
+            }
+            let (client, _) = server_client_for(ctx, remote.server.as_deref()).await?;
+            let bytes = client.download(&remote.path).await?;
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            Ok(())
+        }
         (TransferSide::Local(local), TransferSide::Remote(remote)) => {
             let (client, _) = server_client_for(ctx, remote.server.as_deref()).await?;
             upload_path(
